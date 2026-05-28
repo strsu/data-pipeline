@@ -127,8 +127,8 @@ def _save_to_db(
             cur.execute(
                 """
                 INSERT INTO face_record
-                    (cut_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2, conf, is_confirmed, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, false, %s, %s)
+                    (cut_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2, conf, chroma_doc_id, is_confirmed, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, '', false, %s, %s)
                 RETURNING id
                 """,
                 (cut_id, idx, b[0], b[1], b[2], b[3], face["conf"], now, now),
