@@ -25,7 +25,8 @@ FROM python:3.12-slim
 
 ENV PYTHONFAULTHANDLER=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONHASHSEED=random
+    PYTHONHASHSEED=random \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # libgomp1: PaddlePaddle OpenMP / libgl1: OpenCV
 RUN set -eux \
