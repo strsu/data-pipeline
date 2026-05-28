@@ -21,7 +21,7 @@ def get_ocr() -> PaddleOCR:
             lang="korean",
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
-            use_mkldnn=False,  # AMD CPU: OneDNN은 Intel 전용이라 비활성화
+            enable_mkldnn=False,  # AMD CPU: OneDNN은 Intel 전용이라 비활성화
         )
     return _ocr
 
