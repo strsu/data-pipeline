@@ -12,7 +12,7 @@ dependencies = [
     "numpy==2.2.6",
     "onnxruntime==1.21.1",
     "paddlepaddle",
-    "paddleocr==2.10.0",
+    "paddleocr==3.5.0",
     "ultralytics==8.3.151",
 ]
 requires-python = "==3.12.*"
