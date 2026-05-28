@@ -15,5 +15,6 @@ dependencies = [
     "paddlepaddle",
     "paddleocr==3.5.0",
     "ultralytics==8.3.151",
+    "chromadb>=0.6.0",
 ]
 requires-python = "==3.12.*"

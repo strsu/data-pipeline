@@ -36,3 +36,11 @@ ASPECT_RATIO_MAX = 2.5
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 15]
+
+# Chroma
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
+CHROMA_AUTH_TOKEN = os.getenv("CHROMA_AUTH_TOKEN", "")
+
+# Step 2 — face identification
+MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.25"))  # P0 시작값 (cosine distance)

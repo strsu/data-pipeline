@@ -38,6 +38,18 @@ def upload_face_crop(face_record_id: int, source: str, title_id: str, crop_bytes
     return key
 
 
+def fetch_face_crop(face_record_id: int, source: str, title_id: str) -> bytes | None:
+    """S3에서 얼굴 크롭 이미지 다운로드. 없으면 None 반환."""
+    key = f"{settings.S3_LOCATION}/{source}/{title_id}/face_crop/{face_record_id}.jpg"
+    try:
+        response = _get_client().get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        return response["Body"].read()
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        raise
+
+
 def fetch_cut_image(source: str, title_id: str, episode_no: int, cut: int) -> bytes | None:
     """S3에서 컷 이미지 다운로드.
 
