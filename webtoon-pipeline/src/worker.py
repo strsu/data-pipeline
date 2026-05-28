@@ -8,6 +8,7 @@ app = faust.App(
     autodiscover=["src.agents"],
     origin="src",
     consumer_auto_offset_reset="latest",
+    topic_allow_declare=False,
 )
 
 if __name__ == "__main__":
