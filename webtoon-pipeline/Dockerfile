@@ -17,8 +17,8 @@ COPY pyproject.toml uv.lock /project/
 RUN pip install --no-cache-dir torch torchvision \
     --index-url https://download.pytorch.org/whl/cpu
 
-# 2단계: uv로 나머지 패키지 설치 (torch는 이미 설치됨)
-RUN uv sync --frozen --no-dev --no-install-project
+# 2단계: uv로 나머지 패키지 설치 (torch는 이미 설치됨, system Python에 직접 설치)
+RUN uv pip install --system --no-cache -r pyproject.toml
 
 # runtime stage
 FROM python:3.12-slim
