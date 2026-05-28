@@ -7,16 +7,28 @@ RUN set -eux \
         build-essential python3-dev gcc ca-certificates libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -U pip setuptools wheel \
-    && pip install --no-cache-dir uv
+RUN pip install --no-cache-dir -U pip setuptools wheel
 
 WORKDIR /project
 
 COPY pyproject.toml /project/pyproject.toml
 
-RUN uv pip compile pyproject.toml > requirements.txt && \
-    uv pip install --system --no-cache -r requirements.txt && \
-    rm -f requirements.txt
+# 1단계: CPU-only torch 먼저 설치 (PyPI 기본 인덱스는 Linux에서 CUDA 버전 반환)
+# uv pip compile/install은 재해결 시 CUDA로 덮어씌우므로 pip 직접 사용
+RUN pip install --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# 2단계: 나머지 패키지 설치 — torch가 이미 설치돼 있으므로 pip이 재설치하지 않음
+RUN pip install --no-cache-dir \
+    faust-streaming==0.10.22 \
+    psycopg2-binary==2.9.11 \
+    boto3==1.38.21 \
+    requests==2.32.5 \
+    pillow==11.2.1 \
+    numpy==2.2.6 \
+    onnxruntime==1.21.1 \
+    paddleocr==2.10.0 \
+    ultralytics==8.3.151
 
 # runtime stage
 FROM python:3.12-slim
