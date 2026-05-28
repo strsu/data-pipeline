@@ -95,7 +95,8 @@ def _save_to_db(
         )
         cut_id = cur.fetchone()[0]
 
-        # 재처리 시 기존 데이터 초기화 (text_annotation은 CASCADE로 자동 삭제)
+        # 재처리 시 기존 데이터 초기화
+        cur.execute("DELETE FROM text_annotation WHERE region_id IN (SELECT id FROM text_region WHERE cut_id = %s)", (cut_id,))
         cur.execute("DELETE FROM text_region WHERE cut_id = %s", (cut_id,))
         cur.execute("DELETE FROM face_record WHERE cut_id = %s", (cut_id,))
 
