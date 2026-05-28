@@ -47,16 +47,6 @@ COPY models /project/models
 
 ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
-RUN python -c "
-from paddleocr import PaddleOCR
-PaddleOCR(
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-    engine='paddle',
-    lang='korean',
-    enable_mkldnn=False,
-)
-"
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, engine='paddle', lang='korean', enable_mkldnn=False)"
 
 CMD ["python", "-m", "faust", "-A", "src.worker", "worker", "-l", "info"]
