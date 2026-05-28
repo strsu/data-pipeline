@@ -1,0 +1,17 @@
+[project]
+name = "webtoon-pipeline"
+version = "0.1.0"
+description = "Webtoon analysis pipeline — Faust/Kafka worker"
+dependencies = [
+    "faust-streaming==0.10.22",
+    "psycopg2-binary==2.9.11",
+    "boto3==1.38.21",
+    "requests==2.32.5",
+    "pillow==11.2.1",
+    "numpy==2.2.6",
+    "opencv-python-headless==4.11.0.86",
+    "paddlepaddle==3.0.0",
+    "paddleocr==2.10.0",
+    "ultralytics==8.3.151",
+]
+requires-python = "==3.12.*"

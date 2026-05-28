@@ -1,0 +1,192 @@
+name: pipeline-deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    if: ${{ !contains(github.event.head_commit.message, '[skip-build]') }}
+    runs-on: ubuntu-latest
+    outputs:
+      pipelines: ${{ steps.detect.outputs.pipelines }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: 변경된 파이프라인 감지
+        id: detect
+        run: |
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-tree -r --name-only HEAD)
+
+          # 워크플로우 파일 변경 시 Dockerfile이 있는 모든 디렉터리 빌드
+          REBUILD_ALL="false"
+          if echo "$CHANGED_FILES" | grep -q "^\.github/workflows/"; then
+            REBUILD_ALL="true"
+          fi
+
+          PIPELINES=""
+          for dir in */; do
+            dir="${dir%/}"
+            [ ! -f "${dir}/Dockerfile" ] && continue
+
+            if [ "$REBUILD_ALL" = "true" ] || echo "$CHANGED_FILES" | grep -q "^${dir}/"; then
+              PIPELINES="$PIPELINES $dir"
+            fi
+          done
+
+          PIPELINES="${PIPELINES# }"
+          echo "pipelines=$PIPELINES" >> $GITHUB_OUTPUT
+
+          if [ -n "$PIPELINES" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "빌드 대상: $PIPELINES"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "변경된 파이프라인 없음"
+          fi
+
+  build:
+    if: needs.detect.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    needs: detect
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      built_pipelines: ${{ steps.build.outputs.built_pipelines }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Registry 로그인
+        run: |
+          if ! echo "${{ secrets.REGISTRY_PASSWORD }}" | \
+            docker login ${{ secrets.REGISTRY_SERVER }} -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin; then
+            echo "❌ Registry 로그인 실패"
+            exit 1
+          fi
+
+      - name: 이미지 빌드 및 푸시
+        id: build
+        run: |
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          IMAGE_TAG="${GIT_COMMIT}-${TIMESTAMP}"
+          REGISTRY="${{ secrets.REGISTRY_SERVER }}"
+          BUILT_PIPELINES=""
+
+          for PIPELINE in ${{ needs.detect.outputs.pipelines }}; do
+            echo "🔨 $PIPELINE 빌드 중..."
+            if docker buildx build --platform linux/amd64 \
+              -t ${REGISTRY}/${PIPELINE}:${IMAGE_TAG} \
+              -t ${REGISTRY}/${PIPELINE}:${GIT_COMMIT} \
+              -t ${REGISTRY}/${PIPELINE}:latest \
+              -f ${PIPELINE}/Dockerfile \
+              ${PIPELINE} \
+              --push; then
+              echo "✅ $PIPELINE 완료: ${IMAGE_TAG}"
+              BUILT_PIPELINES="$BUILT_PIPELINES $PIPELINE"
+            else
+              echo "❌ $PIPELINE 빌드 실패"
+              exit 1
+            fi
+          done
+
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "built_pipelines=${BUILT_PIPELINES# }" >> $GITHUB_OUTPUT
+
+  update-kustomization:
+    if: needs.build.outputs.built_pipelines != ''
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: proxmox-configuration repo 체크아웃
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/proxmox-configuration
+          path: proxmox-config
+          token: ${{ secrets.PROXMOX_CONFIGURATION_REPO_TOKEN }}
+
+      - name: kustomization.yaml 업데이트
+        run: |
+          cd proxmox-config
+          IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
+
+          for PIPELINE in ${{ needs.build.outputs.built_pipelines }}; do
+            KUSTOMIZATION="pipeline_repo/kustomization.yaml"
+
+            if [ ! -f "$KUSTOMIZATION" ]; then
+              echo "❌ $KUSTOMIZATION 없음 — $PIPELINE 스킵"
+              continue
+            fi
+
+            sed -i.bak "/name: ${PIPELINE}$/,/newTag:/ {
+              /newTag:/ s/newTag:.*/newTag: ${IMAGE_TAG}/
+            }" "$KUSTOMIZATION"
+            rm -f "${KUSTOMIZATION}.bak"
+            echo "✅ $PIPELINE → $IMAGE_TAG 업데이트 완료"
+          done
+
+          echo "📋 변경 내용:"
+          git diff pipeline_repo/ || true
+
+      - name: 커밋 및 푸시
+        run: |
+          cd proxmox-config
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet pipeline_repo/; then
+            echo "ℹ️  변경사항 없음"
+          else
+            IMAGE_TAG="${{ needs.build.outputs.image_tag }}"
+            PIPELINES="${{ needs.build.outputs.built_pipelines }}"
+            git add pipeline_repo/
+            git commit -m "Update pipeline tags: ${IMAGE_TAG} (${PIPELINES}) [skip-ci]"
+            git push && echo "✅ 푸시 완료" || (echo "❌ 푸시 실패" && exit 1)
+          fi
+
+  slack-notification:
+    if: ${{ always() && needs.detect.outputs.has_changes == 'true' }}
+    needs: [detect, build, update-kustomization]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set status
+        run: |
+          if [ "${{ needs.build.result }}" = "failure" ] || \
+             [ "${{ needs.update-kustomization.result }}" = "failure" ]; then
+            echo "CUSTOM_STATUS=❌ 실패" >> $GITHUB_ENV
+          elif [ "${{ needs.build.result }}" = "cancelled" ]; then
+            echo "CUSTOM_STATUS=⚠️ 취소" >> $GITHUB_ENV
+          else
+            echo "CUSTOM_STATUS=✅ 성공" >> $GITHUB_ENV
+          fi
+
+      - name: slack-send
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "파이프라인 배포: ${{ env.CUSTOM_STATUS }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*배포 상태:* ${{ env.CUSTOM_STATUS }}\n*파이프라인:* `${{ needs.build.outputs.built_pipelines }}`\n*태그:* `${{ needs.build.outputs.image_tag }}`\n*Actor:* ${{ github.actor }}\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|📊 워크플로우 보기>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
