@@ -28,6 +28,9 @@ def extract_embedding(image_bytes: bytes) -> list[float]:
     inputs = processor(images=img, return_tensors="pt")
     with torch.no_grad():
         features = model.get_image_features(**inputs)
+        # transformers 5.x: get_image_features → BaseModelOutputWithPooling
+        if not isinstance(features, torch.Tensor):
+            features = features.pooler_output
         # L2 정규화 — cosine distance = 1 - cosine_similarity
         features = features / features.norm(dim=-1, keepdim=True)
     return features.squeeze(0).numpy().tolist()
