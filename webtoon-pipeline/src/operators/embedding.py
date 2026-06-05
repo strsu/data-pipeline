@@ -1,37 +1,33 @@
-"""ResNet50 얼굴 임베딩 추출 (P0 — P2~P3에서 애니 특화 모델로 교체 예정, §12.4)."""
+"""CLIP 이미지 인코더 기반 얼굴 임베딩 추출 (openai/clip-vit-large-patch14, 768-dim)."""
 from __future__ import annotations
 
 from io import BytesIO
 
 import torch
-import torchvision.models as models
-import torchvision.transforms as transforms
 from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
 
-_model: models.ResNet | None = None
-_transform: transforms.Compose | None = None
+_MODEL_ID = "openai/clip-vit-large-patch14"
+_model: CLIPModel | None = None
+_processor: CLIPProcessor | None = None
 
 
-def _get_model() -> tuple[models.ResNet, transforms.Compose]:
-    global _model, _transform
+def _get_model() -> tuple[CLIPModel, CLIPProcessor]:
+    global _model, _processor
     if _model is None:
-        m = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        m.fc = torch.nn.Identity()  # 2048-dim 임베딩 직접 출력
-        m.eval()
-        _model = m
-        _transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-    return _model, _transform
+        _model = CLIPModel.from_pretrained(_MODEL_ID)
+        _model.eval()
+        _processor = CLIPProcessor.from_pretrained(_MODEL_ID)
+    return _model, _processor
 
 
 def extract_embedding(image_bytes: bytes) -> list[float]:
-    """이미지 바이트 → ResNet50 임베딩 (2048-dim float list)."""
-    model, transform = _get_model()
+    """이미지 바이트 → CLIP 이미지 임베딩 (768-dim, L2 정규화된 float list)."""
+    model, processor = _get_model()
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    tensor = transform(img).unsqueeze(0)
+    inputs = processor(images=img, return_tensors="pt")
     with torch.no_grad():
-        embedding = model(tensor).squeeze(0).numpy()
-    return embedding.tolist()
+        features = model.get_image_features(**inputs)
+        # L2 정규화 — cosine distance = 1 - cosine_similarity
+        features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze(0).numpy().tolist()
