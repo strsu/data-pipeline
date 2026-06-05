@@ -227,6 +227,72 @@ def _get_next_ready_episode(webtoon_id: int, current_no: int) -> Optional[dict]:
         return {"id": row[0], "no": row[1]} if row else None
 
 
+def _seed_confirmed_faces(
+    webtoon_id: int, source: str, title_id: str, collection
+) -> None:
+    """수동 확정된 얼굴을 Chroma에 시딩 — 수동 등록/재배정 캐릭터가 매칭 기준점으로 사용되도록 보장.
+
+    is_confirmed=True인 face_record를 조회해 Chroma에 upsert한다.
+    재배정 후 appearance가 바뀐 경우도 올바른 캐릭터 메타데이터로 덮어쓴다.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fr.id, fr.face_idx,
+                   fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
+                   fr.conf, fr.appearance_id, fr.chroma_doc_id,
+                   wc.cut_number, we.no AS episode_no,
+                   ca.label AS appearance_label,
+                   c.name AS character_name
+            FROM face_record fr
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            JOIN webtoon_episode we ON wc.episode_id = we.id
+            JOIN character_appearance ca ON fr.appearance_id = ca.id
+            JOIN character c ON ca.character_id = c.id
+            WHERE c.webtoon_id = %s
+              AND fr.is_confirmed = true
+              AND fr.appearance_id IS NOT NULL
+              AND fr.deleted_at IS NULL
+            """,
+            (webtoon_id,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return
+
+    for row in rows:
+        (face_id, face_idx, x1, y1, x2, y2, conf,
+         appearance_id, chroma_doc_id, cut_number, episode_no,
+         appearance_label, character_name) = row
+
+        doc_id = chroma_doc_id or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
+
+        crop_bytes = fetch_face_crop(face_id, source, title_id)
+        if crop_bytes is None:
+            continue
+
+        embedding = extract_embedding(crop_bytes)
+        collection.upsert(
+            ids=[doc_id],
+            embeddings=[embedding],
+            metadatas=[{
+                "webtoon_id": webtoon_id,
+                "episode": episode_no,
+                "cut": cut_number,
+                "face_idx": face_idx,
+                "character_id": character_name,
+                "appearance_id": appearance_id,
+                "appearance_label": appearance_label,
+                "character_name": character_name,
+                "is_confirmed": True,
+                "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
+                "conf": conf or 0.0,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }],
+        )
+
+
 # ── 핵심 처리 (동기 — run_in_executor에서 실행) ────────────────────────────────
 
 @dataclass
@@ -263,6 +329,11 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
 
     # ── Chroma 컬렉션 로드 ────────────────────────────────────────────────────
     collection = get_face_collection(source, title_id)
+
+    # ── 수동 확정 얼굴 시딩 ──────────────────────────────────────────────────
+    # 사용자가 직접 등록/재배정한 얼굴의 임베딩을 Chroma에 upsert하여
+    # 이후 얼굴이 올바른 캐릭터와 매칭될 수 있도록 기준점 확보
+    _seed_confirmed_faces(webtoon_id, source, title_id, collection)
 
     # ── 에피소드 내 얼굴 식별 (컷 순서대로) ──────────────────────────────────
     face_records = _load_face_records(msg.webtoon_episode_id)
