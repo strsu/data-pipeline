@@ -24,7 +24,7 @@ from src.worker import app
 MATCH_THRESHOLD = settings.MATCH_THRESHOLD
 
 
-# ── Kafka 토픽 ───────────────────────────────────────────────────────────────
+# ── Kafka 토픽 ────────────────────────────────────────────────────────────────────────────
 
 class EpisodePhase3Start(faust.Record):
     source: str
@@ -36,7 +36,7 @@ class EpisodePhase3Start(faust.Record):
 cut_phase3_start = app.topic("cut.phase3.start", value_type=EpisodePhase3Start)
 
 
-# ── DB 헬퍼 ──────────────────────────────────────────────────────────────────
+# ── DB 헬퍼 ────────────────────────────────────────────────────────────────────────────
 
 def _get_webtoon_info(webtoon_episode_id: int) -> dict:
     with db_cursor() as cur:
@@ -132,7 +132,6 @@ def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: in
     """신규 Character + CharacterAppearance 생성 (NEW_CHAR_{N:03d}, 웹툰 글로벌 스코프, §12.2)."""
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
-        # 현재 웹툰의 최대 NEW_CHAR 번호 계산
         cur.execute(
             """
             SELECT COALESCE(MAX(
@@ -229,11 +228,12 @@ def _get_next_ready_episode(webtoon_id: int, current_no: int) -> Optional[dict]:
 
 def _seed_confirmed_faces(
     webtoon_id: int, source: str, title_id: str, collection
-) -> None:
+) -> int:
     """수동 확정된 얼굴을 Chroma에 시딩 — 수동 등록/재배정 캐릭터가 매칭 기준점으로 사용되도록 보장.
 
     is_confirmed=True인 face_record를 조회해 Chroma에 upsert한다.
-    재배정 후 appearance가 바뀐 경우도 올바른 캐릭터 메타데이터로 덮어쓴다.
+    재배정 후 appearance가 바뀌 경우도 올바른 캐릭터 메타데이터로 덮어쓴다.
+    리턴값: upsert된 문서 수 (컴렉션 크기 추적에 활용)
     """
     with db_cursor() as cur:
         cur.execute(
@@ -259,7 +259,7 @@ def _seed_confirmed_faces(
         rows = cur.fetchall()
 
     if not rows:
-        return
+        return 0
 
     for row in rows:
         (face_id, face_idx, x1, y1, x2, y2, conf,
@@ -292,8 +292,10 @@ def _seed_confirmed_faces(
             }],
         )
 
+    return len(rows)
 
-# ── 핵심 처리 (동기 — run_in_executor에서 실행) ────────────────────────────────
+
+# ── 핵심 처리 (동기 — run_in_executor에서 실행) ────────────────────────────────────────────
 
 @dataclass
 class _Phase2Result:
@@ -316,26 +318,28 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
 
     state = _get_or_create_pipeline_state(webtoon_id)
 
-    # ── 멱등성 가드 (§18.3) ───────────────────────────────────────────────────
+    # ── 멱등성 가드 (§18.3) ───────────────────────────────────────────────────────────────────
     last_no = state["last_completed_no"]
     if last_no is not None and last_no >= msg.episode_no:
         return result  # 이미 처리 완료 — 조용히 skip
 
-    # ── processable_max_episode 체크 (§20) ───────────────────────────────────
+    # ── processable_max_episode 체크 (§20) ────────────────────────────────────────────────────
     max_ep = state["phase2_processable_max_episode"]
     if max_ep is not None and msg.episode_no > max_ep:
         _set_phase2_idle(webtoon_id)
         return result  # idle 전환, 이벤트 미발행 → 자연 대기
 
-    # ── Chroma 컬렉션 로드 ────────────────────────────────────────────────────
+    # ── Chroma 콜렉션 로드 ────────────────────────────────────────────────────────────────
     collection = get_face_collection(source, title_id)
 
-    # ── 수동 확정 얼굴 시딩 ──────────────────────────────────────────────────
-    # 사용자가 직접 등록/재배정한 얼굴의 임베딩을 Chroma에 upsert하여
-    # 이후 얼굴이 올바른 캐릭터와 매칭될 수 있도록 기준점 확보
-    _seed_confirmed_faces(webtoon_id, source, title_id, collection)
+    # ── 수동 확정 얼굴 시딩 ──────────────────────────────────────────────────────────
+    seeded_count = _seed_confirmed_faces(webtoon_id, source, title_id, collection)
 
-    # ── 에피소드 내 얼굴 식별 (컷 순서대로) ──────────────────────────────────
+    # 시딩 + 기존 콜렉션 크기를 합산하여 query 가능 여부 판단
+    # collection.count()는 기존 문서만 반영하므로 시딩 후 참조
+    collection_size = collection.count()
+
+    # ── 에피소드 내 얼굴 식별 (컷 순서대로) ──────────────────────────────────────────
     face_records = _load_face_records(msg.webtoon_episode_id)
     for face in face_records:
         crop_bytes = fetch_face_crop(face["id"], source, title_id)
@@ -346,15 +350,20 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
         embedding = extract_embedding(crop_bytes)
         doc_id = f"{webtoon_id}_{msg.episode_no}_{face['cut_number']}_F{face['face_idx']}"
 
-        # Chroma 코사인 유사도 검색 (낮을수록 유사)
-        query_result = collection.query(
-            query_embeddings=[embedding],
-            n_results=1,
-            include=["metadatas", "distances"],
-        )
-        has_match = bool(query_result["ids"][0])
-        best_distance = query_result["distances"][0][0] if has_match else None
-        best_meta = query_result["metadatas"][0][0] if has_match else None
+        if collection_size > 0:
+            # Chroma 코사인 유사도 검색 (낙을수록 유사)
+            query_result = collection.query(
+                query_embeddings=[embedding],
+                n_results=1,
+                include=["metadatas", "distances"],
+            )
+            has_match = bool(query_result["ids"][0])
+            best_distance = query_result["distances"][0][0] if has_match else None
+            best_meta = query_result["metadatas"][0][0] if has_match else None
+        else:
+            has_match = False
+            best_distance = None
+            best_meta = None
 
         if has_match and best_distance <= MATCH_THRESHOLD:
             # 기존 캐릭터 매칭
@@ -388,14 +397,14 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }],
         )
+        collection_size += 1  # upsert 후 카운트 증가 — 다음 얼굴부터 매칭 가능
 
         _update_face_record(face["id"], appearance_id, doc_id, match_score)
 
-    # ── 에피소드 완료 상태 갱신 ──────────────────────────────────────────────
+    # ── 에피소드 완료 상태 갱신 ────────────────────────────────────────────────────────
     _complete_episode_state(webtoon_id, msg.webtoon_episode_id)
 
-    # ── 다음 에피소드 자기 트리거 (§18.3) ────────────────────────────────────
-    # Step1이 이미 next_ep.phase1.complete를 발행했을 경우 멱등성 가드로 skip
+    # ── 다음 에피소드 자기 트리거 (§18.3) ────────────────────────────────────────────────
     next_ep = _get_next_ready_episode(webtoon_id, msg.episode_no)
     if next_ep:
         result.should_trigger_next = True
@@ -408,7 +417,7 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
             total_cuts=0,
         )
 
-    # ── Phase 3 트리거 (활성 웹툰만, §12.10) ─────────────────────────────────
+    # ── Phase 3 트리거 (활성 웹툰만, §12.10) ─────────────────────────────────────────────
     if state["phase3_enabled"]:
         result.should_start_phase3 = True
         result.phase3_key = kafka_key
@@ -422,7 +431,7 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
     return result
 
 
-# ── Faust Agent ───────────────────────────────────────────────────────────────
+# ── Faust Agent ─────────────────────────────────────────────────────────────────────────────
 
 @app.agent(episode_phase1_complete, concurrency=1)
 async def face_identify_agent(stream):
