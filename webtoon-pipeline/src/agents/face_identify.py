@@ -183,18 +183,25 @@ def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: in
         return {"char_id": char_id, "char_name": char_name, "appearance_id": appearance_id}
 
 
-def _update_face_record(
-    face_id: int, appearance_id: int, chroma_doc_id: str, match_score: Optional[float]
-) -> None:
+def _update_face_record(face_id: int, appearance_id: int) -> None:
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            "UPDATE face_record SET appearance_id = %s, updated_at = %s WHERE id = %s",
+            (appearance_id, now, face_id),
+        )
+
+
+def _update_face_embedding_score(face_id: int, model: str, match_score: Optional[float]) -> None:
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
-            UPDATE face_record
-            SET appearance_id = %s, chroma_doc_id = %s, match_score = %s, updated_at = %s
-            WHERE id = %s
+            UPDATE face_embedding
+            SET match_score = %s, updated_at = %s
+            WHERE face_record_id = %s AND embedding_model = %s
             """,
-            (appearance_id, chroma_doc_id, match_score, now, face_id),
+            (match_score, now, face_id, model),
         )
 
 
@@ -248,21 +255,23 @@ def _seed_confirmed_faces(
             """
             SELECT fr.id, fr.face_idx,
                    fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
-                   fr.conf, fr.appearance_id, fr.chroma_doc_id,
+                   fr.conf, fr.appearance_id,
                    wc.cut_number, we.no AS episode_no,
                    ca.label AS appearance_label,
-                   c.name AS character_name
+                   c.name AS character_name,
+                   fe.chroma_doc_id
             FROM face_record fr
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             JOIN webtoon_episode we ON wc.episode_id = we.id
             JOIN character_appearance ca ON fr.appearance_id = ca.id
             JOIN character c ON ca.character_id = c.id
+            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
             WHERE c.webtoon_id = %s
               AND fr.is_confirmed = true
               AND fr.appearance_id IS NOT NULL
               AND fr.deleted_at IS NULL
             """,
-            (webtoon_id,),
+            (EMBEDDING_MODEL_NAME, webtoon_id),
         )
         rows = cur.fetchall()
 
@@ -271,8 +280,8 @@ def _seed_confirmed_faces(
 
     for row in rows:
         (face_id, face_idx, x1, y1, x2, y2, conf,
-         appearance_id, chroma_doc_id, cut_number, episode_no,
-         appearance_label, character_name) = row
+         appearance_id, cut_number, episode_no,
+         appearance_label, character_name, chroma_doc_id) = row
 
         doc_id = chroma_doc_id or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
 
@@ -434,7 +443,8 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
         )
         collection_size += 1  # upsert 후 카운트 증가 — 다음 얼굴부터 매칭 가능
 
-        _update_face_record(face["id"], appearance_id, doc_id, match_score)
+        _update_face_record(face["id"], appearance_id)
+        _update_face_embedding_score(face["id"], EMBEDDING_MODEL_NAME, match_score)
 
     # ── 에피소드 완료 상태 갱신 ────────────────────────────────────────────────────────
     _complete_episode_state(webtoon_id, msg.webtoon_episode_id)
