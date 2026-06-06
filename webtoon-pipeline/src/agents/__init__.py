@@ -1,1 +1,1 @@
-from src.agents import local_extract, face_identify  # noqa: F401
+from . import face_identify  # noqa: F401
