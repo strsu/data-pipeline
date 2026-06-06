@@ -12,8 +12,9 @@ from io import BytesIO
 import faust
 from PIL import Image
 
+from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
-from src.config.s3 import fetch_cut_image, upload_face_crop
+from src.config.s3 import delete_face_crop, fetch_cut_image, upload_face_crop
 from src.operators.cut_merger import CutSegment, adjust_bbox_to_cut, split_cut_pair
 from src.operators.ocr import run_ocr
 from src.operators.yolo import detect_faces
@@ -169,7 +170,60 @@ def _process_segment(
                 print(f"[ocr_yolo] face crop upload 실패 face_id={face_record_id}: {e}")
 
 
-def _upsert_cut(webtoon_episode_id: int, cut_number: int, now: datetime) -> int:
+def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
+    """기존 컷의 face_record + S3 크롭 + Chroma + FaceEmbedding을 모두 제거한다."""
+    with db_cursor() as cur:
+        # face_record별 S3 크롭 삭제 및 Chroma/FaceEmbedding 정리
+        cur.execute(
+            """
+            SELECT fr.id,
+                   fe.embedding_model,
+                   fe.chroma_doc_id
+            FROM face_record fr
+            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id
+            WHERE fr.cut_id = %s
+            """,
+            (cut_id,),
+        )
+        rows = cur.fetchall()
+
+    # (face_id → set of (model, doc_id)) 집계
+    face_ids: set[int] = set()
+    chroma_entries: dict[str, list[str]] = {}  # model → [doc_id, ...]
+    for face_id, model, doc_id in rows:
+        face_ids.add(face_id)
+        if model and doc_id:
+            chroma_entries.setdefault(model, []).append(doc_id)
+
+    # S3 크롭 삭제
+    for face_id in face_ids:
+        try:
+            delete_face_crop(face_id, source, title_id)
+        except Exception as e:
+            print(f"[ocr_yolo] S3 crop 삭제 실패 face_id={face_id}: {e}")
+
+    # Chroma 항목 삭제
+    for model, doc_ids in chroma_entries.items():
+        try:
+            collection = get_face_collection(source, title_id, model)
+            collection.delete(ids=doc_ids)
+        except Exception as e:
+            print(f"[ocr_yolo] Chroma 삭제 실패 model={model}: {e}")
+
+    # DB: FaceEmbedding → face_record 순서로 삭제
+    if face_ids:
+        with db_cursor() as cur:
+            cur.execute(
+                "DELETE FROM face_embedding WHERE face_record_id = ANY(%s)",
+                (list(face_ids),),
+            )
+            cur.execute(
+                "DELETE FROM face_record WHERE id = ANY(%s)",
+                (list(face_ids),),
+            )
+
+
+def _upsert_cut(webtoon_episode_id: int, cut_number: int, now: datetime, source: str, title_id: str) -> int:
     with db_cursor() as cur:
         cur.execute(
             """
@@ -185,14 +239,16 @@ def _upsert_cut(webtoon_episode_id: int, cut_number: int, now: datetime) -> int:
         )
         cut_id = cur.fetchone()[0]
 
-        # 재처리 시 기존 데이터 초기화
+        # 재처리 시 기존 텍스트 데이터 초기화
         cur.execute(
             "DELETE FROM text_annotation WHERE region_id IN (SELECT id FROM text_region WHERE cut_id = %s)",
             (cut_id,),
         )
         cur.execute("DELETE FROM text_region WHERE cut_id = %s", (cut_id,))
-        cur.execute("DELETE FROM face_record WHERE cut_id = %s", (cut_id,))
-        return cut_id
+
+    # face_record는 S3/Chroma 정리 후 삭제
+    _cleanup_cut_faces(cut_id, source, title_id)
+    return cut_id
 
 
 def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
@@ -237,10 +293,10 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
         now = datetime.now(timezone.utc)
         try:
             # cut[N] WebtoonCut upsert (세그먼트 저장 전 cut row 필요)
-            _upsert_cut(msg.webtoon_episode_id, cut, now)
+            _upsert_cut(msg.webtoon_episode_id, cut, now, msg.source, msg.title_id)
             # cut[N+1]도 미리 upsert (세그먼트가 cut[N+1] 영역에 걸칠 수 있으므로)
             if next_cut_bytes is not None:
-                _upsert_cut(msg.webtoon_episode_id, cut + 1, now)
+                _upsert_cut(msg.webtoon_episode_id, cut + 1, now, msg.source, msg.title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
             for segment in segments:
