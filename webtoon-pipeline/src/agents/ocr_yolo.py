@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 
@@ -22,6 +23,9 @@ from src.worker import app
 
 FACE_PAD_RATIO = 0.15
 FACE_CROP_SIZE = (112, 112)
+
+# 에피소드 30개 처리 후 worker 교체 → paddle C++ 힙 메모리 전체 반납
+_process_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=30)
 
 
 # ── Kafka 메시지 스키마 ────────────────────────────────────────────────────────
@@ -283,7 +287,7 @@ def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
         )
 
 
-def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
+def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episode_id: int) -> tuple[int, str | None]:
     """에피소드 전체 컷을 처리. 반환: (total_cuts, error_msg or None)."""
     cut = 1
     total = 0
@@ -292,11 +296,11 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
     error_msg = None
     next_cut_bytes: bytes | None = None
 
-    print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 처리 시작")
+    print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작")
 
     # cut[1]을 미리 읽어둠
     try:
-        next_cut_bytes = fetch_cut_image(msg.source, msg.title_id, msg.episode_no, 1)
+        next_cut_bytes = fetch_cut_image(source, title_id, episode_no, 1)
     except Exception as e:
         return 0, str(e)
 
@@ -307,7 +311,7 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
 
         # 다음 컷 미리 읽기 (병합용)
         try:
-            next_cut_bytes = fetch_cut_image(msg.source, msg.title_id, msg.episode_no, cut + 1)
+            next_cut_bytes = fetch_cut_image(source, title_id, episode_no, cut + 1)
         except Exception as e:
             error_msg = str(e)
             break
@@ -315,10 +319,10 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
         now = datetime.now(timezone.utc)
         try:
             # cut[N] WebtoonCut upsert (세그먼트 저장 전 cut row 필요)
-            _upsert_cut(msg.webtoon_episode_id, cut, now, msg.source, msg.title_id)
+            _upsert_cut(webtoon_episode_id, cut, now, source, title_id)
             # cut[N+1]도 미리 upsert (세그먼트가 cut[N+1] 영역에 걸칠 수 있으므로)
             if next_cut_bytes is not None:
-                _upsert_cut(msg.webtoon_episode_id, cut + 1, now, msg.source, msg.title_id)
+                _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
 
@@ -330,8 +334,8 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
             cut_faces = 0
             for segment in segments:
                 ocr_n, face_n = _process_segment(
-                    segment, msg.webtoon_episode_id, cut,
-                    msg.source, msg.title_id, region_index, face_index,
+                    segment, webtoon_episode_id, cut,
+                    source, title_id, region_index, face_index,
                 )
                 cut_ocr += ocr_n
                 cut_faces += face_n
@@ -341,16 +345,16 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
             total += 1
 
             print(
-                f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={cut} "
+                f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} "
                 f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
             )
         except Exception as e:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={cut} 오류: {e}")
+            print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} 오류: {e}")
 
         cut += 1
 
     print(
-        f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — "
+        f"[ocr_yolo] {source}/{title_id} ep={episode_no} — "
         f"완료: {total}컷 처리 | 텍스트 영역 총 {total_ocr}개 | 얼굴 총 {total_faces}개"
     )
     return total, error_msg
@@ -367,7 +371,14 @@ async def ocr_yolo_agent(stream):
         _update_phase1_status(msg.webtoon_episode_id, "running")
 
         try:
-            total, error_msg = await loop.run_in_executor(None, _process_episode, msg)
+            total, error_msg = await loop.run_in_executor(
+                _process_pool,
+                _process_episode,
+                msg.source,
+                msg.title_id,
+                msg.episode_no,
+                msg.webtoon_episode_id,
+            )
         except Exception as e:
             print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 치명적 오류: {e}")
             _update_phase1_status(msg.webtoon_episode_id, "error")
