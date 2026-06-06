@@ -24,9 +24,9 @@ def get_chroma_client() -> chromadb.HttpClient:
     return _client
 
 
-def get_face_collection(source: str, title_id: str) -> chromadb.Collection:
-    """웹툰별 얼굴 임베딩 컬렉션 반환 (없으면 생성)."""
+def get_face_collection(source: str, title_id: str, model: str = "clip") -> chromadb.Collection:
+    """웹툰·모델별 얼굴 임베딩 컬렉션 반환 (없으면 생성)."""
     return get_chroma_client().get_or_create_collection(
-        name=f"character_faces_{source}_{title_id}",
+        name=f"character_faces_{source}_{title_id}_{model}",
         metadata={"hnsw:space": "cosine"},
     )
