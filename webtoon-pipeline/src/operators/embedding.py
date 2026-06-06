@@ -8,6 +8,7 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 _MODEL_ID = "openai/clip-vit-large-patch14"
+EMBEDDING_MODEL_NAME = "clip"  # Chroma 컬렉션명 및 face_embedding.embedding_model 저장값
 _model: CLIPModel | None = None
 _processor: CLIPProcessor | None = None
 

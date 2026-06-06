@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,12 +12,12 @@ from typing import Optional
 import faust
 from psycopg2.extras import Json
 
-from src.agents.local_extract import EpisodePhase1Complete, episode_phase1_complete
+from src.agents.embedding_agent import EpisodePhase1bComplete, episode_phase1b_complete
+from src.config import settings
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
-from src.config import settings
-from src.operators.embedding import extract_embedding
+from src.operators.embedding import EMBEDDING_MODEL_NAME, extract_embedding
 from src.worker import app
 
 MATCH_THRESHOLD = settings.MATCH_THRESHOLD
@@ -100,6 +99,15 @@ def _set_phase2_idle(webtoon_id: int) -> None:
     with db_cursor() as cur:
         cur.execute(
             "UPDATE webtoon_pipeline_state SET phase2_status = 'idle', updated_at = %s WHERE webtoon_id = %s",
+            (now, webtoon_id),
+        )
+
+
+def _set_phase2_completed(webtoon_id: int) -> None:
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            "UPDATE webtoon_pipeline_state SET phase2_status = 'completed', updated_at = %s WHERE webtoon_id = %s",
             (now, webtoon_id),
         )
 
@@ -300,14 +308,40 @@ def _seed_confirmed_faces(
 @dataclass
 class _Phase2Result:
     should_trigger_next: bool = False
-    next_msg: Optional[EpisodePhase1Complete] = None
+    next_msg: Optional[EpisodePhase1bComplete] = None
     next_key: str = ""
     should_start_phase3: bool = False
     phase3_msg: Optional[EpisodePhase3Start] = None
     phase3_key: str = ""
 
 
-def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
+def _update_character_first_seen(appearance_id: int, episode_id: int, episode_no: int, cut_number: int) -> None:
+    """기존 캐릭터 매칭 시 first_seen이 더 이른 경우에만 업데이트."""
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE character
+            SET first_seen_episode_id = %s, first_seen_cut = %s, updated_at = %s
+            WHERE id = (
+                SELECT c.id FROM character c
+                JOIN character_appearance ca ON ca.character_id = c.id
+                WHERE ca.id = %s
+            )
+            AND (
+                first_seen_episode_id IS NULL
+                OR (SELECT no FROM webtoon_episode WHERE id = first_seen_episode_id) > %s
+                OR (
+                    (SELECT no FROM webtoon_episode WHERE id = first_seen_episode_id) = %s
+                    AND first_seen_cut > %s
+                )
+            )
+            """,
+            (episode_id, cut_number, now, appearance_id, episode_no, episode_no, cut_number),
+        )
+
+
+def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
     result = _Phase2Result()
 
     webtoon = _get_webtoon_info(msg.webtoon_episode_id)
@@ -330,7 +364,7 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
         return result  # idle 전환, 이벤트 미발행 → 자연 대기
 
     # ── Chroma 콜렉션 로드 ────────────────────────────────────────────────────────────────
-    collection = get_face_collection(source, title_id)
+    collection = get_face_collection(source, title_id, EMBEDDING_MODEL_NAME)
 
     # ── 수동 확정 얼굴 시딩 ──────────────────────────────────────────────────────────
     seeded_count = _seed_confirmed_faces(webtoon_id, source, title_id, collection)
@@ -370,6 +404,7 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
             appearance_id: int = best_meta["appearance_id"]
             char_name: str = best_meta.get("character_name") or best_meta["character_id"]
             match_score: Optional[float] = best_distance
+            _update_character_first_seen(appearance_id, msg.webtoon_episode_id, msg.episode_no, face["cut_number"])
         else:
             # 신규 캐릭터 발급 (§5.5-1, §12.2)
             allocated = _allocate_character(webtoon_id, msg.webtoon_episode_id, face["cut_number"])
@@ -407,15 +442,19 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
     # ── 다음 에피소드 자기 트리거 (§18.3) ────────────────────────────────────────────────
     next_ep = _get_next_ready_episode(webtoon_id, msg.episode_no)
     if next_ep:
-        result.should_trigger_next = True
-        result.next_key = kafka_key
-        result.next_msg = EpisodePhase1Complete(
-            source=source,
-            title_id=title_id,
-            episode_no=next_ep["no"],
-            webtoon_episode_id=next_ep["id"],
-            total_cuts=0,
-        )
+        if max_ep is not None and next_ep["no"] > max_ep:
+            _set_phase2_idle(webtoon_id)
+        else:
+            result.should_trigger_next = True
+            result.next_key = kafka_key
+            result.next_msg = EpisodePhase1bComplete(
+                source=source,
+                title_id=title_id,
+                episode_no=next_ep["no"],
+                webtoon_episode_id=next_ep["id"],
+            )
+    else:
+        _set_phase2_completed(webtoon_id)
 
     # ── Phase 3 트리거 (활성 웹툰만, §12.10) ─────────────────────────────────────────────
     if state["phase3_enabled"]:
@@ -433,7 +472,7 @@ def _process_episode(msg: EpisodePhase1Complete) -> _Phase2Result:
 
 # ── Faust Agent ─────────────────────────────────────────────────────────────────────────────
 
-@app.agent(episode_phase1_complete, concurrency=1)
+@app.agent(episode_phase1b_complete, concurrency=1)
 async def face_identify_agent(stream):
     loop = asyncio.get_running_loop()
     async for msg in stream:
@@ -446,7 +485,7 @@ async def face_identify_agent(stream):
             continue
 
         if result.should_trigger_next:
-            await episode_phase1_complete.send(
+            await episode_phase1b_complete.send(
                 key=result.next_key,
                 value=result.next_msg,
             )

@@ -10,7 +10,7 @@ import faust
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
-from src.operators.embedding import extract_embedding
+from src.operators.embedding import extract_embedding, EMBEDDING_MODEL_NAME
 from src.worker import app
 
 
@@ -72,7 +72,7 @@ def _sync_face(msg: FaceChromaSyncMsg) -> None:
         f"{msg.webtoon_id}_{face['episode_no']}_{face['cut_number']}_F{face['face_idx']}"
     )
 
-    collection = get_face_collection(msg.source, msg.title_id)
+    collection = get_face_collection(msg.source, msg.title_id, EMBEDDING_MODEL_NAME)
     b = face["bbox"]
     collection.upsert(
         ids=[doc_id],
