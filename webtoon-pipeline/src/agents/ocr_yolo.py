@@ -151,8 +151,8 @@ def _process_segment(
                 """
                 INSERT INTO face_record
                     (cut_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                     conf, chroma_doc_id, is_confirmed, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, '', false, %s, %s)
+                     conf, is_confirmed, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, false, %s, %s)
                 ON CONFLICT ON CONSTRAINT uniq_face_record_cut_idx DO NOTHING
                 RETURNING id
                 """,

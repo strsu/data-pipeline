@@ -30,18 +30,20 @@ def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
             """
             SELECT fr.id, fr.face_idx,
                    fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
-                   fr.conf, fr.chroma_doc_id, fr.appearance_id,
+                   fr.conf, fr.appearance_id,
                    wc.cut_number, we.no AS episode_no,
                    ca.label AS appearance_label,
-                   c.name AS character_name
+                   c.name AS character_name,
+                   fe.chroma_doc_id
             FROM face_record fr
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             JOIN webtoon_episode we ON wc.episode_id = we.id
             JOIN character_appearance ca ON fr.appearance_id = ca.id
             JOIN character c ON ca.character_id = c.id
+            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
             WHERE fr.id = %s AND fr.deleted_at IS NULL
             """,
-            (face_record_id,),
+            (EMBEDDING_MODEL_NAME, face_record_id),
         )
         row = cur.fetchone()
         if not row:
@@ -49,9 +51,10 @@ def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
         return {
             "id": row[0], "face_idx": row[1],
             "bbox": [row[2], row[3], row[4], row[5]],
-            "conf": row[6], "chroma_doc_id": row[7], "appearance_id": row[8],
-            "cut_number": row[9], "episode_no": row[10],
-            "appearance_label": row[11], "character_name": row[12],
+            "conf": row[6], "appearance_id": row[7],
+            "cut_number": row[8], "episode_no": row[9],
+            "appearance_label": row[10], "character_name": row[11],
+            "chroma_doc_id": row[12],
         }
 
 
