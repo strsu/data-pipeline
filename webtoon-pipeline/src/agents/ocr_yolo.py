@@ -79,18 +79,23 @@ def _process_segment(
     cut_number_n: int,
     source: str,
     title_id: str,
-) -> None:
-    """단일 세그먼트에 OCR + YOLO를 실행하고 결과를 DB에 저장."""
+    region_index: dict[int, int],
+    face_index: dict[int, int],
+) -> tuple[int, int]:
+    """단일 세그먼트에 OCR + YOLO를 실행하고 결과를 DB에 저장.
+
+    region_index, face_index: cut_id → 다음 인덱스 (호출자가 공유, 컷 내 중복 방지)
+    반환: (저장된 OCR 영역 수, 저장된 얼굴 수)
+    """
     ocr_blocks = run_ocr(segment.image_bytes)
     faces = detect_faces(segment.image_bytes)
 
+    saved_ocr = 0
+    saved_faces = 0
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
-        # 세그먼트별 bbox를 원본 컷 좌표로 변환하여 cut_number 결정
-        # cut_offset=0 → cut[N], cut_offset=1 → cut[N+1]
-
         # OCR 블록 저장
-        for idx, block in enumerate(ocr_blocks):
+        for block in ocr_blocks:
             raw_bbox = block.get("bbox_2d") or [0, 0, 0, 0]
             adjusted_bbox, cut_offset = adjust_bbox_to_cut(
                 [raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]], segment
@@ -108,6 +113,10 @@ def _process_segment(
             if not row:
                 continue
             cut_id = row[0]
+
+            # 세그먼트 간 공유 카운터로 같은 cut_id 내 index 중복 방지
+            idx = region_index.get(cut_id, 0)
+            region_index[cut_id] = idx + 1
 
             cur.execute(
                 """
@@ -128,9 +137,10 @@ def _process_segment(
                 """,
                 (region_id, block["text"], block.get("score"), now, now),
             )
+            saved_ocr += 1
 
         # 얼굴 저장
-        for idx, face in enumerate(faces):
+        for face in faces:
             adjusted_bbox, cut_offset = adjust_bbox_to_cut(face["bbox"], segment)
             actual_cut = cut_number_n + cut_offset
 
@@ -146,6 +156,10 @@ def _process_segment(
                 continue
             cut_id = row[0]
 
+            # 세그먼트 간 공유 카운터로 같은 cut_id 내 face_idx 중복 방지
+            face_idx = face_index.get(cut_id, 0)
+            face_index[cut_id] = face_idx + 1
+
             b = adjusted_bbox
             cur.execute(
                 """
@@ -156,18 +170,21 @@ def _process_segment(
                 ON CONFLICT ON CONSTRAINT uniq_face_record_cut_idx DO NOTHING
                 RETURNING id
                 """,
-                (cut_id, idx, b[0], b[1], b[2], b[3], face["conf"], now, now),
+                (cut_id, face_idx, b[0], b[1], b[2], b[3], face["conf"], now, now),
             )
             result = cur.fetchone()
             if not result:
                 continue
             face_record_id = result[0]
+            saved_faces += 1
 
             try:
                 crop_bytes = _crop_face(segment.image_bytes, face["bbox"])
                 upload_face_crop(face_record_id, source, title_id, crop_bytes)
             except Exception as e:
                 print(f"[ocr_yolo] face crop upload 실패 face_id={face_record_id}: {e}")
+
+    return saved_ocr, saved_faces
 
 
 def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
@@ -270,8 +287,13 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
     """에피소드 전체 컷을 처리. 반환: (total_cuts, error_msg or None)."""
     cut = 1
     total = 0
+    total_ocr = 0
+    total_faces = 0
     error_msg = None
     next_cut_bytes: bytes | None = None
+
+    print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 처리 시작")
+
     # cut[1]을 미리 읽어둠
     try:
         next_cut_bytes = fetch_cut_image(msg.source, msg.title_id, msg.episode_no, 1)
@@ -299,15 +321,38 @@ def _process_episode(msg: EpisodeStartMsg) -> tuple[int, str | None]:
                 _upsert_cut(msg.webtoon_episode_id, cut + 1, now, msg.source, msg.title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
-            for segment in segments:
-                _process_segment(segment, msg.webtoon_episode_id, cut, msg.source, msg.title_id)
 
+            # 컷 내 index 중복 방지: 세그먼트 전체에서 공유하는 카운터
+            region_index: dict[int, int] = {}
+            face_index: dict[int, int] = {}
+
+            cut_ocr = 0
+            cut_faces = 0
+            for segment in segments:
+                ocr_n, face_n = _process_segment(
+                    segment, msg.webtoon_episode_id, cut,
+                    msg.source, msg.title_id, region_index, face_index,
+                )
+                cut_ocr += ocr_n
+                cut_faces += face_n
+
+            total_ocr += cut_ocr
+            total_faces += cut_faces
             total += 1
+
+            print(
+                f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={cut} "
+                f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
+            )
         except Exception as e:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={cut} error: {e}")
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={cut} 오류: {e}")
 
         cut += 1
 
+    print(
+        f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — "
+        f"완료: {total}컷 처리 | 텍스트 영역 총 {total_ocr}개 | 얼굴 총 {total_faces}개"
+    )
     return total, error_msg
 
 
@@ -318,16 +363,18 @@ async def ocr_yolo_agent(stream):
     loop = asyncio.get_running_loop()
 
     async for msg in stream:
+        print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 메시지 수신")
         _update_phase1_status(msg.webtoon_episode_id, "running")
 
         try:
             total, error_msg = await loop.run_in_executor(None, _process_episode, msg)
         except Exception as e:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} fatal: {e}")
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 치명적 오류: {e}")
             _update_phase1_status(msg.webtoon_episode_id, "error")
             continue
 
         if error_msg:
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 에러 종료: {error_msg}")
             await episode_phase1a_error.send(
                 key=f"{msg.source}_{msg.title_id}",
                 value=EpisodePhase1aError(
