@@ -295,6 +295,8 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
     total_faces = 0
     error_msg = None
     next_cut_bytes: bytes | None = None
+    # 직전 라운드 마지막 세그먼트가 cut[N+1] 영역에 걸쳐 있었는지 여부
+    prev_last_seg_crossed: bool = False
 
     print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작")
 
@@ -325,6 +327,18 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
                 _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
+
+            # 직전 라운드 마지막 세그먼트가 이 컷(현재 cut[N]) 시작과 겹쳤으면 첫 세그먼트 제거
+            if prev_last_seg_crossed and segments:
+                segments = segments[1:]
+
+            # 다음 라운드를 위해 현재 마지막 세그먼트가 cut[N+1]에 걸치는지 기록
+            # y_offset < cut_n_height: 세그먼트가 cut[N] 영역에서 시작해 cut[N+1]까지 연장됨
+            if segments:
+                last_seg = segments[-1]
+                prev_last_seg_crossed = last_seg.y_offset < last_seg.cut_n_height
+            else:
+                prev_last_seg_crossed = False
 
             # 컷 내 index 중복 방지: 세그먼트 전체에서 공유하는 카운터
             region_index: dict[int, int] = {}
