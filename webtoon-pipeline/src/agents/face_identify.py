@@ -408,7 +408,7 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
             best_distance = None
             best_meta = None
 
-        if has_match and best_distance <= MATCH_THRESHOLD:
+        if has_match and best_distance <= MATCH_THRESHOLD and "appearance_id" in best_meta:
             # 기존 캐릭터 매칭
             appearance_id: int = best_meta["appearance_id"]
             char_name: str = best_meta.get("character_name") or best_meta["character_id"]
