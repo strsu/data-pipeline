@@ -17,6 +17,10 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
             dbname=settings.DB_NAME,
             user=settings.DB_USER,
             password=settings.DB_PASSWORD,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
     return _pool
 
@@ -26,11 +30,17 @@ def db_cursor():
     pool = _get_pool()
     conn = pool.getconn()
     try:
+        if conn.closed:
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
         with conn.cursor() as cur:
             yield cur
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
         pool.putconn(conn)
