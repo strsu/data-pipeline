@@ -1,4 +1,4 @@
-"""YOLO 얼굴 탐지 — pipeline.py FaceOperator._detect 로직 이식."""
+"""YOLO 얼굴 탐지."""
 from __future__ import annotations
 
 from io import BytesIO
@@ -6,7 +6,7 @@ from io import BytesIO
 from PIL import Image
 from ultralytics import YOLO
 
-from src.config.settings import (
+from src.config import (
     ASPECT_RATIO_MAX,
     ASPECT_RATIO_MIN,
     FACE_CONF_THRESHOLD,
