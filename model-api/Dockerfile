@@ -64,4 +64,6 @@ CMD ["gunicorn", "src.main:app", \
      "--max-requests=50", \
      "--max-requests-jitter=10", \
      "--timeout=120", \
-     "--bind=0.0.0.0:8000"]
+     "--bind=0.0.0.0:8000", \
+     "--access-logfile=-", \
+     "--log-level=info"]
