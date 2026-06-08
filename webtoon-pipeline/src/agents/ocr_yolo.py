@@ -389,7 +389,7 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
                 f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} "
                 f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
             )
-        except httpx.HTTPError:
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
             raise  # 에이전트 레벨에서 Kafka 재큐 처리
         except Exception as e:
             print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} 오류: {e}")
@@ -439,8 +439,23 @@ async def ocr_yolo_agent(stream):
                 msg.episode_no,
                 msg.webtoon_episode_id,
             )
-        except httpx.HTTPError as e:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 장애: {e}, 재큐")
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            # 인프라 일시 장애 (model-api 기동 중 등) → retry_count 소진 없이 재큐
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 미응답: {e}, 재큐")
+            await cut_phase1_start.send(
+                key=f"{msg.source}_{msg.title_id}",
+                value=EpisodeStartMsg(
+                    source=msg.source,
+                    title_id=msg.title_id,
+                    episode_no=msg.episode_no,
+                    webtoon_episode_id=msg.webtoon_episode_id,
+                    retry_count=msg.retry_count,  # 카운트 유지
+                ),
+            )
+            continue
+        except httpx.HTTPStatusError as e:
+            # model-api 가 5xx 반환 → retry_count 증가
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 오류 {e.response.status_code}: {e}, 재큐")
             await cut_phase1_start.send(
                 key=f"{msg.source}_{msg.title_id}",
                 value=EpisodeStartMsg(
