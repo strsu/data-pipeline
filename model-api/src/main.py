@@ -1,6 +1,7 @@
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from src.models.ocr import get_ocr
@@ -10,10 +11,26 @@ from src.routers import ocr_yolo, embed
 
 _ready = False
 
+_LOG_FMT = "%(asctime)s [%(process)d] [%(levelname)s] %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+logging.basicConfig(format=_LOG_FMT, datefmt=_LOG_DATEFMT, level=logging.INFO, force=True)
+
+# uvicorn.access 핸들러에도 동일한 timestamp 포맷 적용
+def _patch_access_log() -> None:
+    logger = logging.getLogger("uvicorn.access")
+    fmt = logging.Formatter(
+        '%(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        datefmt=_LOG_DATEFMT,
+    )
+    for handler in logger.handlers:
+        handler.setFormatter(fmt)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _ready
+    _patch_access_log()
     get_ocr()
     get_yolo()
     get_clip()

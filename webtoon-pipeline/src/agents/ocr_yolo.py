@@ -93,6 +93,7 @@ def _process_segment(
     cut_number_n: int,
     source: str,
     title_id: str,
+    episode_no: int,
     region_index: dict[int, int],
     face_index: dict[int, int],
     saved_face_bboxes: dict[int, list],
@@ -101,7 +102,13 @@ def _process_segment(
 
     httpx.HTTPError는 그대로 전파 → 에이전트 레벨에서 Kafka 재큐 처리.
     """
-    ocr_blocks, faces = run_ocr_yolo(segment.image_bytes)
+    ocr_blocks, faces = run_ocr_yolo(
+        segment.image_bytes,
+        source=source,
+        title_id=title_id,
+        episode_no=episode_no,
+        cut=cut_number_n,
+    )
 
     saved_ocr = 0
     saved_faces = 0
@@ -375,7 +382,7 @@ def _process_cut(
     for segment in segments:
         ocr_n, face_n = _process_segment(
             segment, webtoon_episode_id, cut,
-            source, title_id, region_index, face_index, saved_face_bboxes,
+            source, title_id, episode_no, region_index, face_index, saved_face_bboxes,
         )
         cut_ocr += ocr_n
         cut_faces += face_n
