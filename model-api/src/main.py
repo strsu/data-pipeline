@@ -18,13 +18,17 @@ logging.basicConfig(format=_LOG_FMT, datefmt=_LOG_DATEFMT, level=logging.INFO, f
 
 # uvicorn.access 핸들러에도 동일한 timestamp 포맷 적용
 def _patch_access_log() -> None:
-    logger = logging.getLogger("uvicorn.access")
-    fmt = logging.Formatter(
-        '%(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s',
-        datefmt=_LOG_DATEFMT,
-    )
-    for handler in logger.handlers:
-        handler.setFormatter(fmt)
+    try:
+        from uvicorn.logging import AccessFormatter
+        logger = logging.getLogger("uvicorn.access")
+        fmt = AccessFormatter(
+            '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            datefmt=_LOG_DATEFMT,
+        )
+        for handler in logger.handlers:
+            handler.setFormatter(fmt)
+    except Exception:
+        pass
 
 
 @asynccontextmanager
