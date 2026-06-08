@@ -23,9 +23,20 @@ from src.worker import app
 
 FACE_PAD_RATIO = 0.15
 FACE_CROP_SIZE = (112, 112)
+_IOU_DEDUP_THRESHOLD = 0.5
+
+
+def _iou(a: list[float], b: list[float]) -> float:
+    xi1, yi1 = max(a[0], b[0]), max(a[1], b[1])
+    xi2, yi2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, xi2 - xi1) * max(0.0, yi2 - yi1)
+    if inter == 0.0:
+        return 0.0
+    union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / union if union > 0.0 else 0.0
 
 # 에피소드 30개 처리 후 worker 교체 → paddle C++ 힙 메모리 전체 반납
-_process_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=30)
+_process_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=5)
 
 
 # ── Kafka 메시지 스키마 ────────────────────────────────────────────────────────
@@ -85,10 +96,11 @@ def _process_segment(
     title_id: str,
     region_index: dict[int, int],
     face_index: dict[int, int],
+    saved_face_bboxes: dict[int, list],
 ) -> tuple[int, int]:
     """단일 세그먼트에 OCR + YOLO를 실행하고 결과를 DB에 저장.
 
-    region_index, face_index: cut_id → 다음 인덱스 (호출자가 공유, 컷 내 중복 방지)
+    region_index, face_index, saved_face_bboxes: episode 레벨 공유 상태
     반환: (저장된 OCR 영역 수, 저장된 얼굴 수)
     """
     ocr_blocks = run_ocr(segment.image_bytes)
@@ -101,10 +113,13 @@ def _process_segment(
         # OCR 블록 저장
         for block in ocr_blocks:
             raw_bbox = block.get("bbox_2d") or [0, 0, 0, 0]
-            adjusted_bbox, cut_offset = adjust_bbox_to_cut(
+            adjusted_bbox, _ = adjust_bbox_to_cut(
                 [raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]], segment
             )
-            actual_cut = cut_number_n + cut_offset
+            abs_y_center = segment.y_offset + (raw_bbox[1] + raw_bbox[3]) / 2
+            if abs_y_center >= segment.cut_n_height:
+                continue
+            actual_cut = cut_number_n
 
             cur.execute(
                 """
@@ -145,6 +160,14 @@ def _process_segment(
 
         # 얼굴 저장
         for face in faces:
+            # 얼굴 상단이 split 아래(cut[N+1] 내부)로 완전히 내려가면 skip →
+            # 다음 라운드에서 경계를 걸친(또는 cut[N] 내부) 온전한 형태로 잡혀 저장된다.
+            # split 위 또는 경계를 걸친 얼굴만 이 라운드에서 처리해 병합 뷰의 full crop을 확보한다.
+            abs_y1 = segment.y_offset + face["bbox"][1]
+            if abs_y1 >= segment.cut_n_height:
+                continue
+
+            # center 기준 단일 귀속 (bbox 좌표계도 center가 정한 컷에 맞춰 변환됨)
             adjusted_bbox, cut_offset = adjust_bbox_to_cut(face["bbox"], segment)
             actual_cut = cut_number_n + cut_offset
 
@@ -160,7 +183,15 @@ def _process_segment(
                 continue
             cut_id = row[0]
 
-            # 세그먼트 간 공유 카운터로 같은 cut_id 내 face_idx 중복 방지
+            # cross-boundary 얼굴이 다음 라운드에서 잘린 형태로 재검출될 때 제거.
+            # 경계 걸친 얼굴(이전 라운드, full)과 cut[N] 상단 재검출(다음 라운드, 잘림)이
+            # 같은 cut_id로 비교되어, 먼저 저장된 full crop만 남는다.
+            norm = [adjusted_bbox[0], max(0.0, adjusted_bbox[1]),
+                    adjusted_bbox[2], max(0.0, adjusted_bbox[3])]
+            if any(_iou(norm, s) >= _IOU_DEDUP_THRESHOLD for s in saved_face_bboxes.get(cut_id, [])):
+                continue
+            saved_face_bboxes.setdefault(cut_id, []).append(norm)
+
             face_idx = face_index.get(cut_id, 0)
             face_index[cut_id] = face_idx + 1
 
@@ -267,9 +298,16 @@ def _upsert_cut(webtoon_episode_id: int, cut_number: int, now: datetime, source:
         )
         cur.execute("DELETE FROM text_region WHERE cut_id = %s", (cut_id,))
 
-    # face_record는 S3/Chroma 정리 후 삭제
-    _cleanup_cut_faces(cut_id, source, title_id)
     return cut_id
+
+
+def _cleanup_episode_faces(webtoon_episode_id: int, source: str, title_id: str) -> None:
+    """에피소드 시작 시 전체 face 데이터 일괄 정리 (재처리 지원)."""
+    with db_cursor() as cur:
+        cur.execute("SELECT id FROM webtoon_cut WHERE episode_id = %s", (webtoon_episode_id,))
+        cut_ids = [row[0] for row in cur.fetchall()]
+    for cut_id in cut_ids:
+        _cleanup_cut_faces(cut_id, source, title_id)
 
 
 def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
@@ -295,10 +333,15 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
     total_faces = 0
     error_msg = None
     next_cut_bytes: bytes | None = None
-    # 직전 라운드 마지막 세그먼트가 cut[N+1] 영역에 걸쳐 있었는지 여부
-    prev_last_seg_crossed: bool = False
 
     print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작")
+
+    # 재처리 시 기존 face 데이터 일괄 정리 (OCR text는 _upsert_cut에서 per-cut 정리)
+    _cleanup_episode_faces(webtoon_episode_id, source, title_id)
+
+    # episode 레벨 공유 상태: round 간 face_idx 충돌 방지 + IoU 중복 체크
+    face_index: dict[int, int] = {}
+    saved_face_bboxes: dict[int, list] = {}
 
     # cut[1]을 미리 읽어둠
     try:
@@ -320,36 +363,22 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
 
         now = datetime.now(timezone.utc)
         try:
-            # cut[N] WebtoonCut upsert (세그먼트 저장 전 cut row 필요)
+            # cut[N] upsert + cut[N+1] row 생성 (cross-boundary face 저장 대상)
             _upsert_cut(webtoon_episode_id, cut, now, source, title_id)
-            # cut[N+1]도 미리 upsert (세그먼트가 cut[N+1] 영역에 걸칠 수 있으므로)
             if next_cut_bytes is not None:
                 _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
 
-            # 직전 라운드 마지막 세그먼트가 이 컷(현재 cut[N]) 시작과 겹쳤으면 첫 세그먼트 제거
-            if prev_last_seg_crossed and segments:
-                segments = segments[1:]
-
-            # 다음 라운드를 위해 현재 마지막 세그먼트가 cut[N+1]에 걸치는지 기록
-            # y_offset < cut_n_height: 세그먼트가 cut[N] 영역에서 시작해 cut[N+1]까지 연장됨
-            if segments:
-                last_seg = segments[-1]
-                prev_last_seg_crossed = last_seg.y_offset < last_seg.cut_n_height
-            else:
-                prev_last_seg_crossed = False
-
-            # 컷 내 index 중복 방지: 세그먼트 전체에서 공유하는 카운터
+            # OCR index는 per-round (text는 _upsert_cut에서 매 round 초기화)
             region_index: dict[int, int] = {}
-            face_index: dict[int, int] = {}
 
             cut_ocr = 0
             cut_faces = 0
             for segment in segments:
                 ocr_n, face_n = _process_segment(
                     segment, webtoon_episode_id, cut,
-                    source, title_id, region_index, face_index,
+                    source, title_id, region_index, face_index, saved_face_bboxes,
                 )
                 cut_ocr += ocr_n
                 cut_faces += face_n
@@ -376,7 +405,7 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
 
 # ── Faust Agent ───────────────────────────────────────────────────────────────
 
-@app.agent(cut_phase1_start)
+@app.agent(cut_phase1_start, concurrency=1)
 async def ocr_yolo_agent(stream):
     loop = asyncio.get_running_loop()
 

@@ -126,6 +126,10 @@ def adjust_bbox_to_cut(
 ) -> tuple[list[float], int]:
     """세그먼트 좌표계 bbox를 원본 컷 좌표계로 변환.
 
+    귀속 컷은 bbox 중심(center) 기준으로 결정한다. 좌표계 변환도 center가 정한
+    컷에 맞추므로, 귀속 판정과 변환 좌표계가 항상 일치한다 (cross-boundary
+    중복 dedup이 같은 cut 내에서 정상 동작하도록 보장).
+
     Returns:
         (변환된 bbox [x1,y1,x2,y2], 귀속 cut_offset)
         cut_offset=0: cut[N], cut_offset=1: cut[N+1]
@@ -133,10 +137,11 @@ def adjust_bbox_to_cut(
     x1, y1, x2, y2 = bbox
     abs_y1 = segment.y_offset + y1
     abs_y2 = segment.y_offset + y2
+    abs_yc = (abs_y1 + abs_y2) / 2
 
-    if abs_y1 < segment.cut_n_height:
-        # cut[N]에 귀속 (경계 걸쳐도 위 컷 기준)
+    if abs_yc < segment.cut_n_height:
+        # center가 cut[N]에 귀속 (경계 걸쳐도 중심이 위 컷이면 위 컷 기준)
         return [x1, abs_y1, x2, abs_y2], 0
     else:
-        # cut[N+1]에 귀속
+        # center가 cut[N+1]에 귀속
         return [x1, abs_y1 - segment.cut_n_height, x2, abs_y2 - segment.cut_n_height], 1
