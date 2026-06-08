@@ -6,19 +6,18 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 
 import faust
+import httpx
 from PIL import Image
 
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import delete_face_crop, fetch_cut_image, upload_face_crop
 from src.operators.cut_merger import CutSegment, adjust_bbox_to_cut, split_cut_pair
-from src.operators.ocr import run_ocr
-from src.operators.yolo import detect_faces
+from src.operators.ocr_yolo_client import run_ocr_yolo
 from src.worker import app
 
 FACE_PAD_RATIO = 0.15
@@ -35,9 +34,6 @@ def _iou(a: list[float], b: list[float]) -> float:
     union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
     return inter / union if union > 0.0 else 0.0
 
-# 에피소드 30개 처리 후 worker 교체 → paddle C++ 힙 메모리 전체 반납
-_process_pool = ProcessPoolExecutor(max_workers=1, max_tasks_per_child=5)
-
 
 # ── Kafka 메시지 스키마 ────────────────────────────────────────────────────────
 
@@ -46,6 +42,7 @@ class EpisodeStartMsg(faust.Record):
     title_id: str
     episode_no: int
     webtoon_episode_id: int
+    retry_count: int = 0
 
 
 class EpisodePhase1aComplete(faust.Record):
@@ -100,11 +97,9 @@ def _process_segment(
 ) -> tuple[int, int]:
     """단일 세그먼트에 OCR + YOLO를 실행하고 결과를 DB에 저장.
 
-    region_index, face_index, saved_face_bboxes: episode 레벨 공유 상태
-    반환: (저장된 OCR 영역 수, 저장된 얼굴 수)
+    httpx.HTTPError는 그대로 전파 → 에이전트 레벨에서 Kafka 재큐 처리.
     """
-    ocr_blocks = run_ocr(segment.image_bytes)
-    faces = detect_faces(segment.image_bytes)
+    ocr_blocks, faces = run_ocr_yolo(segment.image_bytes)
 
     saved_ocr = 0
     saved_faces = 0
@@ -133,7 +128,6 @@ def _process_segment(
                 continue
             cut_id = row[0]
 
-            # 세그먼트 간 공유 카운터로 같은 cut_id 내 index 중복 방지
             idx = region_index.get(cut_id, 0)
             region_index[cut_id] = idx + 1
 
@@ -160,14 +154,10 @@ def _process_segment(
 
         # 얼굴 저장
         for face in faces:
-            # 얼굴 상단이 split 아래(cut[N+1] 내부)로 완전히 내려가면 skip →
-            # 다음 라운드에서 경계를 걸친(또는 cut[N] 내부) 온전한 형태로 잡혀 저장된다.
-            # split 위 또는 경계를 걸친 얼굴만 이 라운드에서 처리해 병합 뷰의 full crop을 확보한다.
             abs_y1 = segment.y_offset + face["bbox"][1]
             if abs_y1 >= segment.cut_n_height:
                 continue
 
-            # center 기준 단일 귀속 (bbox 좌표계도 center가 정한 컷에 맞춰 변환됨)
             adjusted_bbox, cut_offset = adjust_bbox_to_cut(face["bbox"], segment)
             actual_cut = cut_number_n + cut_offset
 
@@ -183,9 +173,6 @@ def _process_segment(
                 continue
             cut_id = row[0]
 
-            # cross-boundary 얼굴이 다음 라운드에서 잘린 형태로 재검출될 때 제거.
-            # 경계 걸친 얼굴(이전 라운드, full)과 cut[N] 상단 재검출(다음 라운드, 잘림)이
-            # 같은 cut_id로 비교되어, 먼저 저장된 full crop만 남는다.
             norm = [adjusted_bbox[0], max(0.0, adjusted_bbox[1]),
                     adjusted_bbox[2], max(0.0, adjusted_bbox[3])]
             if any(_iou(norm, s) >= _IOU_DEDUP_THRESHOLD for s in saved_face_bboxes.get(cut_id, [])):
@@ -225,7 +212,6 @@ def _process_segment(
 def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
     """기존 컷의 face_record + S3 크롭 + Chroma + FaceEmbedding을 모두 제거한다."""
     with db_cursor() as cur:
-        # face_record별 S3 크롭 삭제 및 Chroma/FaceEmbedding 정리
         cur.execute(
             """
             SELECT fr.id,
@@ -239,22 +225,19 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
         )
         rows = cur.fetchall()
 
-    # (face_id → set of (model, doc_id)) 집계
     face_ids: set[int] = set()
-    chroma_entries: dict[str, list[str]] = {}  # model → [doc_id, ...]
+    chroma_entries: dict[str, list[str]] = {}
     for face_id, model, doc_id in rows:
         face_ids.add(face_id)
         if model and doc_id:
             chroma_entries.setdefault(model, []).append(doc_id)
 
-    # S3 크롭 삭제
     for face_id in face_ids:
         try:
             delete_face_crop(face_id, source, title_id)
         except Exception as e:
             print(f"[ocr_yolo] S3 crop 삭제 실패 face_id={face_id}: {e}")
 
-    # Chroma 항목 삭제
     for model, doc_ids in chroma_entries.items():
         try:
             collection = get_face_collection(source, title_id, model)
@@ -262,7 +245,6 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
         except Exception as e:
             print(f"[ocr_yolo] Chroma 삭제 실패 model={model}: {e}")
 
-    # DB: FaceEmbedding → face_record 순서로 삭제
     if face_ids:
         with db_cursor() as cur:
             cur.execute(
@@ -291,7 +273,6 @@ def _upsert_cut(webtoon_episode_id: int, cut_number: int, now: datetime, source:
         )
         cut_id = cur.fetchone()[0]
 
-        # 재처리 시 기존 텍스트 데이터 초기화
         cur.execute(
             "DELETE FROM text_annotation WHERE region_id IN (SELECT id FROM text_region WHERE cut_id = %s)",
             (cut_id,),
@@ -310,6 +291,20 @@ def _cleanup_episode_faces(webtoon_episode_id: int, source: str, title_id: str) 
         _cleanup_cut_faces(cut_id, source, title_id)
 
 
+def _get_last_processed_cut(webtoon_episode_id: int) -> int:
+    """가장 마지막으로 처리 완료된 컷 번호를 반환한다. 없으면 0."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(cut_number), 0)
+            FROM webtoon_cut
+            WHERE episode_id = %s AND processed_at IS NOT NULL
+            """,
+            (webtoon_episode_id,),
+        )
+        return cur.fetchone()[0]
+
+
 def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
@@ -326,26 +321,32 @@ def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
 
 
 def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episode_id: int) -> tuple[int, str | None]:
-    """에피소드 전체 컷을 처리. 반환: (total_cuts, error_msg or None)."""
-    cut = 1
+    """에피소드 전체 컷을 처리. 반환: (total_cuts, error_msg or None).
+
+    httpx.HTTPError는 잡지 않고 전파 → 에이전트가 Kafka 재큐 처리.
+    """
+    # 체크포인트: OOM 재시작 시 마지막 처리 컷 다음부터 재개
+    last_processed = _get_last_processed_cut(webtoon_episode_id)
+    resume_from = last_processed + 1 if last_processed > 0 else 1
+
+    cut = resume_from
     total = 0
     total_ocr = 0
     total_faces = 0
     error_msg = None
     next_cut_bytes: bytes | None = None
 
-    print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작")
+    print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작 (cut={resume_from}부터)")
 
-    # 재처리 시 기존 face 데이터 일괄 정리 (OCR text는 _upsert_cut에서 per-cut 정리)
-    _cleanup_episode_faces(webtoon_episode_id, source, title_id)
+    # 처음부터 시작할 때만 기존 face 데이터 정리
+    if resume_from == 1:
+        _cleanup_episode_faces(webtoon_episode_id, source, title_id)
 
-    # episode 레벨 공유 상태: round 간 face_idx 충돌 방지 + IoU 중복 체크
     face_index: dict[int, int] = {}
     saved_face_bboxes: dict[int, list] = {}
 
-    # cut[1]을 미리 읽어둠
     try:
-        next_cut_bytes = fetch_cut_image(source, title_id, episode_no, 1)
+        next_cut_bytes = fetch_cut_image(source, title_id, episode_no, resume_from)
     except Exception as e:
         return 0, str(e)
 
@@ -354,7 +355,6 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
         if cur_bytes is None:
             break
 
-        # 다음 컷 미리 읽기 (병합용)
         try:
             next_cut_bytes = fetch_cut_image(source, title_id, episode_no, cut + 1)
         except Exception as e:
@@ -363,14 +363,12 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
 
         now = datetime.now(timezone.utc)
         try:
-            # cut[N] upsert + cut[N+1] row 생성 (cross-boundary face 저장 대상)
             _upsert_cut(webtoon_episode_id, cut, now, source, title_id)
             if next_cut_bytes is not None:
                 _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
 
             segments = split_cut_pair(cur_bytes, next_cut_bytes)
 
-            # OCR index는 per-round (text는 _upsert_cut에서 매 round 초기화)
             region_index: dict[int, int] = {}
 
             cut_ocr = 0
@@ -391,6 +389,8 @@ def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episod
                 f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} "
                 f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
             )
+        except httpx.HTTPError:
+            raise  # 에이전트 레벨에서 Kafka 재큐 처리
         except Exception as e:
             print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} 오류: {e}")
 
@@ -410,18 +410,48 @@ async def ocr_yolo_agent(stream):
     loop = asyncio.get_running_loop()
 
     async for msg in stream:
-        print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 메시지 수신")
+        print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 메시지 수신 (retry={msg.retry_count})")
+
+        if msg.retry_count >= 5:
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — retry 상한 초과, 에러 처리")
+            await episode_phase1a_error.send(
+                key=f"{msg.source}_{msg.title_id}",
+                value=EpisodePhase1aError(
+                    source=msg.source,
+                    title_id=msg.title_id,
+                    episode_no=msg.episode_no,
+                    webtoon_episode_id=msg.webtoon_episode_id,
+                    failed_cut=0,
+                    error="model-api retry limit exceeded",
+                ),
+            )
+            _update_phase1_status(msg.webtoon_episode_id, "error")
+            continue
+
         _update_phase1_status(msg.webtoon_episode_id, "running")
 
         try:
             total, error_msg = await loop.run_in_executor(
-                _process_pool,
+                None,
                 _process_episode,
                 msg.source,
                 msg.title_id,
                 msg.episode_no,
                 msg.webtoon_episode_id,
             )
+        except httpx.HTTPError as e:
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 장애: {e}, 재큐")
+            await cut_phase1_start.send(
+                key=f"{msg.source}_{msg.title_id}",
+                value=EpisodeStartMsg(
+                    source=msg.source,
+                    title_id=msg.title_id,
+                    episode_no=msg.episode_no,
+                    webtoon_episode_id=msg.webtoon_episode_id,
+                    retry_count=msg.retry_count + 1,
+                ),
+            )
+            continue
         except Exception as e:
             print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 치명적 오류: {e}")
             _update_phase1_status(msg.webtoon_episode_id, "error")

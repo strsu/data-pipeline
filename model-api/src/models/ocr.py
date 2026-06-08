@@ -1,4 +1,4 @@
-"""PaddleOCR 추출 — pipeline.py parse_ocr_result 로직 그대로 이식."""
+"""PaddleOCR 추출."""
 from __future__ import annotations
 
 from typing import Any
@@ -19,9 +19,7 @@ def get_ocr() -> PaddleOCR:
             use_textline_orientation=False,
             engine="paddle",
             lang="korean",
-            # text_detection_model_name="PP-OCRv5_server_det",
-            # text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
-            enable_mkldnn=False  # AMD CPU: OneDNN은 Intel 전용이라 비활성화
+            enable_mkldnn=False,
         )
     return _ocr
 
@@ -32,8 +30,6 @@ def run_ocr(image_bytes: bytes) -> list[dict[str, Any]]:
         return []
     return _parse_ocr_result(get_ocr().predict(img))
 
-
-# ── 파싱 헬퍼 (pipeline.py parse_ocr_result 동일) ───────────────────────────
 
 def _quad_to_bbox(quad: Any) -> list[int] | None:
     if quad is None:
