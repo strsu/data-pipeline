@@ -1,7 +1,7 @@
 """Stage A Agent: OCR + YOLO → DB 저장 + face crop S3 업로드, episode.phase1a.complete 발행.
 
-컷 처리 시 인접 컷(cut[N+1])을 미리 읽어 자연 구분선 기반 분할을 수행한다.
-분할 후 각 세그먼트에 OCR + YOLO를 실행하고 bbox를 원본 컷 좌표로 변환해 저장한다.
+메시지 하나 = 컷 하나. 처리 완료 후 다음 컷 메시지를 자체 발행한다.
+컷 처리 시 인접 컷(cut[N+1])을 읽어 자연 구분선 기반 분할을 수행한다.
 """
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ class EpisodeStartMsg(faust.Record):
     title_id: str
     episode_no: int
     webtoon_episode_id: int
+    current_cut: int = 1
+    max_cut: int = 0     # 0이면 에이전트가 DB에서 조회
     retry_count: int = 0
 
 
@@ -291,20 +293,6 @@ def _cleanup_episode_faces(webtoon_episode_id: int, source: str, title_id: str) 
         _cleanup_cut_faces(cut_id, source, title_id)
 
 
-def _get_last_processed_cut(webtoon_episode_id: int) -> int:
-    """가장 마지막으로 처리 완료된 컷 번호를 반환한다. 없으면 0."""
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT COALESCE(MAX(cut_number), 0)
-            FROM webtoon_cut
-            WHERE episode_id = %s AND processed_at IS NOT NULL
-            """,
-            (webtoon_episode_id,),
-        )
-        return cur.fetchone()[0]
-
-
 def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
@@ -320,87 +308,83 @@ def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
         )
 
 
-def _process_episode(source: str, title_id: str, episode_no: int, webtoon_episode_id: int) -> tuple[int, str | None]:
-    """에피소드 전체 컷을 처리. 반환: (total_cuts, error_msg or None).
+def _get_image_count(webtoon_episode_id: int) -> int:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT image_count FROM webtoon_episode WHERE id = %s",
+            (webtoon_episode_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
 
-    httpx.HTTPError는 잡지 않고 전파 → 에이전트가 Kafka 재큐 처리.
+
+def _load_face_state(
+    webtoon_episode_id: int, cut_number: int
+) -> tuple[dict[int, int], dict[int, list]]:
+    """이전 컷 처리 시 overlap으로 기록된 face 데이터를 DB에서 복원한다."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT id FROM webtoon_cut WHERE episode_id = %s AND cut_number = %s",
+            (webtoon_episode_id, cut_number),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}, {}
+        cut_id = row[0]
+        cur.execute(
+            "SELECT face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2 FROM face_record WHERE cut_id = %s",
+            (cut_id,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return {}, {}
+    face_index = {cut_id: max(r[0] for r in rows) + 1}
+    saved_face_bboxes = {cut_id: [[r[1], r[2], r[3], r[4]] for r in rows]}
+    return face_index, saved_face_bboxes
+
+
+def _process_cut(
+    source: str,
+    title_id: str,
+    episode_no: int,
+    webtoon_episode_id: int,
+    cut: int,
+) -> bool:
+    """단일 컷을 처리. 반환: 다음 컷 존재 여부 (has_next).
+
+    httpx.HTTPError는 전파 → 에이전트 레벨에서 Kafka 재큐 처리.
     """
-    # 체크포인트: OOM 재시작 시 마지막 처리 컷 다음부터 재개
-    last_processed = _get_last_processed_cut(webtoon_episode_id)
-    resume_from = last_processed + 1 if last_processed > 0 else 1
+    cur_bytes = fetch_cut_image(source, title_id, episode_no, cut)
+    if cur_bytes is None:
+        return False
 
-    cut = resume_from
-    total = 0
-    total_ocr = 0
-    total_faces = 0
-    error_msg = None
-    next_cut_bytes: bytes | None = None
+    next_cut_bytes = fetch_cut_image(source, title_id, episode_no, cut + 1)
 
-    print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} — 처리 시작 (cut={resume_from}부터)")
+    now = datetime.now(timezone.utc)
+    _upsert_cut(webtoon_episode_id, cut, now, source, title_id)
+    if next_cut_bytes is not None:
+        _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
 
-    # 처음부터 시작할 때만 기존 face 데이터 정리
-    if resume_from == 1:
-        _cleanup_episode_faces(webtoon_episode_id, source, title_id)
+    face_index, saved_face_bboxes = _load_face_state(webtoon_episode_id, cut)
+    region_index: dict[int, int] = {}
 
-    face_index: dict[int, int] = {}
-    saved_face_bboxes: dict[int, list] = {}
+    segments = split_cut_pair(cur_bytes, next_cut_bytes)
 
-    try:
-        next_cut_bytes = fetch_cut_image(source, title_id, episode_no, resume_from)
-    except Exception as e:
-        return 0, str(e)
-
-    while True:
-        cur_bytes = next_cut_bytes
-        if cur_bytes is None:
-            break
-
-        try:
-            next_cut_bytes = fetch_cut_image(source, title_id, episode_no, cut + 1)
-        except Exception as e:
-            error_msg = str(e)
-            break
-
-        now = datetime.now(timezone.utc)
-        try:
-            _upsert_cut(webtoon_episode_id, cut, now, source, title_id)
-            if next_cut_bytes is not None:
-                _upsert_cut(webtoon_episode_id, cut + 1, now, source, title_id)
-
-            segments = split_cut_pair(cur_bytes, next_cut_bytes)
-
-            region_index: dict[int, int] = {}
-
-            cut_ocr = 0
-            cut_faces = 0
-            for segment in segments:
-                ocr_n, face_n = _process_segment(
-                    segment, webtoon_episode_id, cut,
-                    source, title_id, region_index, face_index, saved_face_bboxes,
-                )
-                cut_ocr += ocr_n
-                cut_faces += face_n
-
-            total_ocr += cut_ocr
-            total_faces += cut_faces
-            total += 1
-
-            print(
-                f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} "
-                f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
-            )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
-            raise  # 에이전트 레벨에서 Kafka 재큐 처리
-        except Exception as e:
-            print(f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} 오류: {e}")
-
-        cut += 1
+    cut_ocr = 0
+    cut_faces = 0
+    for segment in segments:
+        ocr_n, face_n = _process_segment(
+            segment, webtoon_episode_id, cut,
+            source, title_id, region_index, face_index, saved_face_bboxes,
+        )
+        cut_ocr += ocr_n
+        cut_faces += face_n
 
     print(
-        f"[ocr_yolo] {source}/{title_id} ep={episode_no} — "
-        f"완료: {total}컷 처리 | 텍스트 영역 총 {total_ocr}개 | 얼굴 총 {total_faces}개"
+        f"[ocr_yolo] {source}/{title_id} ep={episode_no} cut={cut} "
+        f"— 세그먼트 {len(segments)}개 | 텍스트 영역 {cut_ocr}개 | 얼굴 {cut_faces}개"
     )
-    return total, error_msg
+    return next_cut_bytes is not None
 
 
 # ── Faust Agent ───────────────────────────────────────────────────────────────
@@ -410,7 +394,7 @@ async def ocr_yolo_agent(stream):
     loop = asyncio.get_running_loop()
 
     async for msg in stream:
-        print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — 메시지 수신 (retry={msg.retry_count})")
+        print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} — 메시지 수신 (retry={msg.retry_count})")
 
         if msg.retry_count >= 5:
             print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} — retry 상한 초과, 에러 처리")
@@ -421,27 +405,34 @@ async def ocr_yolo_agent(stream):
                     title_id=msg.title_id,
                     episode_no=msg.episode_no,
                     webtoon_episode_id=msg.webtoon_episode_id,
-                    failed_cut=0,
+                    failed_cut=msg.current_cut,
                     error="model-api retry limit exceeded",
                 ),
             )
             _update_phase1_status(msg.webtoon_episode_id, "error")
             continue
 
-        _update_phase1_status(msg.webtoon_episode_id, "running")
+        max_cut = msg.max_cut or _get_image_count(msg.webtoon_episode_id)
+
+        if msg.current_cut == 1:
+            await loop.run_in_executor(
+                None, _cleanup_episode_faces,
+                msg.webtoon_episode_id, msg.source, msg.title_id,
+            )
+            _update_phase1_status(msg.webtoon_episode_id, "running")
 
         try:
-            total, error_msg = await loop.run_in_executor(
+            has_next = await loop.run_in_executor(
                 None,
-                _process_episode,
+                _process_cut,
                 msg.source,
                 msg.title_id,
                 msg.episode_no,
                 msg.webtoon_episode_id,
+                msg.current_cut,
             )
         except (httpx.ConnectError, httpx.TimeoutException) as e:
-            # 인프라 일시 장애 (model-api 기동 중 등) → retry_count 소진 없이 재큐
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 미응답: {e}, 재큐")
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} model-api 미응답: {e}, 재큐")
             await cut_phase1_start.send(
                 key=f"{msg.source}_{msg.title_id}",
                 value=EpisodeStartMsg(
@@ -449,13 +440,14 @@ async def ocr_yolo_agent(stream):
                     title_id=msg.title_id,
                     episode_no=msg.episode_no,
                     webtoon_episode_id=msg.webtoon_episode_id,
-                    retry_count=msg.retry_count,  # 카운트 유지
+                    current_cut=msg.current_cut,
+                    max_cut=max_cut,
+                    retry_count=msg.retry_count,
                 ),
             )
             continue
         except httpx.HTTPStatusError as e:
-            # model-api 가 5xx 반환 → retry_count 증가
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} model-api 오류 {e.response.status_code}: {e}, 재큐")
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} model-api 오류 {e.response.status_code}: {e}, 재큐")
             await cut_phase1_start.send(
                 key=f"{msg.source}_{msg.title_id}",
                 value=EpisodeStartMsg(
@@ -463,39 +455,39 @@ async def ocr_yolo_agent(stream):
                     title_id=msg.title_id,
                     episode_no=msg.episode_no,
                     webtoon_episode_id=msg.webtoon_episode_id,
+                    current_cut=msg.current_cut,
+                    max_cut=max_cut,
                     retry_count=msg.retry_count + 1,
                 ),
             )
             continue
         except Exception as e:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 치명적 오류: {e}")
+            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} 치명적 오류: {e}")
             _update_phase1_status(msg.webtoon_episode_id, "error")
             continue
 
-        if error_msg:
-            print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} 에러 종료: {error_msg}")
-            await episode_phase1a_error.send(
+        if has_next and msg.current_cut < max_cut:
+            await cut_phase1_start.send(
                 key=f"{msg.source}_{msg.title_id}",
-                value=EpisodePhase1aError(
+                value=EpisodeStartMsg(
                     source=msg.source,
                     title_id=msg.title_id,
                     episode_no=msg.episode_no,
                     webtoon_episode_id=msg.webtoon_episode_id,
-                    failed_cut=0,
-                    error=error_msg,
+                    current_cut=msg.current_cut + 1,
+                    max_cut=max_cut,
+                    retry_count=0,
                 ),
             )
-            _update_phase1_status(msg.webtoon_episode_id, "error")
-            continue
-
-        _update_phase1_status(msg.webtoon_episode_id, "completed")
-        await episode_phase1a_complete.send(
-            key=f"{msg.source}_{msg.title_id}",
-            value=EpisodePhase1aComplete(
-                source=msg.source,
-                title_id=msg.title_id,
-                episode_no=msg.episode_no,
-                webtoon_episode_id=msg.webtoon_episode_id,
-                total_cuts=total,
-            ),
-        )
+        else:
+            _update_phase1_status(msg.webtoon_episode_id, "completed")
+            await episode_phase1a_complete.send(
+                key=f"{msg.source}_{msg.title_id}",
+                value=EpisodePhase1aComplete(
+                    source=msg.source,
+                    title_id=msg.title_id,
+                    episode_no=msg.episode_no,
+                    webtoon_episode_id=msg.webtoon_episode_id,
+                    total_cuts=msg.current_cut,
+                ),
+            )
