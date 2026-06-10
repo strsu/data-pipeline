@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -12,6 +13,8 @@ from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
 from src.operators.embedding import extract_embedding, EMBEDDING_MODEL_NAME
 from src.worker import app
+
+logger = logging.getLogger(__name__)
 
 
 class FaceChromaSyncMsg(faust.Record):
@@ -61,12 +64,12 @@ def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
 def _sync_face(msg: FaceChromaSyncMsg) -> None:
     face = _load_face_for_sync(msg.face_record_id)
     if face is None:
-        print(f"[face_chroma_sync] face_id={msg.face_record_id} not found or no appearance, skip")
+        logger.warning("[face_chroma_sync] face_id=%s not found or no appearance, skip", msg.face_record_id)
         return
 
     crop_bytes = fetch_face_crop(face["id"], msg.source, msg.title_id)
     if crop_bytes is None:
-        print(f"[face_chroma_sync] crop not found face_id={face['id']}, skip")
+        logger.warning("[face_chroma_sync] crop not found face_id=%s, skip", face["id"])
         return
 
     embedding = extract_embedding(crop_bytes)
@@ -95,7 +98,7 @@ def _sync_face(msg: FaceChromaSyncMsg) -> None:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }],
     )
-    print(f"[face_chroma_sync] synced face_id={face['id']} → {face['character_name']} doc_id={doc_id}")
+    logger.info("[face_chroma_sync] synced face_id=%s -> %s doc_id=%s", face["id"], face["character_name"], doc_id)
 
 
 # concurrency=4: I/O 바운드(S3 + Chroma)이고 순서 무관하므로 병렬 처리
@@ -106,6 +109,4 @@ async def face_chroma_sync_agent(stream):
         try:
             await loop.run_in_executor(None, _sync_face, msg)
         except Exception as e:
-            print(f"[face_chroma_sync] face_id={msg.face_record_id} error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error("[face_chroma_sync] face_id=%s error: %s: %s", msg.face_record_id, type(e).__name__, e)
