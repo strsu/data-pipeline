@@ -61,8 +61,8 @@ RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_doc_orientation_cl
 CMD ["gunicorn", "src.main:app", \
      "--worker-class=uvicorn.workers.UvicornWorker", \
      "--workers=2", \
-     "--max-requests=50", \
-     "--max-requests-jitter=10", \
+     "--max-requests=1000", \
+     "--max-requests-jitter=100", \
      "--timeout=120", \
      "--bind=0.0.0.0:8000", \
      "--access-logfile=-", \
