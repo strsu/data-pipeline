@@ -1,7 +1,7 @@
 [project]
 name = "model-api"
 version = "0.1.0"
-description = "FastAPI model serving — PaddleOCR + YOLO + CLIP"
+description = "FastAPI model serving — PaddleOCR + YOLO + CLIP + CCIP"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
@@ -16,5 +16,6 @@ dependencies = [
     "opencv-python-headless>=4.10.0",
     "transformers>=4.40.0",
     "accelerate>=0.30.0",
+    "dghs-imgutils>=0.4.0",
 ]
 requires-python = "==3.12.*"

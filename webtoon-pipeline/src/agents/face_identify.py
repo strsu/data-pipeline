@@ -16,14 +16,13 @@ logger = logging.getLogger(__name__)
 from psycopg2.extras import Json
 
 from src.agents.ocr_yolo import EpisodePhase1aComplete, episode_phase1a_complete
-from src.config import settings
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
-from src.operators.embedding import EMBEDDING_MODEL_NAME, extract_embedding
+from src.operators.embedding import embed_for
+from src.operators.matching import find_match
+from src.operators.model_resolver import resolve_embedding_model
 from src.worker import app
-
-MATCH_THRESHOLD = settings.MATCH_THRESHOLD
 
 
 # ── Kafka 토픽 ────────────────────────────────────────────────────────────────────────────
@@ -263,7 +262,7 @@ def _get_next_ready_episode(webtoon_id: int, current_no: int) -> Optional[dict]:
 
 
 def _seed_confirmed_faces(
-    webtoon_id: int, source: str, title_id: str, collection
+    webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str
 ) -> int:
     """수동 확정된 얼굴을 Chroma에 시딩 — 수동 등록/재배정 캐릭터가 매칭 기준점으로 사용되도록 보장.
 
@@ -292,7 +291,7 @@ def _seed_confirmed_faces(
               AND fr.appearance_id IS NOT NULL
               AND fr.deleted_at IS NULL
             """,
-            (EMBEDDING_MODEL_NAME, webtoon_id),
+            (model_name, webtoon_id),
         )
         rows = cur.fetchall()
 
@@ -310,7 +309,7 @@ def _seed_confirmed_faces(
         if crop_bytes is None:
             continue
 
-        embedding = extract_embedding(crop_bytes)
+        embedding = embed_for(metric_type, crop_bytes)
         collection.upsert(
             ids=[doc_id],
             embeddings=[embedding],
@@ -393,15 +392,17 @@ def _process_episode(msg: EpisodePhase1aComplete) -> _Phase2Result:
         _set_phase2_idle(webtoon_id)
         return result  # idle 전환, 이벤트 미발행 → 자연 대기
 
-    # ── Chroma 콜렉션 로드 ────────────────────────────────────────────────────────────────
-    collection = get_face_collection(source, title_id, EMBEDDING_MODEL_NAME)
+    # ── 모델/threshold 해석 (§B2) ────────────────────────────────────────────────────────
+    ctx = resolve_embedding_model(webtoon_id)
+    model_name = ctx["name"]
+    metric_type = ctx["metric_type"]
+    threshold = ctx["threshold"]
+
+    # ── Chroma 콜렉션 로드 (모델별) ────────────────────────────────────────────────────────
+    collection = get_face_collection(source, title_id, model_name)
 
     # ── 수동 확정 얼굴 시딩 ──────────────────────────────────────────────────────────
-    seeded_count = _seed_confirmed_faces(webtoon_id, source, title_id, collection)
-
-    # 시딩 + 기존 콜렉션 크기를 합산하여 query 가능 여부 판단
-    # collection.count()는 기존 문서만 반영하므로 시딩 후 참조
-    collection_size = collection.count()
+    _seed_confirmed_faces(webtoon_id, source, title_id, collection, model_name, metric_type)
 
     # ── 에피소드 내 얼굴 식별 (컷 순서대로) ──────────────────────────────────────────
     face_records = _load_face_records(msg.webtoon_episode_id)
@@ -411,29 +412,16 @@ def _process_episode(msg: EpisodePhase1aComplete) -> _Phase2Result:
             logger.warning("[face_identify] crop not found face_id=%s, skip", face["id"])
             continue
 
-        embedding = extract_embedding(crop_bytes)
+        feature = embed_for(metric_type, crop_bytes)
         doc_id = f"{webtoon_id}_{msg.episode_no}_{face['cut_number']}_F{face['face_idx']}"
 
-        if collection_size > 0:
-            # Chroma 코사인 유사도 검색 (낙을수록 유사)
-            query_result = collection.query(
-                query_embeddings=[embedding],
-                n_results=1,
-                include=["metadatas", "distances"],
-            )
-            has_match = bool(query_result["ids"][0])
-            best_distance = query_result["distances"][0][0] if has_match else None
-            best_meta = query_result["metadatas"][0][0] if has_match else None
-        else:
-            has_match = False
-            best_distance = None
-            best_meta = None
-
-        if has_match and best_distance <= MATCH_THRESHOLD and "appearance_id" in best_meta:
-            # 기존 캐릭터 매칭
+        matched = find_match(collection, feature, metric_type, threshold)
+        if matched is not None:
+            # 기존/확정 캐릭터 매칭
+            best_meta = matched["meta"]
             appearance_id: int = best_meta["appearance_id"]
             char_name: str = best_meta.get("character_name") or best_meta["character_id"]
-            match_score: Optional[float] = best_distance
+            match_score: Optional[float] = matched["score"]
             _update_character_first_seen(appearance_id, msg.webtoon_episode_id, msg.episode_no, face["cut_number"])
         else:
             # 신규 캐릭터 발급 (§5.5-1, §12.2)
@@ -446,7 +434,7 @@ def _process_episode(msg: EpisodePhase1aComplete) -> _Phase2Result:
         b = face["bbox"]
         collection.upsert(
             ids=[doc_id],
-            embeddings=[embedding],
+            embeddings=[feature],
             metadatas=[{
                 "webtoon_id": webtoon_id,
                 "episode": msg.episode_no,
@@ -462,10 +450,9 @@ def _process_episode(msg: EpisodePhase1aComplete) -> _Phase2Result:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }],
         )
-        collection_size += 1  # upsert 후 카운트 증가 — 다음 얼굴부터 매칭 가능
 
         _update_face_record(face["id"], appearance_id)
-        _upsert_face_embedding(face["id"], EMBEDDING_MODEL_NAME, doc_id, match_score)
+        _upsert_face_embedding(face["id"], model_name, doc_id, match_score)
 
     # ── 에피소드 완료 상태 갱신 ────────────────────────────────────────────────────────
     _complete_episode_state(webtoon_id, msg.webtoon_episode_id)

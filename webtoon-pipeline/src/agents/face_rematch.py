@@ -8,16 +8,15 @@ from typing import Optional
 
 import faust
 
-from src.config import settings
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
-from src.operators.embedding import extract_embedding, EMBEDDING_MODEL_NAME
+from src.operators.embedding import embed_for
+from src.operators.matching import find_match
+from src.operators.model_resolver import resolve_embedding_model
 from src.worker import app
 
 logger = logging.getLogger(__name__)
-
-MATCH_THRESHOLD = settings.MATCH_THRESHOLD
 
 
 class FaceRematchMsg(faust.Record):
@@ -79,34 +78,21 @@ def _rematch_face(msg: FaceRematchMsg) -> None:
         logger.warning("[face_rematch] crop not found face_id=%s, skip", face["id"])
         return
 
-    embedding = extract_embedding(crop_bytes)
-    collection = get_face_collection(msg.source, msg.title_id, EMBEDDING_MODEL_NAME)
+    ctx = resolve_embedding_model(msg.webtoon_id)
+    model_name = ctx["name"]
+    metric_type = ctx["metric_type"]
+    threshold = ctx["threshold"]
 
-    if collection.count() == 0:
-        logger.warning("[face_rematch] face_id=%s Chroma collection empty, skip", face["id"])
+    feature = embed_for(metric_type, crop_bytes)
+    collection = get_face_collection(msg.source, msg.title_id, model_name)
+
+    matched = find_match(collection, feature, metric_type, threshold)
+    if matched is None:
+        logger.info("[face_rematch] face_id=%s no match (threshold=%.4f), skip", face["id"], threshold)
         return
 
-    query_result = collection.query(
-        query_embeddings=[embedding],
-        n_results=1,
-        include=["metadatas", "distances"],
-    )
-
-    has_match = bool(query_result["ids"][0])
-    if not has_match:
-        logger.info("[face_rematch] face_id=%s no candidates in collection, skip", face["id"])
-        return
-
-    best_distance: float = query_result["distances"][0][0]
-    best_meta: dict = query_result["metadatas"][0][0]
-
-    if best_distance > MATCH_THRESHOLD or "appearance_id" not in best_meta:
-        logger.info(
-            "[face_rematch] face_id=%s no match (best_distance=%.4f threshold=%.4f), skip",
-            face["id"], best_distance, MATCH_THRESHOLD,
-        )
-        return
-
+    best_meta: dict = matched["meta"]
+    best_distance: float = matched["score"]
     appearance_id: int = best_meta["appearance_id"]
     character_name: str = best_meta.get("character_name") or best_meta.get("character_id", "unknown")
 
@@ -116,7 +102,7 @@ def _rematch_face(msg: FaceRematchMsg) -> None:
     b = face["bbox"]
     collection.upsert(
         ids=[doc_id],
-        embeddings=[embedding],
+        embeddings=[feature],
         metadatas=[{
             "webtoon_id": msg.webtoon_id,
             "episode": face["episode_no"],

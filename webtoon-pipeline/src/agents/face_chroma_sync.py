@@ -11,7 +11,8 @@ import faust
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
-from src.operators.embedding import extract_embedding, EMBEDDING_MODEL_NAME
+from src.operators.embedding import embed_for
+from src.operators.model_resolver import resolve_embedding_model
 from src.worker import app
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class FaceChromaSyncMsg(faust.Record):
 face_chroma_sync_topic = app.topic("face.chroma.sync", value_type=FaceChromaSyncMsg)
 
 
-def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
+def _load_face_for_sync(face_record_id: int, model_name: str) -> Optional[dict]:
     with db_cursor() as cur:
         cur.execute(
             """
@@ -46,7 +47,7 @@ def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
             LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
             WHERE fr.id = %s AND fr.deleted_at IS NULL
             """,
-            (EMBEDDING_MODEL_NAME, face_record_id),
+            (model_name, face_record_id),
         )
         row = cur.fetchone()
         if not row:
@@ -62,7 +63,11 @@ def _load_face_for_sync(face_record_id: int) -> Optional[dict]:
 
 
 def _sync_face(msg: FaceChromaSyncMsg) -> None:
-    face = _load_face_for_sync(msg.face_record_id)
+    ctx = resolve_embedding_model(msg.webtoon_id)
+    model_name = ctx["name"]
+    metric_type = ctx["metric_type"]
+
+    face = _load_face_for_sync(msg.face_record_id, model_name)
     if face is None:
         logger.warning("[face_chroma_sync] face_id=%s not found or no appearance, skip", msg.face_record_id)
         return
@@ -72,13 +77,13 @@ def _sync_face(msg: FaceChromaSyncMsg) -> None:
         logger.warning("[face_chroma_sync] crop not found face_id=%s, skip", face["id"])
         return
 
-    embedding = extract_embedding(crop_bytes)
+    embedding = embed_for(metric_type, crop_bytes)
 
     doc_id = face["chroma_doc_id"] or (
         f"{msg.webtoon_id}_{face['episode_no']}_{face['cut_number']}_F{face['face_idx']}"
     )
 
-    collection = get_face_collection(msg.source, msg.title_id, EMBEDDING_MODEL_NAME)
+    collection = get_face_collection(msg.source, msg.title_id, model_name)
     b = face["bbox"]
     collection.upsert(
         ids=[doc_id],

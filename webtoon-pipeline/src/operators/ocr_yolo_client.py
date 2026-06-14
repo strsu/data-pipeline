@@ -6,7 +6,7 @@ from io import BytesIO
 import httpx
 from PIL import Image
 
-from src.config.settings import MODEL_API_URL
+from src.config.settings import OCR_YOLO_API_URL
 
 _client: httpx.Client | None = None
 
@@ -30,7 +30,7 @@ def run_ocr_yolo(
     w, h = Image.open(BytesIO(image_bytes)).size
     print(f"[ocr_yolo_client] {source}/{title_id} ep={episode_no} cut={cut} — 전송 {w}x{h} ({len(image_bytes):,} bytes)")
     response = _get_client().post(
-        f"{MODEL_API_URL}/ocr-yolo",
+        f"{OCR_YOLO_API_URL}/ocr-yolo",
         files={"file": ("image.jpg", image_bytes, "image/jpeg")},
         params={"source": source, "title_id": title_id, "episode_no": episode_no, "cut": cut},
     )

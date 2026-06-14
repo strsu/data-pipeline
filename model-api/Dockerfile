@@ -27,6 +27,13 @@ CLIPModel.from_pretrained('openai/clip-vit-large-patch14'); \
 CLIPProcessor.from_pretrained('openai/clip-vit-large-patch14'); \
 print('CLIP model cached.')"
 
+# CCIP 모델(onnx) 빌드 시점에 캐시
+RUN python -c "\
+from PIL import Image; \
+from imgutils.metrics import ccip_extract_feature; \
+ccip_extract_feature(Image.new('RGB', (384, 384), (127, 127, 127)), model='ccip-caformer-24-randaug-pruned'); \
+print('CCIP model cached.')"
+
 # runtime stage
 FROM python:3.12-slim
 
