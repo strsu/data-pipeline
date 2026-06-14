@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 import faust
+
+logger = logging.getLogger(__name__)
 from psycopg2.extras import Json
 
 from src.agents.embedding_agent import EpisodePhase1bComplete, episode_phase1b_complete
@@ -144,7 +147,7 @@ def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: in
             """
             SELECT COALESCE(MAX(
                 CASE WHEN name ~ '^NEW_CHAR_[0-9]+$'
-                THEN CAST(SUBSTRING(name FROM 9) AS INTEGER)
+                THEN CAST(SUBSTRING(name FROM 10) AS INTEGER)
                 ELSE 0 END
             ), 0) + 1
             FROM character
@@ -387,7 +390,7 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
     for face in face_records:
         crop_bytes = fetch_face_crop(face["id"], source, title_id)
         if crop_bytes is None:
-            print(f"[face_identify] crop not found face_id={face['id']}, skip")
+            logger.warning("[face_identify] crop not found face_id=%s, skip", face["id"])
             continue
 
         embedding = extract_embedding(crop_bytes)
@@ -489,9 +492,7 @@ async def face_identify_agent(stream):
         try:
             result: _Phase2Result = await loop.run_in_executor(None, _process_episode, msg)
         except Exception as e:
-            print(f"[face_identify] {msg.source}/{msg.title_id} ep={msg.episode_no} error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error("[face_identify] %s/%s ep=%s error: %s: %s", msg.source, msg.title_id, msg.episode_no, type(e).__name__, e)
             continue
 
         if result.should_trigger_next:
