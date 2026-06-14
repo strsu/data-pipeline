@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
+from typing import Optional
 
 import faust
 import httpx
@@ -301,18 +302,130 @@ def _cleanup_episode_faces(webtoon_episode_id: int, source: str, title_id: str) 
 
 
 def _update_phase1_status(webtoon_episode_id: int, status: str) -> None:
+    """phase1_status 전이 — §A1 불변식대로 pipeline_state 행을 FOR UPDATE로 잠근 뒤 갱신."""
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT webtoon_id FROM webtoon_episode WHERE id = %s",
+            (webtoon_episode_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        webtoon_id = row[0]
+        cur.execute(
+            "SELECT id FROM webtoon_pipeline_state WHERE webtoon_id = %s FOR UPDATE",
+            (webtoon_id,),
+        )
+        cur.execute(
+            "UPDATE webtoon_pipeline_state SET phase1_status = %s, updated_at = %s WHERE webtoon_id = %s",
+            (status, now, webtoon_id),
+        )
+
+
+def _touch_phase1_heartbeat(webtoon_episode_id: int) -> None:
+    """컷 처리마다 pipeline_state.updated_at을 갱신해 '활성 처리 중' heartbeat 제공.
+
+    service reconciler가 '정체된 running'(커밋 후 Kafka 발행 유실)과 '정상 처리 중'을
+    updated_at 신선도로 구분하기 위함(긴 에피소드의 오탐 방지).
+    """
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
             UPDATE webtoon_pipeline_state
-            SET phase1_status = %s, updated_at = %s
-            WHERE webtoon_id = (
-                SELECT webtoon_id FROM webtoon_episode WHERE id = %s
-            )
+            SET updated_at = %s
+            WHERE webtoon_id = (SELECT webtoon_id FROM webtoon_episode WHERE id = %s)
             """,
-            (status, now, webtoon_episode_id),
+            (now, webtoon_episode_id),
         )
+
+
+def _advance_to_next_episode(
+    webtoon_episode_id: int, status: str = "completed", error: Optional[str] = None
+) -> Optional[dict]:
+    """에피소드 Step1 종료 처리(completed/error) + 다음 미처리 다운로드 에피소드 선택 (§A1).
+
+    동일 `db_cursor` 블록(=하나의 트랜잭션) 안에서
+    ① 현재 ep phase1 종료 기록(episode_pipeline_progress upsert) → ② pipeline_state 행 `FOR UPDATE` 락 →
+    ③ 다음 미처리 다운로드 ep(min no) 선택 → ④ phase1_status 전환
+    을 모두 수행해 service kick / reconciler와 직렬화한다(§A1 불변식: 같은 행/같은 락).
+
+    status='error'는 영구 실패 스킵을 의미하며, 다음 ep 선택 시 completed/error 행이 있는 ep는 제외한다
+    → 실패한 ep 하나가 웹툰 전체를 막는 head-of-line 블로킹을 방지한다.
+    반환: 다음 에피소드 dict({id, no, source, title_id}) 또는 None.
+    """
+    now = datetime.now(timezone.utc)
+    completed_at = now if status == "completed" else None
+    with db_cursor() as cur:
+        # ① 현재 에피소드 phase1 종료 기록 (phase=1 = OCR_YOLO)
+        cur.execute(
+            """
+            INSERT INTO episode_pipeline_progress
+                (episode_id, phase, status, completed_at, error, created_at, updated_at)
+            VALUES (%s, 1, %s, %s, %s, %s, %s)
+            ON CONFLICT (episode_id, phase)
+            DO UPDATE SET status = EXCLUDED.status,
+                          completed_at = EXCLUDED.completed_at,
+                          error = EXCLUDED.error,
+                          updated_at = EXCLUDED.updated_at
+            """,
+            (webtoon_episode_id, status, completed_at, error, now, now),
+        )
+        cur.execute(
+            "SELECT webtoon_id FROM webtoon_episode WHERE id = %s",
+            (webtoon_episode_id,),
+        )
+        webtoon_id = cur.fetchone()[0]
+
+        # ② pipeline_state 행 확보 후 락
+        cur.execute(
+            """
+            INSERT INTO webtoon_pipeline_state
+                (webtoon_id, phase1_status, phase2_status, phase2_processed_count,
+                 phase3_enabled, created_at, updated_at)
+            VALUES (%s, 'running', 'idle', 0, false, %s, %s)
+            ON CONFLICT (webtoon_id) DO NOTHING
+            """,
+            (webtoon_id, now, now),
+        )
+        cur.execute(
+            "SELECT id FROM webtoon_pipeline_state WHERE webtoon_id = %s FOR UPDATE",
+            (webtoon_id,),
+        )
+
+        # ③ 다음 미처리 다운로드 에피소드 (phase1 completed/error 행이 없고 soft-delete 아닌 ep)
+        cur.execute(
+            """
+            SELECT we.id, we.no, w.source, w.title_id
+            FROM webtoon_episode we
+            JOIN webtoon w ON we.webtoon_id = w.id
+            WHERE we.webtoon_id = %s
+              AND we.is_downloaded = true
+              AND we.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM episode_pipeline_progress p
+                WHERE p.episode_id = we.id
+                  AND p.phase = 1
+                  AND p.status IN ('completed', 'error')
+              )
+            ORDER BY we.no ASC
+            LIMIT 1
+            """,
+            (webtoon_id,),
+        )
+        row = cur.fetchone()
+
+        # ④ 상태 전환
+        next_status = "running" if row else "idle"
+        cur.execute(
+            "UPDATE webtoon_pipeline_state SET phase1_status = %s, updated_at = %s WHERE webtoon_id = %s",
+            (next_status, now, webtoon_id),
+        )
+
+        if row:
+            return {"id": row[0], "no": row[1], "source": row[2], "title_id": row[3]}
+        return None
 
 
 def _get_image_count(webtoon_episode_id: int) -> int:
@@ -400,6 +513,24 @@ def _process_cut(
 async def ocr_yolo_agent(stream):
     loop = asyncio.get_running_loop()
 
+    async def _chain_next(next_ep: Optional[dict]) -> None:
+        """다음 미처리 다운로드 에피소드가 있으면 cut1부터 phase1 체이닝."""
+        if not next_ep:
+            return
+        print(f"[ocr_yolo] 다음 ep={next_ep['no']} 체이닝 ({next_ep['source']}/{next_ep['title_id']})")
+        await cut_phase1_start.send(
+            key=f"{next_ep['source']}_{next_ep['title_id']}",
+            value=EpisodeStartMsg(
+                source=next_ep["source"],
+                title_id=next_ep["title_id"],
+                episode_no=next_ep["no"],
+                webtoon_episode_id=next_ep["id"],
+                current_cut=1,
+                max_cut=0,
+                retry_count=0,
+            ),
+        )
+
     async for msg in stream:
         print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} — 메시지 수신 (retry={msg.retry_count})")
 
@@ -416,7 +547,12 @@ async def ocr_yolo_agent(stream):
                     error="model-api retry limit exceeded",
                 ),
             )
-            _update_phase1_status(msg.webtoon_episode_id, "error")
+            # 영구 실패로 기록 + 다음 ep로 진행(head-of-line 블로킹 방지, §A1)
+            next_ep = await loop.run_in_executor(
+                None, _advance_to_next_episode,
+                msg.webtoon_episode_id, "error", "model-api retry limit exceeded",
+            )
+            await _chain_next(next_ep)
             continue
 
         max_cut = msg.max_cut or _get_image_count(msg.webtoon_episode_id)
@@ -470,8 +606,16 @@ async def ocr_yolo_agent(stream):
             continue
         except Exception as e:
             print(f"[ocr_yolo] {msg.source}/{msg.title_id} ep={msg.episode_no} cut={msg.current_cut} 치명적 오류: {e}")
-            _update_phase1_status(msg.webtoon_episode_id, "error")
+            # 영구 실패로 기록 + 다음 ep로 진행(head-of-line 블로킹 방지, §A1)
+            next_ep = await loop.run_in_executor(
+                None, _advance_to_next_episode,
+                msg.webtoon_episode_id, "error", f"fatal: {e}",
+            )
+            await _chain_next(next_ep)
             continue
+
+        # 컷 처리 성공 — heartbeat 갱신(긴 에피소드에서 reconciler 오탐 방지, §A1)
+        await loop.run_in_executor(None, _touch_phase1_heartbeat, msg.webtoon_episode_id)
 
         if has_next and msg.current_cut < max_cut:
             await cut_phase1_start.send(
@@ -487,7 +631,7 @@ async def ocr_yolo_agent(stream):
                 ),
             )
         else:
-            _update_phase1_status(msg.webtoon_episode_id, "completed")
+            # 에피소드 Step1 완료 → phase2(face_identify) 트리거
             await episode_phase1a_complete.send(
                 key=f"{msg.source}_{msg.title_id}",
                 value=EpisodePhase1aComplete(
@@ -498,3 +642,9 @@ async def ocr_yolo_agent(stream):
                     total_cuts=msg.current_cut,
                 ),
             )
+
+            # 에피소드 게이팅 (§A1): 완료 마킹 + 다음 미처리 다운로드 ep 체이닝 (행 락 하에서)
+            next_ep = await loop.run_in_executor(
+                None, _advance_to_next_episode, msg.webtoon_episode_id
+            )
+            await _chain_next(next_ep)

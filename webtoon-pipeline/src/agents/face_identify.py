@@ -15,7 +15,7 @@ import faust
 logger = logging.getLogger(__name__)
 from psycopg2.extras import Json
 
-from src.agents.embedding_agent import EpisodePhase1bComplete, episode_phase1b_complete
+from src.agents.ocr_yolo import EpisodePhase1aComplete, episode_phase1a_complete
 from src.config import settings
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
@@ -195,16 +195,25 @@ def _update_face_record(face_id: int, appearance_id: int) -> None:
         )
 
 
-def _update_face_embedding_score(face_id: int, model: str, match_score: Optional[float]) -> None:
+def _upsert_face_embedding(face_id: int, model: str, doc_id: str, match_score: Optional[float]) -> None:
+    """face_embedding 행 upsert.
+
+    A2 이전엔 embedding_agent가 INSERT하고 face_identify는 score만 UPDATE했으나,
+    embedding_agent 제거 후 face_identify가 직접 행을 생성·갱신한다.
+    """
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
-            UPDATE face_embedding
-            SET match_score = %s, updated_at = %s
-            WHERE face_record_id = %s AND embedding_model = %s
+            INSERT INTO face_embedding
+                (face_record_id, embedding_model, chroma_doc_id, match_score, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (face_record_id, embedding_model)
+            DO UPDATE SET chroma_doc_id = EXCLUDED.chroma_doc_id,
+                          match_score   = EXCLUDED.match_score,
+                          updated_at    = EXCLUDED.updated_at
             """,
-            (match_score, now, face_id, model),
+            (face_id, model, doc_id, match_score, now, now),
         )
 
 
@@ -225,17 +234,26 @@ def _complete_episode_state(webtoon_id: int, webtoon_episode_id: int) -> None:
 
 
 def _get_next_ready_episode(webtoon_id: int, current_no: int) -> Optional[dict]:
-    """Phase1이 완료된 다음 에피소드 반환. Step1이 아직 처리 전이면 None."""
+    """Phase1이 '완전 완료'된 다음 에피소드 반환. 아직이면 None.
+
+    기준을 webtoon_cut.processed_at(컷 일부만 처리돼도 충족)에서
+    episode_pipeline_progress(phase=1, status='completed')로 변경(§A1/A2):
+    순차 phase1과 phase2 자체 체이닝이 맞물릴 때, phase1이 부분 완료된 에피소드를
+    phase2가 선행 처리해 일부 얼굴이 누락되고 멱등 가드로 재처리도 막히는 레이스를 방지한다.
+    (phase1 완전 완료 ep는 ocr_yolo가 phase1a.complete로도 트리거하므로 중복 트리거는 가드로 무해.)
+    """
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT we.id, we.no
             FROM webtoon_episode we
             WHERE we.webtoon_id = %s AND we.no = %s
+              AND we.deleted_at IS NULL
               AND EXISTS (
-                SELECT 1 FROM webtoon_cut wc
-                WHERE wc.episode_id = we.id AND wc.processed_at IS NOT NULL
-                LIMIT 1
+                SELECT 1 FROM episode_pipeline_progress p
+                WHERE p.episode_id = we.id
+                  AND p.phase = 1
+                  AND p.status = 'completed'
               )
             """,
             (webtoon_id, current_no + 1),
@@ -320,7 +338,7 @@ def _seed_confirmed_faces(
 @dataclass
 class _Phase2Result:
     should_trigger_next: bool = False
-    next_msg: Optional[EpisodePhase1bComplete] = None
+    next_msg: Optional[EpisodePhase1aComplete] = None
     next_key: str = ""
     should_start_phase3: bool = False
     phase3_msg: Optional[EpisodePhase3Start] = None
@@ -353,7 +371,7 @@ def _update_character_first_seen(appearance_id: int, episode_id: int, episode_no
         )
 
 
-def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
+def _process_episode(msg: EpisodePhase1aComplete) -> _Phase2Result:
     result = _Phase2Result()
 
     webtoon = _get_webtoon_info(msg.webtoon_episode_id)
@@ -447,7 +465,7 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
         collection_size += 1  # upsert 후 카운트 증가 — 다음 얼굴부터 매칭 가능
 
         _update_face_record(face["id"], appearance_id)
-        _update_face_embedding_score(face["id"], EMBEDDING_MODEL_NAME, match_score)
+        _upsert_face_embedding(face["id"], EMBEDDING_MODEL_NAME, doc_id, match_score)
 
     # ── 에피소드 완료 상태 갱신 ────────────────────────────────────────────────────────
     _complete_episode_state(webtoon_id, msg.webtoon_episode_id)
@@ -460,11 +478,12 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
         else:
             result.should_trigger_next = True
             result.next_key = kafka_key
-            result.next_msg = EpisodePhase1bComplete(
+            result.next_msg = EpisodePhase1aComplete(
                 source=source,
                 title_id=title_id,
                 episode_no=next_ep["no"],
                 webtoon_episode_id=next_ep["id"],
+                total_cuts=0,
             )
     else:
         _set_phase2_completed(webtoon_id)
@@ -485,7 +504,7 @@ def _process_episode(msg: EpisodePhase1bComplete) -> _Phase2Result:
 
 # ── Faust Agent ─────────────────────────────────────────────────────────────────────────────
 
-@app.agent(episode_phase1b_complete, concurrency=1)
+@app.agent(episode_phase1a_complete, concurrency=1)
 async def face_identify_agent(stream):
     loop = asyncio.get_running_loop()
     async for msg in stream:
@@ -496,7 +515,7 @@ async def face_identify_agent(stream):
             continue
 
         if result.should_trigger_next:
-            await episode_phase1b_complete.send(
+            await episode_phase1a_complete.send(
                 key=result.next_key,
                 value=result.next_msg,
             )
