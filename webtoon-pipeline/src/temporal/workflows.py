@@ -115,6 +115,19 @@ class EpisodeWorkflow:
 
 
 @workflow.defn
+class EpisodeFaceIdentifyWorkflow:
+    """Step2 단독 — 이미 추출된 얼굴로 임베딩+매칭만 재실행(OCR/YOLO 재실행 없음).
+    admin에서 에피소드 단위로 트리거."""
+
+    @workflow.run
+    async def run(self, ep: EpisodeInput) -> dict:
+        return await workflow.execute_activity(
+            activities.face_identify_episode, ep,
+            start_to_close_timeout=timedelta(minutes=30), retry_policy=_RETRY,
+        )
+
+
+@workflow.defn
 class EpisodeSceneWorkflow:
     """Step3 — 에피소드의 컷을 순차 LLM 분석(슬라이딩 윈도우). 활성 웹툰만.
     CUTS_PER_RUN 단위로 continue-as-new 하며 prev_context를 이어 전달."""

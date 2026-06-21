@@ -48,6 +48,20 @@ def _get_webtoon_id(webtoon_episode_id: int) -> int:
         return cur.fetchone()[0]
 
 
+def _episode_info(webtoon_episode_id: int) -> dict:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT w.source, w.title_id, we.no
+            FROM webtoon_episode we JOIN webtoon w ON we.webtoon_id = w.id
+            WHERE we.id = %s
+            """,
+            (webtoon_episode_id,),
+        )
+        row = cur.fetchone()
+        return {"source": row[0], "title_id": row[1], "episode_no": row[2]}
+
+
 def _cut_id(webtoon_episode_id: int, cut_number: int) -> Optional[int]:
     with db_cursor() as cur:
         cur.execute(
@@ -244,3 +258,47 @@ def analyze_cut_scene(
                 len(result.get("blocks", [])), len(result.get("name_discoveries", [])))
 
     return scene_meta.get("action_summary", "") or prev_context
+
+
+def analyze_episode_scenes(webtoon_episode_id: int) -> dict:
+    """에피소드의 모든 컷을 순차 LLM 분석(슬라이딩 윈도우). 단독 실행/백필용.
+
+    DB의 webtoon_cut(=Step1 산출) 순서대로 돌며 prev_context를 이어 전달한다.
+    Temporal EpisodeSceneWorkflow와 동일 로직의 비-워크플로 버전(테스트/재실행에 사용).
+    phase3_enabled 게이트는 적용하지 않는다(호출 자체가 명시적 실행).
+    """
+    info = _episode_info(webtoon_episode_id)
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT cut_number FROM webtoon_cut WHERE episode_id = %s ORDER BY cut_number",
+            (webtoon_episode_id,),
+        )
+        cut_numbers = [r[0] for r in cur.fetchall()]
+
+    prev = ""
+    analyzed = 0
+    for cn in cut_numbers:
+        prev = analyze_cut_scene(
+            info["source"], info["title_id"], info["episode_no"],
+            webtoon_episode_id, cn, prev,
+        )
+        analyzed += 1
+    logger.info("[step3] episode %s — %s컷 분석 완료", webtoon_episode_id, analyzed)
+    return {"cuts_analyzed": analyzed}
+
+
+def analyze_episode_scenes_by(source: str, title_id: str, episode_no: int) -> dict:
+    """(source, title_id, 회차번호)로 에피소드 Step3 단독 실행. 내부에서 episode id 해석."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT we.id
+            FROM webtoon_episode we JOIN webtoon w ON we.webtoon_id = w.id
+            WHERE w.source = %s AND w.title_id = %s AND we.no = %s AND we.deleted_at IS NULL
+            """,
+            (source, title_id, episode_no),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(f"episode not found: {source}/{title_id} no={episode_no}")
+    return analyze_episode_scenes(row[0])
