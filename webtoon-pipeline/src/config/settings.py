@@ -27,8 +27,11 @@ SOURCE_MEDIA_PATH: dict[str, str] = {
 
 # Model API
 MODEL_API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
-# A3 분리: 서비스별 URL (미설정 시 MODEL_API_URL로 폴백)
-OCR_YOLO_API_URL = os.getenv("OCR_YOLO_API_URL", MODEL_API_URL)
+# 모델별 서비스 URL (미설정 시 폴백 체인).
+OCR_YOLO_API_URL = os.getenv("OCR_YOLO_API_URL", MODEL_API_URL)  # 결합(레거시/하위호환)
+# OCR/YOLO 분리: 각자 별도 서비스. 미설정 시 결합 URL로 폴백.
+OCR_API_URL = os.getenv("OCR_API_URL", OCR_YOLO_API_URL)
+YOLO_API_URL = os.getenv("YOLO_API_URL", OCR_YOLO_API_URL)
 EMBED_CLIP_API_URL = os.getenv("EMBED_CLIP_API_URL", MODEL_API_URL)
 EMBED_CCIP_API_URL = os.getenv("EMBED_CCIP_API_URL", MODEL_API_URL)
 

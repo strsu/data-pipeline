@@ -2,14 +2,20 @@ import os
 
 # ── 모델 서빙 모드 (A3 분리) ───────────────────────────────────────────────
 # all        : OCR+YOLO+CLIP 전부 로드 (기존 동작, 기본값)
-# ocr-yolo   : PaddleOCR + YOLO 만
+# ocr-yolo   : PaddleOCR + YOLO (결합, 기존 Faust 호환)
+# ocr        : PaddleOCR 만 (로드 분리)
+# yolo       : YOLO 만 (로드 분리)
 # embed-clip : CLIP 만
 # embed-ccip : CCIP feature/metric 만
 MODEL_API_MODE = os.getenv("MODEL_API_MODE", "all")
 
 
-def serves_ocr_yolo() -> bool:
-    return MODEL_API_MODE in ("all", "ocr-yolo")
+def serves_ocr() -> bool:
+    return MODEL_API_MODE in ("all", "ocr-yolo", "ocr")
+
+
+def serves_yolo() -> bool:
+    return MODEL_API_MODE in ("all", "ocr-yolo", "yolo")
 
 
 def serves_clip() -> bool:

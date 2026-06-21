@@ -30,4 +30,4 @@ WORKDIR /project
 
 COPY src /project/src
 
-CMD ["python", "-m", "faust", "-A", "src.worker", "worker", "-l", "info"]
+CMD ["python", "-m", "src.temporal.worker"]

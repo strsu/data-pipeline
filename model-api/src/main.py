@@ -37,10 +37,11 @@ async def lifespan(app: FastAPI):
     config.apply_thread_limits()
     log.info("[model-api] MODE=%s threads=%s", config.MODEL_API_MODE, config.MODEL_API_THREADS or "default")
 
-    if config.serves_ocr_yolo():
+    if config.serves_ocr():
         from src.models.ocr import get_ocr
-        from src.models.yolo import get_model as get_yolo
         get_ocr()
+    if config.serves_yolo():
+        from src.models.yolo import get_model as get_yolo
         get_yolo()
     if config.serves_clip():
         from src.models.embedding import get_model as get_clip
@@ -55,7 +56,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-if config.serves_ocr_yolo():
+if config.serves_ocr():
+    from src.routers import ocr
+    app.include_router(ocr.router)
+if config.serves_yolo():
+    from src.routers import yolo
+    app.include_router(yolo.router)
+# OCR·YOLO를 모두 보유한 파드(all/ocr-yolo)는 기존 결합 엔드포인트도 제공(Faust 호환).
+if config.serves_ocr() and config.serves_yolo():
     from src.routers import ocr_yolo
     app.include_router(ocr_yolo.router)
 if config.serves_clip():
