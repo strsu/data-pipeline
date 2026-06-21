@@ -29,11 +29,19 @@ _NAME_AUTO_CONFIDENCE = 0.85
 
 _SYSTEM_PROMPT = (
     "당신은 웹툰 컷을 분석하는 도우미입니다. 이미지(N-2, N-1, 현재 컷 N, 그리고 얼굴 bbox에 "
-    "F0/F1 라벨을 오버레이한 현재 컷)와 OCR 텍스트, 식별된 얼굴 정보를 받습니다. "
-    "현재 컷 N에 대해서만 결과를 JSON으로 출력하세요. 말풍선 꼬리와 오버레이된 얼굴 라벨을 매칭해 화자를 정하고, "
-    "OCR 오타를 문맥에 맞게 교정하세요. 반드시 아래 JSON 스키마만 출력하세요:\n"
+    "F0/F1 라벨을 오버레이한 현재 컷)와 OCR 텍스트(ocr_blocks), 식별된 얼굴 정보를 받습니다. "
+    "현재 컷 N에 대해서만 결과를 JSON으로 출력하세요.\n"
+    "【중요 규칙】\n"
+    "1) ocr_blocks의 **모든 index에 대해 정확히 하나씩** block을 출력하세요. "
+    "입력 블록 개수와 출력 blocks 개수가 같아야 하며, index를 그대로 유지합니다. "
+    "**블록을 병합·분할·생략·재번호하지 마세요.**\n"
+    "2) 각 block의 corrected_text는 **그 index의 OCR 텍스트만** 문맥에 맞게 교정하세요. "
+    "다른 블록의 내용을 끌어오거나 합치지 마세요(여러 줄이 한 문장이어도 각 줄은 자기 조각만 교정).\n"
+    "3) type은 블록별로 narration/speech/sfx/caption/other 중 하나. speaker는 대사(speech)면 "
+    "오버레이된 얼굴 라벨↔말풍선 꼬리로 화자를 정하고, 아니면 null.\n"
+    "반드시 아래 JSON 스키마만 출력하세요:\n"
     '{"blocks":[{"index":<int>,"type":"narration|speech|sfx|caption|other",'
-    '"speaker":"<이름 또는 null>","corrected_text":"<교정문>"}],'
+    '"speaker":"<이름 또는 null>","corrected_text":"<해당 블록만 교정>"}],'
     '"scene_meta":{"action_summary":"<현재 컷 줄거리>","key_objects":["..."]},'
     '"name_discoveries":[{"face_id":"F0","name":"<대사/나레이션에서 드러난 실제 이름>",'
     '"confidence":<0~1>,"evidence":"<근거>"}]}'
@@ -60,6 +68,33 @@ def _episode_info(webtoon_episode_id: int) -> dict:
         )
         row = cur.fetchone()
         return {"source": row[0], "title_id": row[1], "episode_no": row[2]}
+
+
+def prepare_episode_scene(webtoon_episode_id: int) -> None:
+    """Step3 재실행용 정리 — 에피소드의 기존 'llm' 어노테이션 + scene_meta 삭제(paddle 보존).
+
+    재실행이 '완전 교체'가 되도록(이전 run이 다뤘다가 이번엔 빠뜨린 region의 stale llm 제거).
+    Character 이름/제안은 누적 지식이라 건드리지 않는다.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM text_annotation
+            WHERE source = 'llm' AND region_id IN (
+                SELECT tr.id FROM text_region tr
+                JOIN webtoon_cut wc ON tr.cut_id = wc.id
+                WHERE wc.episode_id = %s
+            )
+            """,
+            (webtoon_episode_id,),
+        )
+        cur.execute(
+            """
+            DELETE FROM cut_scene_meta
+            WHERE cut_id IN (SELECT id FROM webtoon_cut WHERE episode_id = %s)
+            """,
+            (webtoon_episode_id,),
+        )
 
 
 def _cut_id(webtoon_episode_id: int, cut_number: int) -> Optional[int]:
@@ -244,10 +279,19 @@ def analyze_cut_scene(
 
     # 저장
     region_by_index = {r["index"]: r["region_id"] for r in regions}
+    matched_idx = set()
     for block in result.get("blocks", []):
-        rid = region_by_index.get(block.get("index"))
+        idx = block.get("index")
+        rid = region_by_index.get(idx)
         if rid is not None:
             _upsert_llm_annotation(rid, block, ctx["name"])
+            matched_idx.add(idx)
+    missing = [r["index"] for r in regions if r["index"] not in matched_idx]
+    if missing:
+        logger.warning(
+            "[step3] %s/%s ep=%s cut=%s — LLM이 분류 누락한 region index=%s (prompt 1:1 미준수)",
+            source, title_id, episode_no, cut_number, missing,
+        )
     scene_meta = result.get("scene_meta") or {}
     _upsert_scene_meta(cut_id, scene_meta)
     _apply_name_discoveries(faces, result.get("name_discoveries"))
@@ -268,6 +312,7 @@ def analyze_episode_scenes(webtoon_episode_id: int) -> dict:
     phase3_enabled 게이트는 적용하지 않는다(호출 자체가 명시적 실행).
     """
     info = _episode_info(webtoon_episode_id)
+    prepare_episode_scene(webtoon_episode_id)
     with db_cursor() as cur:
         cur.execute(
             "SELECT cut_number FROM webtoon_cut WHERE episode_id = %s ORDER BY cut_number",

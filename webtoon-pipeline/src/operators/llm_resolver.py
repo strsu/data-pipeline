@@ -11,13 +11,13 @@ from typing import Optional
 
 from src.config.db import db_cursor
 
-# 시드 누락 대비 폴백 (service 시드와 동일: glm-4.6v / zai)
+# 시드 누락 대비 폴백 (마이그레이션 0010 시드와 동일: 비전 모델 default)
 _FALLBACK = {
     "id": None,
-    "name": "glm-4.6v",
+    "name": "glm-5v-turbo",
     "provider": "zai",
-    "model_id": "glm-4.6v",
-    "params": {},
+    "model_id": "glm-5v-turbo",
+    "params": {"endpoint": "https://api.z.ai/api/paas/v4/chat/completions", "temperature": 0.2},
     "supports_vision": True,
 }
 

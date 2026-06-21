@@ -59,6 +59,7 @@ async def main() -> None:
                 activities.face_identify_episode,
                 activities.is_phase1_done,
                 activities.is_phase3_enabled,
+                activities.prepare_scene,
                 activities.scene_llm_cut,
             ],
             activity_executor=executor,

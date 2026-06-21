@@ -155,3 +155,10 @@ def scene_llm_cut(cut: CutRef, prev_context: str) -> str:
         cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id,
         cut.cut_no, prev_context,
     )
+
+
+@activity.defn
+def prepare_scene(ep: EpisodeInput) -> None:
+    """Step3 시작 시 기존 llm 어노테이션/scene_meta 정리(재실행 완전 교체)."""
+    from src.core import step3
+    step3.prepare_episode_scene(ep.webtoon_episode_id)

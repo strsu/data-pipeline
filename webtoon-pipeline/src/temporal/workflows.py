@@ -134,6 +134,14 @@ class EpisodeSceneWorkflow:
 
     @workflow.run
     async def run(self, s: SceneInput) -> None:
+        # 첫 배치에서만 기존 Step3 결과 정리(재실행 완전 교체).
+        if s.start_cut == 1:
+            await workflow.execute_activity(
+                activities.prepare_scene,
+                EpisodeInput(s.source, s.title_id, s.episode_no, s.webtoon_episode_id),
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+            )
+
         max_cut = s.max_cut or await workflow.execute_activity(
             activities.get_episode_max_cut,
             EpisodeInput(s.source, s.title_id, s.episode_no, s.webtoon_episode_id),

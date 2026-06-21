@@ -10,9 +10,16 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from typing import Optional
 
 import httpx
+
+# glm-5v-turbo 등 동시호출 제한 모델 대응 — LLM HTTP 호출을 전역 직렬화.
+# webtoon-pipeline replicas=1 전제(프로세스 세마포어). 한도가 늘면 LLM_MAX_CONCURRENCY로 상향.
+# 멀티 레플리카로 가면 분산 제한기(또는 Step3 전용 단일 워커/task queue)가 필요.
+_LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "1") or "1")
+_LLM_SEMAPHORE = threading.Semaphore(_LLM_MAX_CONCURRENCY)
 
 # provider별 기본 endpoint (params["endpoint"]로 override 가능). 모델명이 아니라 provider 라우팅.
 _DEFAULT_ENDPOINTS = {
@@ -83,7 +90,9 @@ def call_llm_json(
         body["max_tokens"] = params["max_tokens"]
 
     headers = {"Authorization": f"Bearer {_resolve_api_key(ctx)}"}
-    resp = _get_client().post(endpoint, json=body, headers=headers)
+    # 동시호출 제한(glm-5v-turbo=1) 준수 — 전역 직렬화.
+    with _LLM_SEMAPHORE:
+        resp = _get_client().post(endpoint, json=body, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     text = data["choices"][0]["message"]["content"]
