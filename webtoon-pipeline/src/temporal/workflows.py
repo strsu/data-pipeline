@@ -17,7 +17,14 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import CUTS_PER_RUN, CutRef, EpisodeInput, EpisodeResult, WebtoonInput
 
-_RETRY = RetryPolicy(maximum_attempts=5, initial_interval=timedelta(seconds=2))
+_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=30),
+    # model-api 재시작/콜드스타트(Connection refused)를 견디도록 관대하게.
+    # 일시 장애로 에피소드 워크플로 전체가 실패하지 않게 한다(durable execution).
+    maximum_attempts=100,
+)
 
 
 @workflow.defn

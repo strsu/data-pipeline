@@ -20,8 +20,24 @@ from src.temporal.workflows import EpisodeWorkflow, WebtoonWorkflow
 logging.basicConfig(level=logging.INFO)
 
 
+async def _connect_with_retry() -> Client:
+    """Temporal 준비 전/재시작 중에도 죽지 않고 연결될 때까지 백오프 재시도."""
+    attempt = 0
+    while True:
+        try:
+            return await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
+        except Exception as e:
+            attempt += 1
+            wait = min(30, 2 ** min(attempt, 5))
+            logging.warning(
+                "temporal 연결 실패 (addr=%s): %s — %ds 후 재시도 [%d]",
+                TEMPORAL_ADDRESS, e, wait, attempt,
+            )
+            await asyncio.sleep(wait)
+
+
 async def main() -> None:
-    client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
+    client = await _connect_with_retry()
 
     with ThreadPoolExecutor(max_workers=16) as executor:
         worker = Worker(
