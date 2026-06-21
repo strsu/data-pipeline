@@ -170,6 +170,21 @@ def _complete_episode_state(webtoon_id: int, webtoon_episode_id: int) -> None:
         )
 
 
+def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
+    """매칭 후보에서 제외할 캐릭터(죽은 단역 등)의 appearance_id 목록."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT ca.id
+            FROM character_appearance ca
+            JOIN character c ON ca.character_id = c.id
+            WHERE c.webtoon_id = %s AND c.is_match_excluded = true
+            """,
+            (webtoon_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str) -> int:
     """수동 확정 얼굴을 Chroma에 시딩 — 매칭 기준점 보장."""
     with db_cursor() as cur:
@@ -186,6 +201,7 @@ def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collectio
             LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
             WHERE c.webtoon_id = %s AND fr.is_confirmed = true
               AND fr.appearance_id IS NOT NULL AND fr.deleted_at IS NULL
+              AND c.is_match_excluded = false
             """,
             (model_name, webtoon_id),
         )
@@ -228,6 +244,7 @@ def identify_episode_faces(webtoon_episode_id: int, episode_no: int) -> dict:
 
     collection = get_face_collection(source, title_id, model_name)
     _seed_confirmed_faces(webtoon_id, source, title_id, collection, model_name, metric_type)
+    excluded_appearance_ids = _get_excluded_appearance_ids(webtoon_id)
 
     matched_n = 0
     new_n = 0
@@ -241,7 +258,7 @@ def identify_episode_faces(webtoon_episode_id: int, episode_no: int) -> dict:
         feature = embed_for(metric_type, crop_bytes)
         doc_id = f"{webtoon_id}_{episode_no}_{face['cut_number']}_F{face['face_idx']}"
 
-        match = find_match(collection, feature, metric_type, threshold)
+        match = find_match(collection, feature, metric_type, threshold, excluded_appearance_ids)
         if match is not None:
             meta = match["meta"]
             appearance_id = meta["appearance_id"]

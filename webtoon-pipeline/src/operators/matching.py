@@ -10,21 +10,31 @@ from typing import Optional
 from src.operators.embedding import ccip_compare
 
 
-def find_match(collection, feature: list[float], metric_type: str, threshold: float) -> Optional[dict]:
+def find_match(
+    collection,
+    feature: list[float],
+    metric_type: str,
+    threshold: float,
+    excluded_appearance_ids: Optional[list[int]] = None,
+) -> Optional[dict]:
     if metric_type == "ccip":
-        return _find_match_ccip(collection, feature, threshold)
-    return _find_match_cosine(collection, feature, threshold)
+        return _find_match_ccip(collection, feature, threshold, excluded_appearance_ids)
+    return _find_match_cosine(collection, feature, threshold, excluded_appearance_ids)
 
 
-def _find_match_cosine(collection, feature: list[float], threshold: float) -> Optional[dict]:
+def _find_match_cosine(
+    collection, feature: list[float], threshold: float, excluded_appearance_ids: Optional[list[int]] = None
+) -> Optional[dict]:
     try:
         if collection.count() == 0:
             return None
     except Exception:
         pass
+    where = {"appearance_id": {"$nin": excluded_appearance_ids}} if excluded_appearance_ids else None
     qr = collection.query(
         query_embeddings=[feature],
         n_results=1,
+        where=where,
         include=["metadatas", "distances"],
     )
     if not qr["ids"][0]:
@@ -36,7 +46,9 @@ def _find_match_cosine(collection, feature: list[float], threshold: float) -> Op
     return None
 
 
-def _find_match_ccip(collection, feature: list[float], threshold: float) -> Optional[dict]:
+def _find_match_ccip(
+    collection, feature: list[float], threshold: float, excluded_appearance_ids: Optional[list[int]] = None
+) -> Optional[dict]:
     """컬렉션의 appearance_id 보유 doc feature를 앵커로 모아 CCIP metric 비교."""
     got = collection.get(include=["embeddings", "metadatas"])
     embeddings = got.get("embeddings")
@@ -44,10 +56,11 @@ def _find_match_ccip(collection, feature: list[float], threshold: float) -> Opti
     metadatas = got.get("metadatas")
     metadatas = [] if metadatas is None else list(metadatas)
 
+    excluded = set(excluded_appearance_ids or [])
     anchors: list[list[float]] = []
     anchor_metas: list[dict] = []
     for emb, meta in zip(embeddings, metadatas):
-        if meta and "appearance_id" in meta:
+        if meta and "appearance_id" in meta and meta["appearance_id"] not in excluded:
             anchors.append(list(emb))
             anchor_metas.append(meta)
 
