@@ -39,8 +39,10 @@ def _find_match_cosine(collection, feature: list[float], threshold: float) -> Op
 def _find_match_ccip(collection, feature: list[float], threshold: float) -> Optional[dict]:
     """컬렉션의 appearance_id 보유 doc feature를 앵커로 모아 CCIP metric 비교."""
     got = collection.get(include=["embeddings", "metadatas"])
-    embeddings = got.get("embeddings") or []
-    metadatas = got.get("metadatas") or []
+    embeddings = got.get("embeddings")
+    embeddings = [] if embeddings is None else list(embeddings)
+    metadatas = got.get("metadatas")
+    metadatas = [] if metadatas is None else list(metadatas)
 
     anchors: list[list[float]] = []
     anchor_metas: list[dict] = []

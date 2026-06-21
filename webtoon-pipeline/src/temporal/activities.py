@@ -112,3 +112,46 @@ def face_identify_episode(ep: EpisodeInput) -> dict:
     """에피소드 단위 임베딩+매칭 1패스. 반환: {faces, matched, new_chars}."""
     from src.core import step2
     return step2.identify_episode_faces(ep.webtoon_episode_id, ep.episode_no)
+
+
+@activity.defn
+def is_phase1_done(webtoon_episode_id: int) -> bool:
+    """Step1(OCR/YOLO)이 이미 완료(episode_pipeline_progress phase=1 completed)됐는지."""
+    from src.config.db import db_cursor
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM episode_pipeline_progress "
+            "WHERE episode_id = %s AND phase = 1 AND status = 'completed')",
+            (webtoon_episode_id,),
+        )
+        return bool(cur.fetchone()[0])
+
+
+# ── Step3: LLM 장면/화자 분석 (활성 웹툰만) ───────────────────────────────────
+
+@activity.defn
+def is_phase3_enabled(webtoon_episode_id: int) -> bool:
+    """해당 웹툰의 phase3_enabled 여부."""
+    from src.config.db import db_cursor
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(wps.phase3_enabled, false)
+            FROM webtoon_episode we
+            JOIN webtoon_pipeline_state wps ON wps.webtoon_id = we.webtoon_id
+            WHERE we.id = %s
+            """,
+            (webtoon_episode_id,),
+        )
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+
+@activity.defn
+def scene_llm_cut(cut: CutRef, prev_context: str) -> str:
+    """단일 컷 LLM 분석. 반환: 다음 컷용 prev_context."""
+    from src.core import step3
+    return step3.analyze_cut_scene(
+        cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id,
+        cut.cut_no, prev_context,
+    )

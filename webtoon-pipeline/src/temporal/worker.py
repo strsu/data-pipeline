@@ -15,7 +15,7 @@ from temporalio.worker import Worker
 
 from src.temporal import activities
 from src.temporal.shared import TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE
-from src.temporal.workflows import EpisodeWorkflow, WebtoonWorkflow
+from src.temporal.workflows import EpisodeSceneWorkflow, EpisodeWorkflow, WebtoonWorkflow
 
 logging.basicConfig(level=logging.INFO)
 
@@ -43,7 +43,7 @@ async def main() -> None:
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[WebtoonWorkflow, EpisodeWorkflow],
+            workflows=[WebtoonWorkflow, EpisodeWorkflow, EpisodeSceneWorkflow],
             activities=[
                 activities.get_episode_max_cut,
                 activities.resolve_episode,
@@ -52,6 +52,9 @@ async def main() -> None:
                 activities.ocr_cut,
                 activities.yolo_cut,
                 activities.face_identify_episode,
+                activities.is_phase1_done,
+                activities.is_phase3_enabled,
+                activities.scene_llm_cut,
             ],
             activity_executor=executor,
         )

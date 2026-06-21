@@ -49,3 +49,15 @@ class EpisodeResult:
     faces: int
     matched: int
     new_chars: int
+
+
+@dataclass
+class SceneInput:
+    """Step3(LLM) 에피소드 처리 입력. continue-as-new 시 start_cut/prev_context 갱신."""
+    source: str
+    title_id: str
+    episode_no: int
+    webtoon_episode_id: int
+    start_cut: int = 1
+    max_cut: int = 0
+    prev_context: str = ""
