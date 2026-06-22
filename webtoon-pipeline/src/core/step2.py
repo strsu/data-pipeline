@@ -85,8 +85,8 @@ def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: in
             """
             INSERT INTO character
                 (webtoon_id, name, aliases, extra, first_seen_episode_id, first_seen_cut,
-                 is_confirmed, is_name_auto_assigned, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, false, false, %s, %s)
+                 is_confirmed, is_name_auto_assigned, is_match_excluded, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, false, false, false, %s, %s)
             RETURNING id
             """,
             (webtoon_id, char_name, Json([]), Json({}), webtoon_episode_id, cut_number, now, now),
