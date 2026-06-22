@@ -41,7 +41,7 @@ class EpisodeWorkflow:
         ):
             summary = await workflow.execute_activity(
                 activities.face_identify_episode, ep,
-                start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=7),
+                start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
                 retry_policy=_RETRY,
             )
             return EpisodeResult(
@@ -105,7 +105,7 @@ class EpisodeWorkflow:
         )
         summary = await workflow.execute_activity(
             activities.face_identify_episode, ep,
-            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=7),
+            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
             retry_policy=_RETRY,
         )
 
@@ -125,7 +125,7 @@ class EpisodeFaceIdentifyWorkflow:
     async def run(self, ep: EpisodeInput) -> dict:
         return await workflow.execute_activity(
             activities.face_identify_episode, ep,
-            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=7),
+            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
             retry_policy=_RETRY,
         )
 

@@ -378,6 +378,10 @@ def identify_episode_faces(
         heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
     )
 
+    logger.info("[step2] 매칭 시작: %d개 얼굴 순차 처리 (metric=%s)", len(pending), metric_type)
+    match_log_every = max(1, len(pending) // 10)
+    n_matched = 0
+    n_new = 0
     for i, face in enumerate(pending):
         feature = features_by_face_id.get(face["id"])
         if feature is None:
@@ -397,12 +401,14 @@ def identify_episode_faces(
             appearance_id = meta["appearance_id"]
             char_name = meta.get("character_name") or meta["character_id"]
             match_score = match["score"]
+            n_matched += 1
             _update_character_first_seen(appearance_id, webtoon_episode_id, episode_no, face["cut_number"])
         else:
             allocated = _allocate_character(webtoon_id, webtoon_episode_id, face["cut_number"])
             appearance_id = allocated["appearance_id"]
             char_name = allocated["char_name"]
             match_score = None
+            n_new += 1
 
         b = face["bbox"]
         meta_doc = {
@@ -420,9 +426,21 @@ def identify_episode_faces(
         _update_face_record(face["id"], appearance_id)
         _upsert_face_embedding(face["id"], model_name, doc_id, match_score)
 
+        done = i + 1
+        if done % match_log_every == 0 or done == len(pending):
+            logger.info(
+                "[step2] 매칭 진행 %d/%d (매칭=%d, 신규=%d, anchor=%s)",
+                done, len(pending), n_matched, n_new,
+                len(ccip_anchors) if ccip_anchors is not None else "-",
+            )
+
         if heartbeat_cb:
             heartbeat_cb(resume_from + i + 1)
 
     matched_n, new_n = _summarize_episode_faces(webtoon_episode_id)
     _complete_episode_state(webtoon_id, webtoon_episode_id)
+    logger.info(
+        "[step2] 에피소드 식별 완료 ep_id=%s episode_no=%s: faces=%d, matched=%d, new_chars=%d",
+        webtoon_episode_id, episode_no, len(faces), matched_n, new_n,
+    )
     return {"faces": len(faces), "matched": matched_n, "new_chars": new_n}

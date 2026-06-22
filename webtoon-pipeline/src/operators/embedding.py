@@ -24,8 +24,18 @@ _RETRYABLE = (
     httpx.ReadError,
     httpx.RemoteProtocolError,
 )
-_MAX_RETRIES = 5
-_RETRY_BACKOFF = (60, 60, 60, 60, 60)  # seconds — 200요청마다 워커 리사이클되는 재시작 윈도우를 견딘다
+_MAX_RETRIES = 10
+# 지수 백오프: wait = base * factor^attempt, 회당 상한 _RETRY_MAX_BACKOFF.
+# 마지막 시도 후에는 대기하지 않으므로 실제 대기는 attempt 0..8(9회).
+# 최대 누적 대기 = 1+2+4+8+16*5 = 95초 < heartbeat_timeout(2분=120초).
+_RETRY_BASE = 1.0       # 첫 재시도 대기(초)
+_RETRY_FACTOR = 2.0     # 지수 증가율
+_RETRY_MAX_BACKOFF = 16.0  # 회당 대기 상한(초)
+
+
+def _backoff(attempt: int) -> float:
+    """지수 백오프 대기 시간(초). attempt는 0부터."""
+    return min(_RETRY_MAX_BACKOFF, _RETRY_BASE * (_RETRY_FACTOR ** attempt))
 
 _client: httpx.Client | None = None
 
@@ -49,8 +59,10 @@ def _post_with_retry(url: str, **kwargs):
             return response
         except _RETRYABLE as e:
             last_exc = e
-            wait = _RETRY_BACKOFF[attempt]
-            logger.warning("[embedding] %s 일시 오류 attempt=%d/%d %s: %s — %d초 후 재시도",
+            if attempt + 1 >= _MAX_RETRIES:
+                break  # 마지막 시도 — 대기 없이 종료
+            wait = _backoff(attempt)
+            logger.warning("[embedding] %s 일시 오류 attempt=%d/%d %s: %s — %.0f초 후 재시도",
                            url, attempt + 1, _MAX_RETRIES, type(e).__name__, e, wait)
             time.sleep(wait)
         except httpx.HTTPStatusError as e:
