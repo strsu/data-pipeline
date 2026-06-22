@@ -109,9 +109,24 @@ def yolo_cut(cut: CutRef) -> bool:
 
 @activity.defn
 def face_identify_episode(ep: EpisodeInput) -> dict:
-    """에피소드 단위 임베딩+매칭 1패스. 반환: {faces, matched, new_chars}."""
+    """에피소드 단위 임베딩+매칭 1패스. 반환: {faces, matched, new_chars}.
+
+    얼굴 수가 많거나 anchor 집합이 커지면 처리 시간이 활동 타임아웃에 가까워질 수
+    있다. heartbeat로 처리 완료한 얼굴 인덱스를 기록해두면, 타임아웃으로 재시도될 때
+    처음부터 다시 처리하지 않고 이어서 진행한다.
+    """
     from src.core import step2
-    return step2.identify_episode_faces(ep.webtoon_episode_id, ep.episode_no)
+
+    info = activity.info()
+    resume_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+
+    def _heartbeat(done_count: int) -> None:
+        activity.heartbeat(done_count)
+
+    return step2.identify_episode_faces(
+        ep.webtoon_episode_id, ep.episode_no,
+        heartbeat_cb=_heartbeat, resume_from=resume_from,
+    )
 
 
 @activity.defn

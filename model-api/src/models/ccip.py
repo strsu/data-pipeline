@@ -36,14 +36,19 @@ def compare_features(query: list[float], anchors: list[list[float]]) -> dict:
 
     반환: {"diffs": [...], "min_diff": float|None, "argmin": int|None}
     낮을수록 동일인. 임계값(예: 0.16) 판정은 호출측(파이프라인)에서 수행.
+
+    ccip_difference(x, y)는 내부적으로 ccip_batch_differences([x, y])[0, 1]과 동일하며,
+    호출 1회당 ONNX metric 모델 forward pass 1회가 발생한다. anchor마다 따로 호출하면
+    anchor 수만큼 forward pass가 반복되므로(N개 → N회), query+anchor 전체를 한 번에
+    배치로 묶어 forward pass 1회로 전체 pairwise 행렬을 구하고 query 행(0번)만 취한다.
     """
     if not anchors:
         return {"diffs": [], "min_diff": None, "argmin": None}
 
-    from imgutils.metrics import ccip_difference
+    from imgutils.metrics import ccip_batch_differences
     q = np.asarray(query, dtype=np.float32)
-    diffs: list[float] = []
-    for a in anchors:
-        diffs.append(float(ccip_difference(q, np.asarray(a, dtype=np.float32), model=CCIP_MODEL)))
+    batch = [q] + [np.asarray(a, dtype=np.float32) for a in anchors]
+    diff_matrix = ccip_batch_differences(batch, model=CCIP_MODEL)
+    diffs = diff_matrix[0, 1:].astype(float).tolist()
     argmin = int(np.argmin(diffs))
     return {"diffs": diffs, "min_diff": diffs[argmin], "argmin": argmin}
