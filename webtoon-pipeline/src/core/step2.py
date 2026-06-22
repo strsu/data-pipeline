@@ -191,8 +191,17 @@ def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
         return [row[0] for row in cur.fetchall()]
 
 
-def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str) -> int:
-    """수동 확정 얼굴을 Chroma에 시딩 — 매칭 기준점 보장."""
+def _seed_confirmed_faces(
+    webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str,
+    heartbeat_cb: Optional[Callable[[int], None]] = None, heartbeat_value: int = 0,
+) -> int:
+    """수동 확정 얼굴을 Chroma에 시딩 — 매칭 기준점 보장.
+
+    웹툰 전체의 확정 얼굴을 순차로 S3 다운로드+임베딩하므로, 확정 얼굴이 누적된
+    웹툰에서는 이 단계만으로도 heartbeat_timeout을 넘길 수 있다. 메인 루프와 동일하게
+    얼굴 하나가 끝날 때마다 같은 값(heartbeat_value)으로 heartbeat를 보내 타임아웃
+    타이머를 갱신한다.
+    """
     with db_cursor() as cur:
         cur.execute(
             """
@@ -219,6 +228,8 @@ def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collectio
         doc_id = chroma_doc_id or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
         crop_bytes = fetch_face_crop(face_id, source, title_id)
         if crop_bytes is None:
+            if heartbeat_cb:
+                heartbeat_cb(heartbeat_value)
             continue
         embedding = embed_for(metric_type, crop_bytes)
         collection.upsert(
@@ -231,6 +242,8 @@ def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collectio
                 "conf": conf or 0.0, "created_at": datetime.now(timezone.utc).isoformat(),
             }],
         )
+        if heartbeat_cb:
+            heartbeat_cb(heartbeat_value)
     return len(rows)
 
 
@@ -309,7 +322,10 @@ def identify_episode_faces(
     threshold = ctx["threshold"]
 
     collection = get_face_collection(source, title_id, model_name)
-    _seed_confirmed_faces(webtoon_id, source, title_id, collection, model_name, metric_type)
+    _seed_confirmed_faces(
+        webtoon_id, source, title_id, collection, model_name, metric_type,
+        heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
+    )
     excluded_appearance_ids = _get_excluded_appearance_ids(webtoon_id)
 
     # collection.get()/일괄 임베딩이 heartbeat_timeout(2분)보다 오래 걸릴 수 있어,
