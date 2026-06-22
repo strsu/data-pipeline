@@ -267,13 +267,42 @@ def _fetch_and_embed_all(
     """
     if not faces:
         return {}
+    total = len(faces)
+    workers = min(_EMBED_WORKERS, total)
+    logger.info(
+        "[step2] 임베딩 시작: %d개 얼굴 (metric=%s, workers=%d, resume_from=%d)",
+        total, metric_type, workers, heartbeat_value,
+    )
+    # 진행 로그 간격: 너무 잦지 않게 약 10% 단위(최소 1개)로 출력.
+    log_every = max(1, total // 10)
+
     results: dict[int, Optional[list[float]]] = {}
-    with ThreadPoolExecutor(max_workers=min(_EMBED_WORKERS, len(faces))) as pool:
+    done = 0
+    ok = 0
+    missing = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_fetch_and_embed, f, source, title_id, metric_type): f["id"] for f in faces}
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            face_id = futures[future]
+            try:
+                feature = future.result()
+            except Exception:
+                logger.exception("[step2] 임베딩 실패 face_id=%s (%d/%d 처리됨)", face_id, done, total)
+                raise
+            results[face_id] = feature
+            done += 1
+            if feature is None:
+                missing += 1
+            else:
+                ok += 1
+            if done % log_every == 0 or done == total:
+                logger.info(
+                    "[step2] 임베딩 진행 %d/%d (성공=%d, crop없음=%d, 진행중=%d)",
+                    done, total, ok, missing, total - done,
+                )
             if heartbeat_cb:
                 heartbeat_cb(heartbeat_value)
+    logger.info("[step2] 임베딩 완료: %d/%d (성공=%d, crop없음=%d)", done, total, ok, missing)
     return results
 
 
@@ -340,6 +369,10 @@ def identify_episode_faces(
 
     faces = _load_face_records(webtoon_episode_id)
     pending = faces[resume_from:]
+    logger.info(
+        "[step2] 에피소드 식별 시작 ep_id=%s episode_no=%s: 전체 %d개 얼굴, resume_from=%d → 처리 대상 %d개 (model=%s, metric=%s)",
+        webtoon_episode_id, episode_no, len(faces), resume_from, len(pending), model_name, metric_type,
+    )
     features_by_face_id = _fetch_and_embed_all(
         pending, source, title_id, metric_type,
         heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
