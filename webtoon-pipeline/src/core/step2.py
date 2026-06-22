@@ -8,8 +8,9 @@ Temporal 액티비티가 `identify_episode_faces(webtoon_episode_id)`를 호출�
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from psycopg2.extras import Json
 
@@ -17,10 +18,15 @@ from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.s3 import fetch_face_crop
 from src.operators.embedding import embed_for
-from src.operators.matching import find_match
+from src.operators.matching import find_match, load_ccip_anchors
 from src.operators.model_resolver import resolve_embedding_model
 
 logger = logging.getLogger(__name__)
+
+# S3 다운로드 + model-api 임베딩 요청은 얼굴 간 독립적인 I/O라 동시 처리.
+# 매칭/캐릭터 할당은 같은 에피소드 내 순서 의존(신규 캐릭터가 다음 얼굴의 매칭 후보가
+# 될 수 있음)이라 순차 유지 — 병렬화 대상은 fetch+embed 단계로 한정.
+_EMBED_WORKERS = 8
 
 
 # ── DB 헬퍼 ───────────────────────────────────────────────────────────────────
@@ -228,10 +234,57 @@ def _seed_confirmed_faces(webtoon_id: int, source: str, title_id: str, collectio
     return len(rows)
 
 
+def _fetch_and_embed(face: dict, source: str, title_id: str, metric_type: str) -> Optional[list[float]]:
+    crop_bytes = fetch_face_crop(face["id"], source, title_id)
+    if crop_bytes is None:
+        return None
+    return embed_for(metric_type, crop_bytes)
+
+
+def _fetch_and_embed_all(faces: list[dict], source: str, title_id: str, metric_type: str) -> dict[int, Optional[list[float]]]:
+    """S3 crop 다운로드 + model-api 임베딩을 얼굴 간 동시 처리(독립 I/O).
+    매칭/캐릭터 할당은 순서 의존이라 이 단계의 결과를 받아 순차로 처리한다."""
+    if not faces:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(_EMBED_WORKERS, len(faces))) as pool:
+        results = pool.map(lambda f: (f["id"], _fetch_and_embed(f, source, title_id, metric_type)), faces)
+        return dict(results)
+
+
+def _summarize_episode_faces(webtoon_episode_id: int) -> tuple[int, int]:
+    """face_record/face_embedding 현재 상태로 matched/new_chars 집계 (재시도 후에도 정확).
+    match_score IS NULL이면 신규 캐릭터, 값이 있으면 기존 캐릭터 매칭."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE fe.match_score IS NOT NULL) AS matched,
+                COUNT(*) FILTER (WHERE fe.match_score IS NULL) AS new_chars
+            FROM face_record fr
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id
+            WHERE wc.episode_id = %s AND fr.appearance_id IS NOT NULL
+            """,
+            (webtoon_episode_id,),
+        )
+        matched, new_chars = cur.fetchone()
+        return matched or 0, new_chars or 0
+
+
 # ── 에피소드 단위 식별 진입점 (Temporal 액티비티가 호출) ──────────────────────
 
-def identify_episode_faces(webtoon_episode_id: int, episode_no: int) -> dict:
-    """에피소드의 모든 얼굴을 임베딩+매칭 1패스로 식별. 반환: 처리 요약."""
+def identify_episode_faces(
+    webtoon_episode_id: int,
+    episode_no: int,
+    heartbeat_cb: Optional[Callable[[int], None]] = None,
+    resume_from: int = 0,
+) -> dict:
+    """에피소드의 모든 얼굴을 임베딩+매칭 1패스로 식별. 반환: 처리 요약.
+
+    heartbeat_cb/resume_from: 액티비티 타임아웃으로 재시도될 때 처음부터 다시
+    처리하지 않도록, 처리 완료한 얼굴 인덱스를 Temporal heartbeat detail로 기록하고
+    재시도 시 그 지점부터 재개한다(`face_identify_episode` 액티비티가 연결).
+    """
     webtoon = get_webtoon_info(webtoon_episode_id)
     webtoon_id = webtoon["webtoon_id"]
     source = webtoon["source"]
@@ -246,46 +299,60 @@ def identify_episode_faces(webtoon_episode_id: int, episode_no: int) -> dict:
     _seed_confirmed_faces(webtoon_id, source, title_id, collection, model_name, metric_type)
     excluded_appearance_ids = _get_excluded_appearance_ids(webtoon_id)
 
-    matched_n = 0
-    new_n = 0
+    # ccip는 anchor 전체를 브루트포스로 비교해야 해서(§matching.py) 얼굴마다
+    # collection.get()으로 전체 재조회하지 않도록 에피소드당 1회만 적재해 캐시한다.
+    # 새로 추가되는 얼굴(매칭/신규 캐릭터)은 루프 중 캐시에 직접 append해 갱신.
+    ccip_anchors = load_ccip_anchors(collection, excluded_appearance_ids) if metric_type == "ccip" else None
+
     faces = _load_face_records(webtoon_episode_id)
-    for face in faces:
-        crop_bytes = fetch_face_crop(face["id"], source, title_id)
-        if crop_bytes is None:
+    pending = faces[resume_from:]
+    features_by_face_id = _fetch_and_embed_all(pending, source, title_id, metric_type)
+
+    for i, face in enumerate(pending):
+        feature = features_by_face_id.get(face["id"])
+        if feature is None:
             logger.warning("[step2] crop not found face_id=%s, skip", face["id"])
+            if heartbeat_cb:
+                heartbeat_cb(resume_from + i + 1)
             continue
 
-        feature = embed_for(metric_type, crop_bytes)
         doc_id = f"{webtoon_id}_{episode_no}_{face['cut_number']}_F{face['face_idx']}"
 
-        match = find_match(collection, feature, metric_type, threshold, excluded_appearance_ids)
+        match = find_match(
+            collection, feature, metric_type, threshold, excluded_appearance_ids,
+            ccip_anchors=ccip_anchors,
+        )
         if match is not None:
             meta = match["meta"]
             appearance_id = meta["appearance_id"]
             char_name = meta.get("character_name") or meta["character_id"]
             match_score = match["score"]
             _update_character_first_seen(appearance_id, webtoon_episode_id, episode_no, face["cut_number"])
-            matched_n += 1
         else:
             allocated = _allocate_character(webtoon_id, webtoon_episode_id, face["cut_number"])
             appearance_id = allocated["appearance_id"]
             char_name = allocated["char_name"]
             match_score = None
-            new_n += 1
 
         b = face["bbox"]
-        collection.upsert(
-            ids=[doc_id], embeddings=[feature],
-            metadatas=[{
-                "webtoon_id": webtoon_id, "episode": episode_no, "cut": face["cut_number"],
-                "face_idx": face["face_idx"], "character_id": char_name, "appearance_id": appearance_id,
-                "appearance_label": "기본", "character_name": char_name, "is_confirmed": False,
-                "bbox_x1": b[0], "bbox_y1": b[1], "bbox_x2": b[2], "bbox_y2": b[3],
-                "conf": face["conf"], "created_at": datetime.now(timezone.utc).isoformat(),
-            }],
-        )
+        meta_doc = {
+            "webtoon_id": webtoon_id, "episode": episode_no, "cut": face["cut_number"],
+            "face_idx": face["face_idx"], "character_id": char_name, "appearance_id": appearance_id,
+            "appearance_label": "기본", "character_name": char_name, "is_confirmed": False,
+            "bbox_x1": b[0], "bbox_y1": b[1], "bbox_x2": b[2], "bbox_y2": b[3],
+            "conf": face["conf"], "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        collection.upsert(ids=[doc_id], embeddings=[feature], metadatas=[meta_doc])
+        if ccip_anchors is not None and match is None:
+            # 같은 에피소드 내 다음 얼굴이 방금 만든 신규 캐릭터와 매칭될 수 있어 캐시에 반영.
+            ccip_anchors.append({"embedding": feature, "meta": meta_doc})
+
         _update_face_record(face["id"], appearance_id)
         _upsert_face_embedding(face["id"], model_name, doc_id, match_score)
 
+        if heartbeat_cb:
+            heartbeat_cb(resume_from + i + 1)
+
+    matched_n, new_n = _summarize_episode_faces(webtoon_episode_id)
     _complete_episode_state(webtoon_id, webtoon_episode_id)
     return {"faces": len(faces), "matched": matched_n, "new_chars": new_n}
