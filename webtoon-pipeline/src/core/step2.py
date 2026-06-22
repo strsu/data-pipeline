@@ -8,7 +8,7 @@ Temporal 액티비티가 `identify_episode_faces(webtoon_episode_id)`를 호출�
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -241,14 +241,27 @@ def _fetch_and_embed(face: dict, source: str, title_id: str, metric_type: str) -
     return embed_for(metric_type, crop_bytes)
 
 
-def _fetch_and_embed_all(faces: list[dict], source: str, title_id: str, metric_type: str) -> dict[int, Optional[list[float]]]:
+def _fetch_and_embed_all(
+    faces: list[dict], source: str, title_id: str, metric_type: str,
+    heartbeat_cb: Optional[Callable[[int], None]] = None, heartbeat_value: int = 0,
+) -> dict[int, Optional[list[float]]]:
     """S3 crop 다운로드 + model-api 임베딩을 얼굴 간 동시 처리(독립 I/O).
-    매칭/캐릭터 할당은 순서 의존이라 이 단계의 결과를 받아 순차로 처리한다."""
+    매칭/캐릭터 할당은 순서 의존이라 이 단계의 결과를 받아 순차로 처리한다.
+
+    이 단계는 순차 루프 진입 전이라 resume 인덱스(heartbeat_value)는 아직 전진하지
+    않지만, 얼굴 수가 많으면 이 단계만으로도 heartbeat_timeout을 넘길 수 있어
+    얼굴 하나가 끝날 때마다 같은 값으로 heartbeat를 보내 타임아웃 타이머를 갱신한다.
+    """
     if not faces:
         return {}
+    results: dict[int, Optional[list[float]]] = {}
     with ThreadPoolExecutor(max_workers=min(_EMBED_WORKERS, len(faces))) as pool:
-        results = pool.map(lambda f: (f["id"], _fetch_and_embed(f, source, title_id, metric_type)), faces)
-        return dict(results)
+        futures = {pool.submit(_fetch_and_embed, f, source, title_id, metric_type): f["id"] for f in faces}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+            if heartbeat_cb:
+                heartbeat_cb(heartbeat_value)
+    return results
 
 
 def _summarize_episode_faces(webtoon_episode_id: int) -> tuple[int, int]:
@@ -299,6 +312,11 @@ def identify_episode_faces(
     _seed_confirmed_faces(webtoon_id, source, title_id, collection, model_name, metric_type)
     excluded_appearance_ids = _get_excluded_appearance_ids(webtoon_id)
 
+    # collection.get()/일괄 임베딩이 heartbeat_timeout(2분)보다 오래 걸릴 수 있어,
+    # 순차 루프 진입 전인 이 구간에서도 heartbeat로 타임아웃 타이머를 미리 갱신해둔다.
+    if heartbeat_cb:
+        heartbeat_cb(resume_from)
+
     # ccip는 anchor 전체를 브루트포스로 비교해야 해서(§matching.py) 얼굴마다
     # collection.get()으로 전체 재조회하지 않도록 에피소드당 1회만 적재해 캐시한다.
     # 새로 추가되는 얼굴(매칭/신규 캐릭터)은 루프 중 캐시에 직접 append해 갱신.
@@ -306,7 +324,10 @@ def identify_episode_faces(
 
     faces = _load_face_records(webtoon_episode_id)
     pending = faces[resume_from:]
-    features_by_face_id = _fetch_and_embed_all(pending, source, title_id, metric_type)
+    features_by_face_id = _fetch_and_embed_all(
+        pending, source, title_id, metric_type,
+        heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
+    )
 
     for i, face in enumerate(pending):
         feature = features_by_face_id.get(face["id"])
