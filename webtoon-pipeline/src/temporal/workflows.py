@@ -90,6 +90,46 @@ class EpisodeWorkflow:
 
 
 @workflow.defn
+class EpisodeStep1Workflow:
+    """Step1 단독 — 에피소드의 OCR/YOLO만 재추출(Step2 얼굴 식별 없음).
+    admin에서 에피소드 단위로 트리거. 기존 추출 데이터를 정리 후 다시 추출하고
+    phase1 완료를 마킹한다."""
+
+    @workflow.run
+    async def run(self, ep: EpisodeInput) -> EpisodeResult:
+        # 재처리 정리(기존 OCR/얼굴/세그먼트 데이터 제거).
+        await workflow.execute_activity(
+            activities.prepare_episode, ep,
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
+        )
+
+        # 에피소드 단위 Step1 — 스트립 결합 후 콘텐츠 세그먼트별 OCR/YOLO(병렬).
+        await asyncio.gather(
+            workflow.execute_activity(
+                activities.ocr_episode, ep,
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=_RETRY,
+            ),
+            workflow.execute_activity(
+                activities.yolo_episode, ep,
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=_RETRY,
+            ),
+        )
+
+        # phase1 완료 마킹(Step2는 실행하지 않음).
+        await workflow.execute_activity(
+            activities.mark_phase1_complete, ep,
+            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
+        )
+
+        return EpisodeResult(
+            source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
+            total_cuts=0, faces=0, matched=0, new_chars=0,
+        )
+
+
+@workflow.defn
 class EpisodeFaceIdentifyWorkflow:
     """Step2 단독 — 이미 추출된 얼굴로 임베딩+매칭만 재실행(OCR/YOLO 재실행 없음).
     admin에서 에피소드 단위로 트리거."""

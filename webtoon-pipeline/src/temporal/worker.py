@@ -18,6 +18,7 @@ from src.temporal.shared import TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE
 from src.temporal.workflows import (
     EpisodeFaceIdentifyWorkflow,
     EpisodeSceneWorkflow,
+    EpisodeStep1Workflow,
     EpisodeWorkflow,
     WebtoonWorkflow,
 )
@@ -48,7 +49,7 @@ async def main() -> None:
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[WebtoonWorkflow, EpisodeWorkflow, EpisodeFaceIdentifyWorkflow, EpisodeSceneWorkflow],
+            workflows=[WebtoonWorkflow, EpisodeWorkflow, EpisodeStep1Workflow, EpisodeFaceIdentifyWorkflow, EpisodeSceneWorkflow],
             activities=[
                 activities.get_episode_max_cut,
                 activities.resolve_episode,
