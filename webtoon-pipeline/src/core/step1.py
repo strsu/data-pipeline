@@ -11,6 +11,7 @@ Temporal 액티비티가 호출한다. OCR과 YOLO는 **독립 경로**로 분�
 """
 from __future__ import annotations
 
+import time
 from bisect import bisect_right
 from datetime import datetime, timezone
 from io import BytesIO
@@ -380,12 +381,17 @@ def process_cut_yolo(
 # 컷 단위 대비 메모리 사용이 크므로 워커 메모리를 고려할 것.
 
 
-def _load_episode_strip(source: str, title_id: str, episode_no: int, webtoon_episode_id: int):
+def _load_episode_strip(source: str, title_id: str, episode_no: int, webtoon_episode_id: int,
+                        tag: str = "step1"):
     """에피소드 전체 컷 다운로드 → 공통 너비로 결합한 스트립 + 컷 경계/매핑 반환.
 
     반환: (strip PIL, W, cut_numbers[list], bounds[list], cut_id_map{cut_no:id})
           또는 컷이 없으면 None.  bounds[k]~bounds[k+1] 가 cut_numbers[k] 영역.
     """
+    ep = f"{source}/{title_id} ep={episode_no}"
+    # [1] 컷 이미지 S3 다운로드 (순차)
+    t0 = time.perf_counter()
+    print(f"[{tag}.load] {ep} — 이미지 다운로드 시작")
     imgs: list[tuple[int, Image.Image]] = []
     cut = 1
     while True:
@@ -393,10 +399,17 @@ def _load_episode_strip(source: str, title_id: str, episode_no: int, webtoon_epi
         if b is None:
             break
         imgs.append((cut, Image.open(BytesIO(b)).convert("RGB")))
+        if cut % 10 == 0:
+            print(f"[{tag}.load] {ep} — 다운로드 {cut}개 완료 ({time.perf_counter() - t0:.1f}s)")
         cut += 1
     if not imgs:
+        print(f"[{tag}.load] {ep} — 컷 없음")
         return None
+    print(f"[{tag}.load] {ep} — 다운로드 완료 {len(imgs)}개 ({time.perf_counter() - t0:.1f}s)")
 
+    # [2] 공통 너비로 리사이즈 + 세로 결합(스트립 생성)
+    t1 = time.perf_counter()
+    print(f"[{tag}.load] {ep} — 스트립 결합 시작 ({len(imgs)}개)")
     W = min(im.width for _, im in imgs)
     cut_numbers: list[int] = []
     bounds: list[int] = [0]
@@ -411,8 +424,13 @@ def _load_episode_strip(source: str, title_id: str, episode_no: int, webtoon_epi
     strip = Image.new("RGB", (W, bounds[-1]))
     for im, y0 in zip(resized, bounds[:-1]):
         strip.paste(im, (0, y0))
+    print(f"[{tag}.load] {ep} — 스트립 결합 완료 {W}x{bounds[-1]} ({time.perf_counter() - t1:.1f}s)")
 
+    # [3] 컷 row 멱등 보장
+    t2 = time.perf_counter()
     cut_id_map = {cn: ensure_cut(webtoon_episode_id, cn) for cn in cut_numbers}
+    print(f"[{tag}.load] {ep} — cut row {len(cut_id_map)}개 ensure ({time.perf_counter() - t2:.1f}s), "
+          f"load 총 {time.perf_counter() - t0:.1f}s")
     return strip, W, cut_numbers, bounds, cut_id_map
 
 
@@ -504,19 +522,24 @@ def process_episode_ocr(
     검출은 전부 저장하고, 신뢰도(OCR_MIN_SCORE) 미만은 is_used=False로만 표시(드롭 아님).
     같은 줄 그룹은 line_group으로 기록(병합은 소비측에서 파생). 반환: 저장 텍스트 수.
     """
-    loaded = _load_episode_strip(source, title_id, episode_no, webtoon_episode_id)
+    loaded = _load_episode_strip(source, title_id, episode_no, webtoon_episode_id, tag="step1.ocr")
     if loaded is None:
         print(f"[step1.ocr] {source}/{title_id} ep={episode_no} — 컷 없음")
         return 0
     strip, W, cut_numbers, bounds, cut_id_map = loaded
 
+    ep = f"{source}/{title_id} ep={episode_no}"
+    t_seg = time.perf_counter()
+    print(f"[step1.ocr] {ep} — 세그먼트 분할 시작 (strip {W}x{bounds[-1]})")
     arr = np.asarray(strip)
     intervals = _content_intervals(arr)
     del arr
+    print(f"[step1.ocr] {ep} — 세그먼트 분할 완료 {len(intervals)}개 ({time.perf_counter() - t_seg:.1f}s)")
 
     region_index: dict[int, int] = {}
     total = 0
     now = datetime.now(timezone.utc)
+    t_ocr = time.perf_counter()
     for si, (y0, y1) in enumerate(intervals):
         seg = strip.crop((0, y0, W, y1))
         buf = BytesIO()
@@ -564,8 +587,11 @@ def process_episode_ocr(
                 total += 1
         if heartbeat_cb:
             heartbeat_cb(si + 1)
+        print(f"[step1.ocr] {ep} — 세그먼트 {si + 1}/{len(intervals)} 처리 "
+              f"(누적 텍스트 {total}개, {time.perf_counter() - t_ocr:.1f}s)")
 
-    print(f"[step1.ocr] {source}/{title_id} ep={episode_no} — 세그먼트 {len(intervals)}개, 텍스트 {total}개(raw)")
+    print(f"[step1.ocr] {ep} — 세그먼트 {len(intervals)}개, 텍스트 {total}개(raw) "
+          f"OCR {time.perf_counter() - t_ocr:.1f}s")
     return total
 
 
@@ -578,20 +604,25 @@ def process_episode_yolo(
     IOU 중복은 드롭하지 않고 is_duplicate=True/is_used=False로 표시. crop은 is_used 얼굴만 업로드.
     임베딩/매칭(Step2)도 is_used 얼굴만 대상으로 해야 함.
     """
-    loaded = _load_episode_strip(source, title_id, episode_no, webtoon_episode_id)
+    loaded = _load_episode_strip(source, title_id, episode_no, webtoon_episode_id, tag="step1.yolo")
     if loaded is None:
         print(f"[step1.yolo] {source}/{title_id} ep={episode_no} — 컷 없음")
         return 0
     strip, W, cut_numbers, bounds, cut_id_map = loaded
 
+    ep = f"{source}/{title_id} ep={episode_no}"
+    t_seg = time.perf_counter()
+    print(f"[step1.yolo] {ep} — 세그먼트 분할 시작 (strip {W}x{bounds[-1]})")
     arr = np.asarray(strip)
     intervals = _content_intervals(arr)
     del arr
+    print(f"[step1.yolo] {ep} — 세그먼트 분할 완료 {len(intervals)}개 ({time.perf_counter() - t_seg:.1f}s)")
 
     face_index: dict[int, int] = {}
     used_bboxes: dict[int, list] = {}  # cut_id -> 사용된 얼굴 bbox(IOU 중복 판정 기준)
     total = 0
     now = datetime.now(timezone.utc)
+    t_yolo = time.perf_counter()
     for si, (y0, y1) in enumerate(intervals):
         seg = strip.crop((0, y0, W, y1))
         buf = BytesIO()
@@ -639,6 +670,9 @@ def process_episode_yolo(
                         print(f"[step1] face crop upload 실패 face_id={face_record_id}: {e}")
         if heartbeat_cb:
             heartbeat_cb(si + 1)
+        print(f"[step1.yolo] {ep} — 세그먼트 {si + 1}/{len(intervals)} 처리 "
+              f"(누적 얼굴 {total}개, {time.perf_counter() - t_yolo:.1f}s)")
 
-    print(f"[step1.yolo] {source}/{title_id} ep={episode_no} — 세그먼트 {len(intervals)}개, 얼굴 {total}개(raw)")
+    print(f"[step1.yolo] {ep} — 세그먼트 {len(intervals)}개, 얼굴 {total}개(raw) "
+          f"YOLO {time.perf_counter() - t_yolo:.1f}s")
     return total

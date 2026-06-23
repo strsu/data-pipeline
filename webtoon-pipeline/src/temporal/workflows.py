@@ -61,12 +61,12 @@ class EpisodeWorkflow:
         await asyncio.gather(
             workflow.execute_activity(
                 activities.ocr_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=_RETRY,
             ),
             workflow.execute_activity(
                 activities.yolo_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=_RETRY,
             ),
         )
@@ -107,12 +107,12 @@ class EpisodeStep1Workflow:
         await asyncio.gather(
             workflow.execute_activity(
                 activities.ocr_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=_RETRY,
             ),
             workflow.execute_activity(
                 activities.yolo_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=_RETRY,
             ),
         )

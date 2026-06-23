@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
 
 import httpx
@@ -44,16 +45,36 @@ def _post_with_fallback(
     path: str, priority: str, fallback: str, image_bytes: bytes, params: dict, key: str
 ) -> list[dict]:
     """priority(GPU) 호출 → 실패/무응답 시 fallback(원래 CPU 서버)로 재시도."""
+    # 1) GPU(priority) 우선 호출
+    t0 = time.perf_counter()
     try:
-        return _post_image(priority, path, image_bytes, params)[key]
+        result = _post_image(priority, path, image_bytes, params)[key]
+        logger.info(
+            "[ocr_yolo] %s GPU(priority=%s) 성공 — %.2fs, %d건",
+            path, priority, time.perf_counter() - t0, len(result),
+        )
+        return result
     except Exception as e:
-        if fallback and fallback != priority:
-            logger.warning(
-                "[ocr_yolo] %s priority(%s) 실패: %s — fallback(%s) 시도",
-                path, priority, type(e).__name__, fallback,
+        # fallback이 없거나 priority와 동일하면 폴백 불가 — 그대로 전파
+        if not fallback or fallback == priority:
+            logger.error(
+                "[ocr_yolo] %s GPU(priority=%s) 실패(폴백 없음) — %.2fs: %s",
+                path, priority, time.perf_counter() - t0, type(e).__name__,
             )
-            return _post_image(fallback, path, image_bytes, params)[key]
-        raise
+            raise
+        logger.warning(
+            "[ocr_yolo] %s GPU(priority=%s) 실패 — %.2fs: %s — fallback(%s) 시도",
+            path, priority, time.perf_counter() - t0, type(e).__name__, fallback,
+        )
+
+    # 2) CPU(fallback) 재시도
+    t1 = time.perf_counter()
+    result = _post_image(fallback, path, image_bytes, params)[key]
+    logger.info(
+        "[ocr_yolo] %s fallback(%s) 성공 — %.2fs, %d건",
+        path, fallback, time.perf_counter() - t1, len(result),
+    )
+    return result
 
 
 def run_ocr(
