@@ -79,10 +79,11 @@ def mark_phase1_complete(ep: EpisodeInput) -> None:
 
 @activity.defn
 def prepare_episode(ep: EpisodeInput) -> None:
-    """에피소드 시작 시 기존 OCR/얼굴 데이터 정리(재처리 멱등)."""
+    """에피소드 시작 시 기존 OCR/얼굴/세그먼트 데이터 정리(재처리 멱등)."""
     from src.core import step1
     step1.prepare_episode_ocr(ep.webtoon_episode_id)
     step1.prepare_episode_yolo(ep.webtoon_episode_id, ep.source, ep.title_id)
+    step1.prepare_episode_segments(ep.webtoon_episode_id)
 
 
 # ── Step1: OCR / YOLO (분리) ──────────────────────────────────────────────────
@@ -102,6 +103,34 @@ def yolo_cut(cut: CutRef) -> bool:
     from src.core import step1
     return step1.process_cut_yolo(
         cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id, cut.cut_no
+    )
+
+
+# ── Step1: 에피소드 단위 (스트립 결합 → 콘텐츠 세그먼트) ──────────────────────
+
+@activity.defn
+def ocr_episode(ep: EpisodeInput) -> int:
+    """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위 OCR. 반환: 저장 텍스트 수."""
+    from src.core import step1
+
+    def _hb(done: int) -> None:
+        activity.heartbeat(done)
+
+    return step1.process_episode_ocr(
+        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id, heartbeat_cb=_hb
+    )
+
+
+@activity.defn
+def yolo_episode(ep: EpisodeInput) -> int:
+    """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위 YOLO. 반환: 저장 얼굴 수."""
+    from src.core import step1
+
+    def _hb(done: int) -> None:
+        activity.heartbeat(done)
+
+    return step1.process_episode_yolo(
+        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id, heartbeat_cb=_hb
     )
 
 

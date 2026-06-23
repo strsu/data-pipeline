@@ -34,8 +34,7 @@ class EpisodeWorkflow:
     @workflow.run
     async def run(self, ep: EpisodeInput) -> EpisodeResult:
         # Step1이 이미 완료된 에피소드면 재추출(OCR/YOLO) 생략하고 Step2만 재실행.
-        # (Step1은 성공했는데 Step2/이후가 실패해 재kick하는 경우 — 몇 시간짜리 재처리 방지)
-        if ep.start_cut == 1 and await workflow.execute_activity(
+        if await workflow.execute_activity(
             activities.is_phase1_done, ep.webtoon_episode_id,
             start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
         ):
@@ -50,55 +49,29 @@ class EpisodeWorkflow:
                 matched=summary.get("matched", 0), new_chars=summary.get("new_chars", 0),
             )
 
-        # 첫 배치에서만 재처리 정리.
-        if ep.start_cut == 1:
-            await workflow.execute_activity(
-                activities.prepare_episode, ep,
-                start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
-            )
-
-        max_cut = ep.max_cut or await workflow.execute_activity(
-            activities.get_episode_max_cut, ep,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
+        # 재처리 정리(기존 OCR/얼굴 데이터 제거).
+        await workflow.execute_activity(
+            activities.prepare_episode, ep,
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
         )
 
-        end = min(ep.start_cut + CUTS_PER_RUN - 1, max_cut) if max_cut else ep.start_cut + CUTS_PER_RUN - 1
+        # 에피소드 단위 Step1 — 전체 컷을 스트립으로 결합 후 콘텐츠 세그먼트별 OCR/YOLO.
+        # OCR과 YOLO는 독립 경로 → 병렬. 에피소드 전체라 오래 걸릴 수 있어 timeout 넉넉 +
+        # heartbeat(세그먼트마다)로 진행 보고. 컷 배치(continue-as-new)는 더 이상 필요 없다.
+        await asyncio.gather(
+            workflow.execute_activity(
+                activities.ocr_episode, ep,
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=_RETRY,
+            ),
+            workflow.execute_activity(
+                activities.yolo_episode, ep,
+                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=_RETRY,
+            ),
+        )
 
-        cut_no = ep.start_cut
-        last_has_next = True
-        while cut_no <= end:
-            ref = CutRef(
-                source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-                webtoon_episode_id=ep.webtoon_episode_id, cut_no=cut_no,
-            )
-            # OCR과 YOLO는 독립 경로 → 병렬. 각자 model-api 서비스/재시도 분리.
-            ocr_has_next, _ = await asyncio.gather(
-                workflow.execute_activity(
-                    activities.ocr_cut, ref,
-                    start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
-                ),
-                workflow.execute_activity(
-                    activities.yolo_cut, ref,
-                    start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
-                ),
-            )
-            last_has_next = ocr_has_next
-            # 404로 에피소드 경계 도달(이미지 없음) → 컷 루프 종료.
-            if not ocr_has_next:
-                break
-            cut_no += 1
-
-        # 아직 컷이 남았으면(max_cut 미도달 & 경계 미도달) 다음 배치로 재진입.
-        if last_has_next and (not max_cut or end < max_cut):
-            workflow.continue_as_new(
-                EpisodeInput(
-                    source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-                    webtoon_episode_id=ep.webtoon_episode_id,
-                    start_cut=end + 1, max_cut=max_cut,
-                )
-            )
-
-        # ── 마지막 배치: phase1 완료 마킹 + 에피소드 단위 얼굴 식별 ──
+        # phase1 완료 마킹 + 에피소드 단위 얼굴 식별(Step2).
         await workflow.execute_activity(
             activities.mark_phase1_complete, ep,
             start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
@@ -111,7 +84,7 @@ class EpisodeWorkflow:
 
         return EpisodeResult(
             source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-            total_cuts=cut_no, faces=summary.get("faces", 0),
+            total_cuts=0, faces=summary.get("faces", 0),
             matched=summary.get("matched", 0), new_chars=summary.get("new_chars", 0),
         )
 

@@ -56,6 +56,8 @@ async def main() -> None:
                 activities.prepare_episode,
                 activities.ocr_cut,
                 activities.yolo_cut,
+                activities.ocr_episode,
+                activities.yolo_episode,
                 activities.face_identify_episode,
                 activities.is_phase1_done,
                 activities.is_phase3_enabled,

@@ -1,8 +1,9 @@
-"""컷 병합 및 자연 구분선 기반 분할.
+"""컷 병합 및 콘텐츠 구간 기반 분할.
 
-인접한 두 컷을 수직 결합한 뒤, 가로 전체 픽셀 색상이 동일한 행이 3px 이상
-연속되는 구간을 찾아 그 위치에서 분할한다. 구분선이 없으면 각 컷을 원본 그대로
-개별 세그먼트로 반환한다. bbox는 항상 원본 컷 좌표 기준으로 변환된다.
+인접한 두 컷을 수직 결합한 뒤, 가로 전체가 (거의) 단일색인 '여백 행'이 일정 길이
+이상 연속되는 구간(밴드)을 구분선으로 보고 통째로 버린다. 남은 콘텐츠 구간만
+세그먼트로 만든다(얼굴/텍스트가 있는 영역). 콘텐츠 블록은 쪼개지 않으며, 블록 내부의
+짧은 여백은 흡수한다. bbox는 항상 원본 컷 좌표 기준으로 변환된다.
 """
 from __future__ import annotations
 
@@ -12,8 +13,16 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 
-MIN_BAND_PX = 3   # 구분선으로 인정할 최소 연속 행 수
-MARGIN_PX = 3     # 분할 후 남길 여백
+# 여백(행) 판정 허용오차: 행의 채널별 (max-min) 최대값이 이 값 이하이면 단일색 취급.
+# JPEG 노이즈가 있는 흰/검 배경도 여백으로 인정하기 위해 exact(0)가 아닌 약간의 tol 사용.
+NEAR_UNIFORM_TOL = 12
+# 구분선으로 인정할 최소 연속 여백 행 수. 이보다 짧은 여백은 콘텐츠에 흡수(블록 유지).
+MIN_BAND_PX = 10
+# 콘텐츠 구간 중 배경색(대표색)에 가까운 픽셀 비율이 이 값 이상이면 '사실상 단색'으로 보고 버린다.
+# (배경 위 티끌/노이즈 제거. 글자가 있으면 글자 픽셀이 이 임계를 넘겨 유지된다.)
+UNIFORM_BG_RATIO = 0.98
+# 콘텐츠 구간 위/아래로 남길 여백(글자/얼굴 가장자리 클리핑 방지).
+MARGIN_PX = 3
 
 
 @dataclass
@@ -33,43 +42,76 @@ def _to_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def _find_band_splits(arr: np.ndarray) -> list[tuple[int, int]]:
-    """uniform-color 밴드 (시작 y, 끝 y) 목록 반환."""
-    height = arr.shape[0]
-    bands: list[tuple[int, int]] = []
-    band_start = -1
+def _is_near_uniform_block(block: np.ndarray, tol: int, ratio: float) -> bool:
+    """블록(픽셀 N×채널)의 ratio 이상이 대표색(채널 중앙값)에 tol 이내로 가까우면
+    '사실상 단색'(배경+티끌)으로 판정."""
+    if block.size == 0:
+        return True
+    med = np.median(block, axis=0)
+    dist = np.abs(block.astype(np.int16) - med.astype(np.int16)).max(axis=1)
+    return float((dist <= tol).mean()) >= ratio
 
-    for y in range(height):
-        row = arr[y]
-        is_uniform = bool(np.all(row == row[0]))
-        if is_uniform:
-            if band_start < 0:
-                band_start = y
-        else:
-            if band_start >= 0 and (y - band_start) >= MIN_BAND_PX:
-                bands.append((band_start, y - 1))
-            band_start = -1
 
-    if band_start >= 0 and (height - band_start) >= MIN_BAND_PX:
-        bands.append((band_start, height - 1))
+def _content_intervals(
+    arr: np.ndarray, tol: int = NEAR_UNIFORM_TOL, min_band: int = MIN_BAND_PX,
+    bg_ratio: float = UNIFORM_BG_RATIO,
+) -> list[tuple[int, int]]:
+    """콘텐츠 구간 [y0,y1) 목록 반환.
 
-    return bands
+    - 행의 채널별 (max-min) 최대값 <= tol 이면 '여백 행'.
+    - 여백 행이 min_band 이상 연속이면 구분 밴드 → 콘텐츠 종료(밴드 통째 제거).
+    - 짧은 여백(<min_band)은 콘텐츠에 흡수해 블록을 쪼개지 않는다.
+    - 구간의 bg_ratio 이상이 대표색(채널 중앙값)에 가까우면 '사실상 단색'으로 보고 버린다
+      (배경 위 티끌/노이즈 제거. 글자가 있으면 글자 픽셀이 임계를 넘겨 유지된다).
+    """
+    h = arr.shape[0]
+    rows = arr.reshape(h, -1, arr.shape[-1])
+    row_ptp = (rows.max(axis=1) - rows.min(axis=1)).max(axis=1)
+    blank = row_ptp <= tol
+
+    intervals: list[tuple[int, int]] = []
+    i = 0
+    while i < h:
+        if blank[i]:
+            i += 1
+            continue
+        start = i
+        j = i
+        while j < h:
+            if blank[j]:
+                k = j
+                while k < h and blank[k]:
+                    k += 1
+                if (k - j) >= min_band or k == h:
+                    break          # 구분 밴드 → 콘텐츠 종료
+                j = k              # 짧은 여백 → 콘텐츠로 흡수
+            else:
+                j += 1
+        block = arr[start:j].reshape(-1, arr.shape[-1])
+        if not _is_near_uniform_block(block, tol, bg_ratio):
+            intervals.append((start, j))
+        i = j
+    return intervals
 
 
 def split_cut_pair(
     cut_n_bytes: bytes,
     cut_n1_bytes: bytes | None,
 ) -> list[CutSegment]:
-    """cut[N]과 cut[N+1]을 결합 후 자연 구분선에서 분할.
+    """cut[N]과 cut[N+1]을 결합 후 콘텐츠 구간만 세그먼트로 반환.
 
-    cut_n1_bytes가 None이거나 구분선이 없으면 각 컷을 원본 그대로 반환한다.
+    여백(거의 단일색) 밴드는 통째로 버리고, 얼굴/텍스트가 있는 콘텐츠 구간만 남긴다.
+    콘텐츠 블록은 쪼개지 않으며 위/아래로 MARGIN_PX 여백을 남긴다. 콘텐츠가 전혀 없으면
+    각 컷을 원본 그대로 반환한다(안전 폴백).
     """
     img_n = _to_pil(cut_n_bytes)
     h_n = img_n.height
     w_n = img_n.width
 
     if cut_n1_bytes is None:
-        return [CutSegment(cut_n_bytes, 0, h_n)]
+        arr = np.asarray(img_n)
+        segs = _segments_from_intervals(img_n, arr, h_n, h_n)
+        return segs or [CutSegment(cut_n_bytes, 0, h_n)]
 
     img_n1 = _to_pil(cut_n1_bytes)
 
@@ -82,41 +124,28 @@ def split_cut_pair(
     combined.paste(img_n, (0, 0))
     combined.paste(img_n1, (0, h_n))
 
-    arr = np.array(combined)
-    bands = _find_band_splits(arr)
-
-    if not bands:
-        # 구분선 없음 → 각 컷 원본 반환
+    arr = np.asarray(combined)
+    segs = _segments_from_intervals(combined, arr, h_n, h_n + h_n1)
+    if not segs:
+        # 콘텐츠 미검출(전부 여백) → 원본 각 컷 반환(안전 폴백)
         return [
             CutSegment(cut_n_bytes, 0, h_n),
             CutSegment(cut_n1_bytes, h_n, h_n),
         ]
+    return segs
 
-    # 분할점: 각 밴드 중앙에서 ±MARGIN_PX 남기고 컷팅
-    split_points: list[int] = []
-    for band_start, band_end in bands:
-        mid = (band_start + band_end) // 2
-        cut_top = max(band_start + MARGIN_PX, mid)
-        cut_bot = min(band_end - MARGIN_PX + 1, mid + 1)
-        split_points.append(max(cut_top, cut_bot))
 
-    # 중복·역순 제거 후 정렬
-    split_points = sorted(set(split_points))
-
+def _segments_from_intervals(
+    img: Image.Image, arr: np.ndarray, h_n: int, total_h: int
+) -> list[CutSegment]:
+    """콘텐츠 구간을 잘라 CutSegment 목록 생성(위/아래 MARGIN_PX 여백 포함)."""
+    w = img.width
     segments: list[CutSegment] = []
-    prev_y = 0
-    for sp in split_points:
-        if sp <= prev_y:
-            continue
-        seg_img = combined.crop((0, prev_y, w_n, sp))
-        segments.append(CutSegment(_to_bytes(seg_img), prev_y, h_n))
-        prev_y = sp
-
-    # 마지막 세그먼트
-    if prev_y < h_n + h_n1:
-        seg_img = combined.crop((0, prev_y, w_n, h_n + h_n1))
-        segments.append(CutSegment(_to_bytes(seg_img), prev_y, h_n))
-
+    for y0, y1 in _content_intervals(arr):
+        top = max(0, y0 - MARGIN_PX)
+        bot = min(total_h, y1 + MARGIN_PX)
+        seg_img = img.crop((0, top, w, bot))
+        segments.append(CutSegment(_to_bytes(seg_img), top, h_n))
     return segments
 
 

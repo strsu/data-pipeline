@@ -58,6 +58,7 @@ def _load_face_records(webtoon_episode_id: int) -> list[dict]:
             FROM face_record fr
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             WHERE wc.episode_id = %s
+              AND fr.is_used = true
             ORDER BY wc.cut_number, fr.face_idx
             """,
             (webtoon_episode_id,),
@@ -177,14 +178,24 @@ def _complete_episode_state(webtoon_id: int, webtoon_episode_id: int) -> None:
 
 
 def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
-    """매칭 후보에서 제외할 캐릭터(죽은 단역 등)의 appearance_id 목록."""
+    """매칭 후보에서 제외할 appearance_id 목록.
+
+    제외 대상: is_match_excluded(죽은 단역 등) + soft-delete된 캐릭터(c.deleted_at)
+    + soft-delete된 개별 appearance(ca.deleted_at). 쿼리 시점 제외라 이미 Chroma에
+    시딩돼 남아있는 과거 에피소드 doc까지 함께 후보에서 빠진다.
+    """
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT ca.id
             FROM character_appearance ca
             JOIN character c ON ca.character_id = c.id
-            WHERE c.webtoon_id = %s AND c.is_match_excluded = true
+            WHERE c.webtoon_id = %s
+              AND (
+                c.is_match_excluded = true
+                OR c.deleted_at IS NOT NULL
+                OR ca.deleted_at IS NOT NULL
+              )
             """,
             (webtoon_id,),
         )
@@ -216,7 +227,10 @@ def _seed_confirmed_faces(
             LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
             WHERE c.webtoon_id = %s AND fr.is_confirmed = true
               AND fr.appearance_id IS NOT NULL AND fr.deleted_at IS NULL
+              AND fr.is_used = true
               AND c.is_match_excluded = false
+              AND c.deleted_at IS NULL
+              AND ca.deleted_at IS NULL
             """,
             (model_name, webtoon_id),
         )
@@ -319,6 +333,7 @@ def _summarize_episode_faces(webtoon_episode_id: int) -> tuple[int, int]:
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id
             WHERE wc.episode_id = %s AND fr.appearance_id IS NOT NULL
+              AND fr.is_used = true
             """,
             (webtoon_episode_id,),
         )

@@ -1,12 +1,24 @@
-"""model-api HTTP 클라이언트 — OCR/YOLO (분리 엔드포인트 + 레거시 결합)."""
+"""model-api HTTP 클라이언트 — OCR/YOLO (GPU 우선 + 기존 API 폴백)."""
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 
 import httpx
 from PIL import Image
 
-from src.config.settings import OCR_API_URL, YOLO_API_URL, OCR_YOLO_API_URL
+from src.config.settings import (
+    OCR_API_URL,
+    OCR_API_PRIORITY_URL,
+    OCR_YOLO_API_URL,
+    YOLO_API_URL,
+    YOLO_API_PRIORITY_URL,
+)
+
+logger = logging.getLogger(__name__)
+
+# 호출 타임아웃(초). 대부분 초 단위 응답이지만 콜드스타트/큰 세그먼트 대비 60초.
+_HTTP_TIMEOUT = 60.0
 
 _client: httpx.Client | None = None
 
@@ -14,8 +26,34 @@ _client: httpx.Client | None = None
 def _get_client() -> httpx.Client:
     global _client
     if _client is None:
-        _client = httpx.Client(timeout=httpx.Timeout(60.0))
+        _client = httpx.Client(timeout=httpx.Timeout(_HTTP_TIMEOUT))
     return _client
+
+
+def _post_image(base_url: str, path: str, image_bytes: bytes, params: dict) -> dict:
+    response = _get_client().post(
+        f"{base_url.rstrip('/')}{path}",
+        files={"file": ("image.jpg", image_bytes, "image/jpeg")},
+        params=params,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _post_with_fallback(
+    path: str, priority: str, fallback: str, image_bytes: bytes, params: dict, key: str
+) -> list[dict]:
+    """priority(GPU) 호출 → 실패/무응답 시 fallback(원래 CPU 서버)로 재시도."""
+    try:
+        return _post_image(priority, path, image_bytes, params)[key]
+    except Exception as e:
+        if fallback and fallback != priority:
+            logger.warning(
+                "[ocr_yolo] %s priority(%s) 실패: %s — fallback(%s) 시도",
+                path, priority, type(e).__name__, fallback,
+            )
+            return _post_image(fallback, path, image_bytes, params)[key]
+        raise
 
 
 def run_ocr(
@@ -26,14 +64,9 @@ def run_ocr(
     episode_no: int = 0,
     cut: int = 0,
 ) -> list[dict]:
-    """model-api /ocr 호출 → ocr_blocks 반환 (OCR 전용 서비스)."""
-    response = _get_client().post(
-        f"{OCR_API_URL}/ocr",
-        files={"file": ("image.jpg", image_bytes, "image/jpeg")},
-        params={"source": source, "title_id": title_id, "episode_no": episode_no, "cut": cut},
-    )
-    response.raise_for_status()
-    return response.json()["ocr"]
+    """OCR — GPU(priority) 우선, 실패 시 원래 OCR_API_URL 폴백. ocr_blocks 반환."""
+    params = {"source": source, "title_id": title_id, "episode_no": episode_no, "cut": cut}
+    return _post_with_fallback("/ocr", OCR_API_PRIORITY_URL, OCR_API_URL, image_bytes, params, "ocr")
 
 
 def run_yolo(
@@ -44,14 +77,9 @@ def run_yolo(
     episode_no: int = 0,
     cut: int = 0,
 ) -> list[dict]:
-    """model-api /yolo 호출 → faces 반환 (YOLO 전용 서비스)."""
-    response = _get_client().post(
-        f"{YOLO_API_URL}/yolo",
-        files={"file": ("image.jpg", image_bytes, "image/jpeg")},
-        params={"source": source, "title_id": title_id, "episode_no": episode_no, "cut": cut},
-    )
-    response.raise_for_status()
-    return response.json()["faces"]
+    """YOLO — GPU(priority) 우선, 실패 시 원래 YOLO_API_URL 폴백. faces 반환."""
+    params = {"source": source, "title_id": title_id, "episode_no": episode_no, "cut": cut}
+    return _post_with_fallback("/yolo", YOLO_API_PRIORITY_URL, YOLO_API_URL, image_bytes, params, "faces")
 
 
 def run_ocr_yolo(
