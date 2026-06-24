@@ -93,7 +93,7 @@ def _merge_group(items: list[dict]) -> dict:
     text = " ".join((i.get("text") or "") for i in items).strip()
     xs = [i["bbox_2d"][0] for i in items] + [i["bbox_2d"][2] for i in items]
     ys = [i["bbox_2d"][1] for i in items] + [i["bbox_2d"][3] for i in items]
-    score = min(float(i.get("score", 0)) for i in items)
+    score = min(float(i.get("score") or 0) for i in items)
     return {"text": text, "score": round(score, 4), "bbox_2d": [min(xs), min(ys), max(xs), max(ys)]}
 
 
@@ -551,10 +551,17 @@ def process_episode_ocr(
         grouped = _assign_line_groups(raw_blocks)
         with db_cursor() as cur:
             segment_id = _ensure_segment(cur, webtoon_episode_id, si, y0, y1, W)
+            # 같은 줄·가로 근접 그룹(gid)을 하나의 bbox+텍스트로 병합해 region 1개로 저장.
+            # bbox 없는 블록(gid<0)은 위치 불명이라 제외(기존과 동일). 병합 라인의 score는
+            # 그룹 내 최소값 → is_used도 최소 score 기준(전량 저장, 드롭 아님).
+            line_groups: dict[int, list[dict]] = {}
             for blk, gid in grouped:
-                bb = blk.get("bbox_2d")
-                if not bb:
+                if gid < 0 or not blk.get("bbox_2d"):
                     continue
+                line_groups.setdefault(gid, []).append(blk)
+            for gid in sorted(line_groups):
+                blk = _merge_group(line_groups[gid])
+                bb = blk["bbox_2d"]
                 gy1, gy2 = y0 + bb[1], y0 + bb[3]
                 k = _cut_index_at(bounds, (gy1 + gy2) / 2)
                 cut_id = cut_id_map[cut_numbers[k]]
@@ -573,7 +580,7 @@ def process_episode_ocr(
                     RETURNING id
                     """,
                     (cut_id, segment_id, idx, lb[0], lb[1], lb[2], lb[3],
-                     score, (gid if gid >= 0 else None), is_used, now, now),
+                     score, gid, is_used, now, now),
                 )
                 region_id = cur.fetchone()[0]
                 cur.execute(
@@ -590,7 +597,7 @@ def process_episode_ocr(
         print(f"[step1.ocr] {ep} — 세그먼트 {si + 1}/{len(intervals)} 처리 "
               f"(누적 텍스트 {total}개, {time.perf_counter() - t_ocr:.1f}s)")
 
-    print(f"[step1.ocr] {ep} — 세그먼트 {len(intervals)}개, 텍스트 {total}개(raw) "
+    print(f"[step1.ocr] {ep} — 세그먼트 {len(intervals)}개, 텍스트(병합) {total}개 "
           f"OCR {time.perf_counter() - t_ocr:.1f}s")
     return total
 
@@ -638,7 +645,13 @@ def process_episode_yolo(
                 k = _cut_index_at(bounds, (gy1 + gy2) / 2)
                 cut_id = cut_id_map[cut_numbers[k]]
                 ystart = bounds[k]
-                lb = [fb[0], max(0.0, gy1 - ystart), fb[2], max(0.0, gy2 - ystart)]
+                # 컷 경계를 걸친 얼굴(스트립을 1600px 컷으로 자른 경계가 얼굴 한가운데를
+                # 지나는 경우)도 충실히 보존한다. y는 클램프하지 않으므로 위 컷으로 넘친
+                # 얼굴은 음수, 아래 컷으로 넘친 얼굴은 컷 높이를 초과할 수 있다. crop은
+                # 연속 스트립(seg_bytes)에서 잘려 항상 얼굴 전체를 담으므로, bbox도 같은
+                # 실제 영역을 가리키도록 맞춘다(프론트는 overflow 렌더링으로 인접 컷까지 표시).
+                # (기존 max(0,...) 클램프는 위로 넘친 얼굴의 y1을 0으로 만들어 crop과 어긋났음)
+                lb = [fb[0], gy1 - ystart, fb[2], gy2 - ystart]
                 is_dup = any(_iou(lb, s) >= _IOU_DEDUP_THRESHOLD for s in used_bboxes.get(cut_id, []))
                 is_used = not is_dup
                 if is_used:
