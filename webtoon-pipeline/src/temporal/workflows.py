@@ -2,12 +2,11 @@
 
 WebtoonWorkflow (id="{source}_{title_id}")   # 웹툰당 1개 → 에피소드 순차/웹툰 간 병렬
   └─ EpisodeWorkflow (child)                  # 에피소드 순차
-       └─ 컷 루프: ocr_cut ∥ yolo_cut (분리 병렬)
-       └─ (모든 컷 완료 후) face_identify_episode   # 에피소드 단위
+       └─ step1_episode (스트립 결합 → 콘텐츠 세그먼트, OCR+YOLO 통합 1패스)
+       └─ (Step1 완료 후) face_identify_episode   # 에피소드 단위
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
@@ -55,20 +54,13 @@ class EpisodeWorkflow:
             start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
         )
 
-        # 에피소드 단위 Step1 — 전체 컷을 스트립으로 결합 후 콘텐츠 세그먼트별 OCR/YOLO.
-        # OCR과 YOLO는 독립 경로 → 병렬. 에피소드 전체라 오래 걸릴 수 있어 timeout 넉넉 +
+        # 에피소드 단위 Step1 — 전체 컷을 스트립으로 결합 후 콘텐츠 세그먼트 단위로
+        # OCR+YOLO를 단일 패스로 처리. 에피소드 전체라 오래 걸릴 수 있어 timeout 넉넉 +
         # heartbeat(세그먼트마다)로 진행 보고. 컷 배치(continue-as-new)는 더 이상 필요 없다.
-        await asyncio.gather(
-            workflow.execute_activity(
-                activities.ocr_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-                retry_policy=_RETRY,
-            ),
-            workflow.execute_activity(
-                activities.yolo_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-                retry_policy=_RETRY,
-            ),
+        await workflow.execute_activity(
+            activities.step1_episode, ep,
+            start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
+            retry_policy=_RETRY,
         )
 
         # phase1 완료 마킹 + 에피소드 단위 얼굴 식별(Step2).
@@ -92,8 +84,8 @@ class EpisodeWorkflow:
 @workflow.defn
 class EpisodeStep1Workflow:
     """Step1 단독 — 에피소드의 OCR/YOLO만 재추출(Step2 얼굴 식별 없음).
-    admin에서 에피소드 단위로 트리거. 기존 추출 데이터를 정리 후 다시 추출하고
-    phase1 완료를 마킹한다."""
+    admin에서 에피소드 단위로 트리거. 기존 추출 데이터를 정리 후 step1_episode로
+    다시 추출하고 phase1 완료를 마킹한다."""
 
     @workflow.run
     async def run(self, ep: EpisodeInput) -> EpisodeResult:
@@ -103,18 +95,11 @@ class EpisodeStep1Workflow:
             start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
         )
 
-        # 에피소드 단위 Step1 — 스트립 결합 후 콘텐츠 세그먼트별 OCR/YOLO(병렬).
-        await asyncio.gather(
-            workflow.execute_activity(
-                activities.ocr_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-                retry_policy=_RETRY,
-            ),
-            workflow.execute_activity(
-                activities.yolo_episode, ep,
-                start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-                retry_policy=_RETRY,
-            ),
+        # 에피소드 단위 Step1 — 스트립 결합 후 콘텐츠 세그먼트 단위 OCR+YOLO 통합 1패스.
+        await workflow.execute_activity(
+            activities.step1_episode, ep,
+            start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
+            retry_policy=_RETRY,
         )
 
         # phase1 완료 마킹(Step2는 실행하지 않음).

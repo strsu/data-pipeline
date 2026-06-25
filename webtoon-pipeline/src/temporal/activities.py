@@ -86,50 +86,22 @@ def prepare_episode(ep: EpisodeInput) -> None:
     step1.prepare_episode_segments(ep.webtoon_episode_id)
 
 
-# ── Step1: OCR / YOLO (분리) ──────────────────────────────────────────────────
+# ── Step1: 에피소드 단위 (스트립 결합 → 콘텐츠 세그먼트, OCR+YOLO 통합 1패스) ──
 
 @activity.defn
-def ocr_cut(cut: CutRef) -> bool:
-    """단일 컷 OCR. 반환: 다음 컷 존재 여부."""
-    from src.core import step1
-    return step1.process_cut_ocr(
-        cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id, cut.cut_no
-    )
+def step1_episode(ep: EpisodeInput) -> dict:
+    """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위로 OCR+YOLO를 단일 패스로 처리.
 
-
-@activity.defn
-def yolo_cut(cut: CutRef) -> bool:
-    """단일 컷 YOLO. 반환: 다음 컷 존재 여부."""
-    from src.core import step1
-    return step1.process_cut_yolo(
-        cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id, cut.cut_no
-    )
-
-
-# ── Step1: 에피소드 단위 (스트립 결합 → 콘텐츠 세그먼트) ──────────────────────
-
-@activity.defn
-def ocr_episode(ep: EpisodeInput) -> int:
-    """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위 OCR. 반환: 저장 텍스트 수."""
+    단일 다운로드/분할로 세그먼트마다 OCR과 YOLO를 함께 실행한다(Req 6.1, 11.2). 세그먼트
+    완료마다 heartbeat_cb(처리한 세그먼트 수)를 호출해 Temporal 하트비트로 전달한다(Req 12.2).
+    반환: {"segments": n, "texts": t, "faces": f}.
+    """
     from src.core import step1
 
     def _hb(done: int) -> None:
         activity.heartbeat(done)
 
-    return step1.process_episode_ocr(
-        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id, heartbeat_cb=_hb
-    )
-
-
-@activity.defn
-def yolo_episode(ep: EpisodeInput) -> int:
-    """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위 YOLO. 반환: 저장 얼굴 수."""
-    from src.core import step1
-
-    def _hb(done: int) -> None:
-        activity.heartbeat(done)
-
-    return step1.process_episode_yolo(
+    return step1.process_episode_step1(
         ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id, heartbeat_cb=_hb
     )
 
