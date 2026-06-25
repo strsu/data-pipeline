@@ -304,12 +304,15 @@ def analyze_cut_scene(
     return scene_meta.get("action_summary", "") or prev_context
 
 
-def analyze_episode_scenes(webtoon_episode_id: int) -> dict:
+def analyze_episode_scenes(webtoon_episode_id: int, heartbeat_cb=None) -> dict:
     """에피소드의 모든 컷을 순차 LLM 분석(슬라이딩 윈도우). 단독 실행/백필용.
 
     DB의 webtoon_cut(=Step1 산출) 순서대로 돌며 prev_context를 이어 전달한다.
     Temporal EpisodeSceneWorkflow와 동일 로직의 비-워크플로 버전(테스트/재실행에 사용).
     phase3_enabled 게이트는 적용하지 않는다(호출 자체가 명시적 실행).
+
+    heartbeat_cb: 컷 하나를 분석할 때마다 누적 처리 컷 수로 호출(Temporal 액티비티
+    하트비트 연결용). LLM 호출이 길어 액티비티 타임아웃에 가까워질 때 타이머를 갱신한다.
     """
     info = _episode_info(webtoon_episode_id)
     prepare_episode_scene(webtoon_episode_id)
@@ -328,6 +331,8 @@ def analyze_episode_scenes(webtoon_episode_id: int) -> dict:
             webtoon_episode_id, cn, prev,
         )
         analyzed += 1
+        if heartbeat_cb:
+            heartbeat_cb(analyzed)
     logger.info("[step3] episode %s — %s컷 분석 완료", webtoon_episode_id, analyzed)
     return {"cuts_analyzed": analyzed}
 

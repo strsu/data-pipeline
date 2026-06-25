@@ -1,52 +1,49 @@
 """Temporal 액티비티 — 코어(faust-free) 로직을 동기 호출하는 얇은 래퍼.
 
-모든 I/O(model-api HTTP / DB / S3 / Chroma)는 core.step1 / core.step2가 담당.
+모든 I/O(model-api HTTP / DB / S3 / Chroma)는 core.step1 / core.step2 / core.step3가 담당.
 코어/무거운 의존성은 **함수 내부에서 지연 import**한다 — 액티비티 모듈을 import하는 것만으로
 chromadb/boto3/psycopg2를 끌어오지 않게 해, 오케스트레이션 단위 테스트(temporalio만)로도 워크플로를
 검증할 수 있게 한다.
+
+액티비티는 두 부류로 나뉜다:
+- 오케스트레이터 큐(ORCH_QUEUE)에서 도는 가벼운 메타/판정 액티비티
+  (resolve_episode_for_chain / next_chain_episode / mark_phase_complete / is_phase3_enabled).
+- step별 전용 큐(STEP1/2/3_QUEUE, 동시성 1)에서 도는 무거운 작업 액티비티
+  (prepare_episode / step1_episode / face_identify_episode / step3_episode).
+어느 큐에서 실행할지는 호출하는 워크플로(EpisodeChainWorkflow)가 task_queue로 지정한다.
 """
 from __future__ import annotations
 
 from temporalio import activity
 
-from src.temporal.shared import CutRef, EpisodeInput
+from src.temporal.shared import STEP_PHASE, ChainInput, EpisodeInput
 
 
-# ── 메타 조회 ─────────────────────────────────────────────────────────────────
-
-@activity.defn
-def get_episode_max_cut(ep: EpisodeInput) -> int:
-    """에피소드 총 컷 수(webtoon_episode.image_count)."""
-    from src.core import step1
-    return step1.get_image_count(ep.webtoon_episode_id)
-
+# ── 체인 메타/판정 (오케스트레이터 큐) ────────────────────────────────────────
 
 @activity.defn
-def resolve_episode(source: str, title_id: str, episode_no: int) -> EpisodeInput | None:
-    """(source, title_id, episode_no) → 처리 대상 EpisodeInput.
+def resolve_episode_for_chain(source: str, title_id: str, episode_no: int) -> EpisodeInput | None:
+    """(source, title_id, episode_no) → EpisodeInput. 다운로드 완료 + 미삭제 회차만.
 
-    다운로드 완료됐고 아직 phase1 미완료인 에피소드면 반환, 아니면 None.
+    체인이 "이번 회차"를 실행하기 위해 webtoon_episode_id를 해석한다. 회차가 없거나
+    아직 다운로드되지 않았으면 None — 워크플로는 이 회차 작업을 건너뛰고 다음으로 넘어간다.
+    phase 완료 여부로는 필터링하지 않는다(어떤 step을 돌릴지는 체인의 steps가 결정).
     """
     from src.config.db import db_cursor
 
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT we.id
+            SELECT we.id, we.is_downloaded
             FROM webtoon_episode we
             JOIN webtoon w ON we.webtoon_id = w.id
             WHERE w.source = %s AND w.title_id = %s AND we.no = %s
-              AND we.is_downloaded = true AND we.deleted_at IS NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM episode_pipeline_progress p
-                WHERE p.episode_id = we.id AND p.phase = 1
-                  AND p.status IN ('completed', 'error')
-              )
+              AND we.deleted_at IS NULL
             """,
             (source, title_id, episode_no),
         )
         row = cur.fetchone()
-    if not row:
+    if not row or not row[1]:
         return None
     return EpisodeInput(
         source=source, title_id=title_id, episode_no=episode_no,
@@ -55,8 +52,52 @@ def resolve_episode(source: str, title_id: str, episode_no: int) -> EpisodeInput
 
 
 @activity.defn
-def mark_phase1_complete(ep: EpisodeInput) -> None:
-    """에피소드 phase1 완료를 episode_pipeline_progress에 기록."""
+def next_chain_episode(inp: ChainInput) -> int | None:
+    """모든 step 조합 공통 "다음 ep로 이어갈지" 판정. 다음 회차 번호 또는 None.
+
+    - 범위(bounded) 모드(max_ep > 0): cur_ep + 1 이 max_ep 이하면 그 번호, 아니면 None.
+      (admin 범위 실행 — 비어 있는 회차는 워크플로가 작업 없이 통과한다.)
+    - 자동(unbounded) 모드(max_ep == 0): 진입 step(steps[0])이 아직 종료되지 않은,
+      cur_ep 보다 큰 다음 다운로드 회차를 찾는다. 없으면 None(체인 종료).
+      진입 step의 종료 여부는 episode_pipeline_progress(phase, status in completed/error)로 판정.
+    """
+    if inp.max_ep and inp.max_ep > 0:
+        nxt = inp.cur_ep + 1
+        return nxt if nxt <= inp.max_ep else None
+
+    from src.config.db import db_cursor
+
+    entry_step = inp.steps[0] if inp.steps else "step1"
+    phase = STEP_PHASE.get(entry_step, 1)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT we.no
+            FROM webtoon_episode we
+            JOIN webtoon w ON we.webtoon_id = w.id
+            WHERE w.source = %s AND w.title_id = %s AND we.no > %s
+              AND we.is_downloaded = true AND we.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM episode_pipeline_progress p
+                WHERE p.episode_id = we.id AND p.phase = %s
+                  AND p.status IN ('completed', 'error')
+              )
+            ORDER BY we.no
+            LIMIT 1
+            """,
+            (inp.source, inp.title_id, inp.cur_ep, phase),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+@activity.defn
+def mark_phase_complete(ep: EpisodeInput, phase: int) -> None:
+    """에피소드의 특정 phase 완료를 episode_pipeline_progress에 멱등 기록.
+
+    (episode, phase) 1행 — 자동 모드 다음-ep 판정(`next_chain_episode`)이 이 행으로
+    진입 step 종료 여부를 본다. 컷/얼굴 데이터 정리는 step별 prepare가 따로 수행한다.
+    """
     from datetime import datetime, timezone
     from src.config.db import db_cursor
 
@@ -66,34 +107,50 @@ def mark_phase1_complete(ep: EpisodeInput) -> None:
             """
             INSERT INTO episode_pipeline_progress
                 (episode_id, phase, status, completed_at, created_at, updated_at)
-            VALUES (%s, 1, 'completed', %s, %s, %s)
+            VALUES (%s, %s, 'completed', %s, %s, %s)
             ON CONFLICT (episode_id, phase)
             DO UPDATE SET status = 'completed', completed_at = EXCLUDED.completed_at,
                           updated_at = EXCLUDED.updated_at
             """,
-            (ep.webtoon_episode_id, now, now, now),
+            (ep.webtoon_episode_id, phase, now, now, now),
         )
 
 
-# ── 에피소드 준비(재처리 정리) ────────────────────────────────────────────────
+@activity.defn
+def is_phase3_enabled(webtoon_episode_id: int) -> bool:
+    """해당 웹툰의 phase3_enabled 여부 (step3 자동 게이트)."""
+    from src.config.db import db_cursor
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(wps.phase3_enabled, false)
+            FROM webtoon_episode we
+            JOIN webtoon_pipeline_state wps ON wps.webtoon_id = we.webtoon_id
+            WHERE we.id = %s
+            """,
+            (webtoon_episode_id,),
+        )
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+
+# ── step 작업 (step별 전용 큐, 동시성 1) ──────────────────────────────────────
 
 @activity.defn
 def prepare_episode(ep: EpisodeInput) -> None:
-    """에피소드 시작 시 기존 OCR/얼굴/세그먼트 데이터 정리(재처리 멱등)."""
+    """Step1 시작 시 기존 OCR/얼굴/세그먼트 데이터 정리(재처리 멱등)."""
     from src.core import step1
     step1.prepare_episode_ocr(ep.webtoon_episode_id)
     step1.prepare_episode_yolo(ep.webtoon_episode_id, ep.source, ep.title_id)
     step1.prepare_episode_segments(ep.webtoon_episode_id)
 
 
-# ── Step1: 에피소드 단위 (스트립 결합 → 콘텐츠 세그먼트, OCR+YOLO 통합 1패스) ──
-
 @activity.defn
 def step1_episode(ep: EpisodeInput) -> dict:
     """에피소드 전체를 스트립으로 결합 후 콘텐츠 세그먼트 단위로 OCR+YOLO를 단일 패스로 처리.
 
-    단일 다운로드/분할로 세그먼트마다 OCR과 YOLO를 함께 실행한다(Req 6.1, 11.2). 세그먼트
-    완료마다 heartbeat_cb(처리한 세그먼트 수)를 호출해 Temporal 하트비트로 전달한다(Req 12.2).
+    단일 다운로드/분할로 세그먼트마다 OCR과 YOLO를 함께 실행한다. 세그먼트 완료마다
+    heartbeat_cb(처리한 세그먼트 수)를 호출해 Temporal 하트비트로 전달한다.
     반환: {"segments": n, "texts": t, "faces": f}.
     """
     from src.core import step1
@@ -106,15 +163,13 @@ def step1_episode(ep: EpisodeInput) -> dict:
     )
 
 
-# ── Step2: 얼굴 식별 (에피소드 단위) ──────────────────────────────────────────
-
 @activity.defn
 def face_identify_episode(ep: EpisodeInput) -> dict:
     """에피소드 단위 임베딩+매칭 1패스. 반환: {faces, matched, new_chars}.
 
-    얼굴 수가 많거나 anchor 집합이 커지면 처리 시간이 활동 타임아웃에 가까워질 수
-    있다. heartbeat로 처리 완료한 얼굴 인덱스를 기록해두면, 타임아웃으로 재시도될 때
-    처음부터 다시 처리하지 않고 이어서 진행한다.
+    얼굴 수가 많거나 anchor 집합이 커지면 처리 시간이 활동 타임아웃에 가까워질 수 있다.
+    heartbeat로 처리 완료한 얼굴 인덱스를 기록해두면, 타임아웃 재시도 시 처음부터 다시
+    처리하지 않고 이어서 진행한다.
     """
     from src.core import step2
 
@@ -131,50 +186,17 @@ def face_identify_episode(ep: EpisodeInput) -> dict:
 
 
 @activity.defn
-def is_phase1_done(webtoon_episode_id: int) -> bool:
-    """Step1(OCR/YOLO)이 이미 완료(episode_pipeline_progress phase=1 completed)됐는지."""
-    from src.config.db import db_cursor
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT EXISTS(SELECT 1 FROM episode_pipeline_progress "
-            "WHERE episode_id = %s AND phase = 1 AND status = 'completed')",
-            (webtoon_episode_id,),
-        )
-        return bool(cur.fetchone()[0])
+def step3_episode(ep: EpisodeInput) -> dict:
+    """에피소드의 모든 컷을 순차 LLM 분석(Step3). 반환: {"cuts_analyzed": n}.
 
-
-# ── Step3: LLM 장면/화자 분석 (활성 웹툰만) ───────────────────────────────────
-
-@activity.defn
-def is_phase3_enabled(webtoon_episode_id: int) -> bool:
-    """해당 웹툰의 phase3_enabled 여부."""
-    from src.config.db import db_cursor
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT COALESCE(wps.phase3_enabled, false)
-            FROM webtoon_episode we
-            JOIN webtoon_pipeline_state wps ON wps.webtoon_id = we.webtoon_id
-            WHERE we.id = %s
-            """,
-            (webtoon_episode_id,),
-        )
-        row = cur.fetchone()
-        return bool(row[0]) if row else False
-
-
-@activity.defn
-def scene_llm_cut(cut: CutRef, prev_context: str) -> str:
-    """단일 컷 LLM 분석. 반환: 다음 컷용 prev_context."""
+    기존 컷별 분석을 에피소드 단위 1개 액티비티로 흡수한다(컷마다 continue-as-new 불필요).
+    prev_context 연속성은 코어 analyze_episode_scenes가 컷을 순차로 돌며 유지하고, 컷마다
+    heartbeat를 보내 긴 LLM 처리에서도 타임아웃 타이머를 갱신한다. 기존 'llm' 어노테이션
+    정리는 코어가 내부에서 수행한다(재실행 완전 교체).
+    """
     from src.core import step3
-    return step3.analyze_cut_scene(
-        cut.source, cut.title_id, cut.episode_no, cut.webtoon_episode_id,
-        cut.cut_no, prev_context,
-    )
 
+    def _hb(done: int) -> None:
+        activity.heartbeat(done)
 
-@activity.defn
-def prepare_scene(ep: EpisodeInput) -> None:
-    """Step3 시작 시 기존 llm 어노테이션/scene_meta 정리(재실행 완전 교체)."""
-    from src.core import step3
-    step3.prepare_episode_scene(ep.webtoon_episode_id)
+    return step3.analyze_episode_scenes(ep.webtoon_episode_id, heartbeat_cb=_hb)

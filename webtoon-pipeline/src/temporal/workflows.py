@@ -1,12 +1,21 @@
 """Temporal 워크플로 — 흐름 제어만(결정적). I/O는 전부 activity.
 
-WebtoonWorkflow (id="{source}_{title_id}")   # 웹툰당 1개 → 에피소드 순차/웹툰 간 병렬
-  └─ EpisodeWorkflow (child)                  # 에피소드 순차
-       └─ step1_episode (스트립 결합 → 콘텐츠 세그먼트, OCR+YOLO 통합 1패스)
-       └─ (Step1 완료 후) face_identify_episode   # 에피소드 단위
+EpisodeChainWorkflow — 정식 단일 오케스트레이터.
+  에피소드를 순차로 밟으며(cur_ep), 회차마다 steps에 명시된 step을 순서대로 실행하고,
+  끝에서 공통 판정(next_chain_episode)으로 다음 회차로 continue-as-new 한다.
+
+  - steps          : 회차당 실행할 step 목록(["step1"], ["step1","step2"],
+                     ["step1","step2","step3"], ["step3"] 등). 정규 경로와 admin 단독/범위
+                     실행이 동일 워크플로를 steps만 바꿔 사용한다.
+  - 동시성          : 무거운 step 작업은 step별 전용 큐(STEP1/2/3_QUEUE)로 보내고, 그 큐를
+                     서빙하는 워커가 동시성 1이라 step별 전역 1개 실행이 보장된다. 체인
+                     워크플로 자체와 가벼운 판정 액티비티는 ORCH_QUEUE에서 돈다.
+  - 다음 ep 판정    : "이어갈지"는 모든 step 조합에서 next_chain_episode가 공통으로 결정
+                     (자동=진입 step 미완료 다음 회차 / 범위=cur_ep..max_ep).
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 from temporalio import workflow
@@ -15,7 +24,8 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import (
-        CUTS_PER_RUN, CutRef, EpisodeInput, EpisodeResult, SceneInput, WebtoonInput,
+        ORCH_QUEUE, STEP1, STEP1_QUEUE, STEP2, STEP2_QUEUE, STEP3, STEP3_QUEUE,
+        ChainInput, EpisodeInput,
     )
 
 _RETRY = RetryPolicy(
@@ -27,186 +37,103 @@ _RETRY = RetryPolicy(
     maximum_attempts=100,
 )
 
-
-@workflow.defn
-class EpisodeWorkflow:
-    @workflow.run
-    async def run(self, ep: EpisodeInput) -> EpisodeResult:
-        # Step1이 이미 완료된 에피소드면 재추출(OCR/YOLO) 생략하고 Step2만 재실행.
-        if await workflow.execute_activity(
-            activities.is_phase1_done, ep.webtoon_episode_id,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        ):
-            summary = await workflow.execute_activity(
-                activities.face_identify_episode, ep,
-                start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=_RETRY,
-            )
-            return EpisodeResult(
-                source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-                total_cuts=0, faces=summary.get("faces", 0),
-                matched=summary.get("matched", 0), new_chars=summary.get("new_chars", 0),
-            )
-
-        # 재처리 정리(기존 OCR/얼굴 데이터 제거).
-        await workflow.execute_activity(
-            activities.prepare_episode, ep,
-            start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
-        )
-
-        # 에피소드 단위 Step1 — 전체 컷을 스트립으로 결합 후 콘텐츠 세그먼트 단위로
-        # OCR+YOLO를 단일 패스로 처리. 에피소드 전체라 오래 걸릴 수 있어 timeout 넉넉 +
-        # heartbeat(세그먼트마다)로 진행 보고. 컷 배치(continue-as-new)는 더 이상 필요 없다.
-        await workflow.execute_activity(
-            activities.step1_episode, ep,
-            start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-            retry_policy=_RETRY,
-        )
-
-        # phase1 완료 마킹 + 에피소드 단위 얼굴 식별(Step2).
-        await workflow.execute_activity(
-            activities.mark_phase1_complete, ep,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        )
-        summary = await workflow.execute_activity(
-            activities.face_identify_episode, ep,
-            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=_RETRY,
-        )
-
-        return EpisodeResult(
-            source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-            total_cuts=0, faces=summary.get("faces", 0),
-            matched=summary.get("matched", 0), new_chars=summary.get("new_chars", 0),
-        )
+# 가벼운 판정/메타 액티비티 공통 타임아웃.
+_META_TIMEOUT = timedelta(seconds=30)
 
 
 @workflow.defn
-class EpisodeStep1Workflow:
-    """Step1 단독 — 에피소드의 OCR/YOLO만 재추출(Step2 얼굴 식별 없음).
-    admin에서 에피소드 단위로 트리거. 기존 추출 데이터를 정리 후 step1_episode로
-    다시 추출하고 phase1 완료를 마킹한다."""
+class EpisodeChainWorkflow:
+    """정식 에피소드 체인 — steps를 회차마다 순차 실행하고 다음 회차로 이어간다."""
 
     @workflow.run
-    async def run(self, ep: EpisodeInput) -> EpisodeResult:
-        # 재처리 정리(기존 OCR/얼굴/세그먼트 데이터 제거).
-        await workflow.execute_activity(
-            activities.prepare_episode, ep,
-            start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
-        )
-
-        # 에피소드 단위 Step1 — 스트립 결합 후 콘텐츠 세그먼트 단위 OCR+YOLO 통합 1패스.
-        await workflow.execute_activity(
-            activities.step1_episode, ep,
-            start_to_close_timeout=timedelta(hours=1), heartbeat_timeout=timedelta(minutes=5),
-            retry_policy=_RETRY,
-        )
-
-        # phase1 완료 마킹(Step2는 실행하지 않음).
-        await workflow.execute_activity(
-            activities.mark_phase1_complete, ep,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        )
-
-        return EpisodeResult(
-            source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-            total_cuts=0, faces=0, matched=0, new_chars=0,
-        )
-
-
-@workflow.defn
-class EpisodeFaceIdentifyWorkflow:
-    """Step2 단독 — 이미 추출된 얼굴로 임베딩+매칭만 재실행(OCR/YOLO 재실행 없음).
-    admin에서 에피소드 단위로 트리거."""
-
-    @workflow.run
-    async def run(self, ep: EpisodeInput) -> dict:
-        return await workflow.execute_activity(
-            activities.face_identify_episode, ep,
-            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=_RETRY,
-        )
-
-
-@workflow.defn
-class EpisodeSceneWorkflow:
-    """Step3 — 에피소드의 컷을 순차 LLM 분석(슬라이딩 윈도우). 활성 웹툰만.
-    CUTS_PER_RUN 단위로 continue-as-new 하며 prev_context를 이어 전달."""
-
-    @workflow.run
-    async def run(self, s: SceneInput) -> None:
-        # 첫 배치에서만 기존 Step3 결과 정리(재실행 완전 교체).
-        if s.start_cut == 1:
-            await workflow.execute_activity(
-                activities.prepare_scene,
-                EpisodeInput(s.source, s.title_id, s.episode_no, s.webtoon_episode_id),
-                start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-            )
-
-        max_cut = s.max_cut or await workflow.execute_activity(
-            activities.get_episode_max_cut,
-            EpisodeInput(s.source, s.title_id, s.episode_no, s.webtoon_episode_id),
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        )
-
-        end = min(s.start_cut + CUTS_PER_RUN - 1, max_cut)
-        prev = s.prev_context
-        cut_no = s.start_cut
-        while cut_no <= end:
-            ref = CutRef(
-                source=s.source, title_id=s.title_id, episode_no=s.episode_no,
-                webtoon_episode_id=s.webtoon_episode_id, cut_no=cut_no,
-            )
-            prev = await workflow.execute_activity(
-                activities.scene_llm_cut,
-                args=[ref, prev],
-                start_to_close_timeout=timedelta(minutes=10), retry_policy=_RETRY,
-            )
-            cut_no += 1
-
-        if end < max_cut:
-            workflow.continue_as_new(
-                SceneInput(
-                    source=s.source, title_id=s.title_id, episode_no=s.episode_no,
-                    webtoon_episode_id=s.webtoon_episode_id,
-                    start_cut=end + 1, max_cut=max_cut, prev_context=prev,
-                )
-            )
-
-
-@workflow.defn
-class WebtoonWorkflow:
-    @workflow.run
-    async def run(self, w: WebtoonInput) -> None:
+    async def run(self, inp: ChainInput) -> None:
+        # [1] 이번 회차 해석(다운로드 완료 + 미삭제만). 없으면 작업 건너뛰고 다음으로.
         ep = await workflow.execute_activity(
-            activities.resolve_episode,
-            args=[w.source, w.title_id, w.start_episode_no],
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        )
-        if ep is None:
-            workflow.logger.info("[webtoon] %s/%s — 처리할 에피소드 없음, 종료", w.source, w.title_id)
-            return
-
-        await workflow.execute_child_workflow(
-            EpisodeWorkflow.run, ep,
-            id=f"{w.source}_{w.title_id}_{ep.episode_no}",
+            activities.resolve_episode_for_chain,
+            args=[inp.source, inp.title_id, inp.cur_ep],
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=_META_TIMEOUT,
+            retry_policy=_RETRY,
         )
 
-        # Step3(LLM) — 활성 웹툰만. Step1+2 완료 후 컷 순차 분석.
-        if await workflow.execute_activity(
-            activities.is_phase3_enabled, ep.webtoon_episode_id,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=_RETRY,
-        ):
-            await workflow.execute_child_workflow(
-                EpisodeSceneWorkflow.run,
-                SceneInput(
-                    source=ep.source, title_id=ep.title_id, episode_no=ep.episode_no,
-                    webtoon_episode_id=ep.webtoon_episode_id,
-                ),
-                id=f"{w.source}_{w.title_id}_{ep.episode_no}_scene",
+        # [2] steps를 순서대로 실행(각 step은 전용 큐에서 동시성 1로 직렬화).
+        if ep is not None:
+            for step in inp.steps:
+                await self._run_step(step, ep, inp.force)
+
+        # [3] 공통 "다음 ep?" 판정 → 있으면 continue-as-new(같은 workflow_id 유지).
+        nxt = await workflow.execute_activity(
+            activities.next_chain_episode,
+            inp,
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=_META_TIMEOUT,
+            retry_policy=_RETRY,
+        )
+        if nxt is not None:
+            workflow.continue_as_new(replace(inp, cur_ep=nxt))
+
+    # ── step 실행 ──────────────────────────────────────────────────────────────
+
+    async def _run_step(self, step: str, ep: EpisodeInput, force: bool) -> None:
+        if step == STEP1:
+            await self._run_step1(ep)
+        elif step == STEP2:
+            await self._run_step2(ep)
+        elif step == STEP3:
+            await self._run_step3(ep, force)
+        else:
+            workflow.logger.warning("[chain] 알 수 없는 step=%s 무시", step)
+
+    async def _run_step1(self, ep: EpisodeInput) -> None:
+        # 재처리 정리 → OCR+YOLO 통합 1패스 → phase1 완료 마킹.
+        await workflow.execute_activity(
+            activities.prepare_episode, ep,
+            task_queue=STEP1_QUEUE,
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=_RETRY,
+        )
+        await workflow.execute_activity(
+            activities.step1_episode, ep,
+            task_queue=STEP1_QUEUE,
+            start_to_close_timeout=timedelta(hours=1),
+            heartbeat_timeout=timedelta(minutes=5), retry_policy=_RETRY,
+        )
+        await self._mark(ep, 1)
+
+    async def _run_step2(self, ep: EpisodeInput) -> None:
+        await workflow.execute_activity(
+            activities.face_identify_episode, ep,
+            task_queue=STEP2_QUEUE,
+            start_to_close_timeout=timedelta(minutes=30),
+            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
+        await self._mark(ep, 2)
+
+    async def _run_step3(self, ep: EpisodeInput, force: bool) -> None:
+        # 자동 모드(force=False)에서는 phase3_enabled 웹툰만 실행. admin force는 무시하고 실행.
+        if not force:
+            enabled = await workflow.execute_activity(
+                activities.is_phase3_enabled, ep.webtoon_episode_id,
+                task_queue=ORCH_QUEUE,
+                start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
             )
+            if not enabled:
+                workflow.logger.info(
+                    "[chain] %s/%s ep=%s — phase3 비활성, step3 건너뜀",
+                    ep.source, ep.title_id, ep.episode_no,
+                )
+                return
+        await workflow.execute_activity(
+            activities.step3_episode, ep,
+            task_queue=STEP3_QUEUE,
+            start_to_close_timeout=timedelta(hours=2),
+            heartbeat_timeout=timedelta(minutes=10), retry_policy=_RETRY,
+        )
+        await self._mark(ep, 3)
 
-        # 다음 에피소드로 재진입(같은 웹툰 워크플로가 순차 진행).
-        workflow.continue_as_new(
-            WebtoonInput(source=w.source, title_id=w.title_id, start_episode_no=ep.episode_no + 1)
+    async def _mark(self, ep: EpisodeInput, phase: int) -> None:
+        await workflow.execute_activity(
+            activities.mark_phase_complete,
+            args=[ep, phase],
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
         )

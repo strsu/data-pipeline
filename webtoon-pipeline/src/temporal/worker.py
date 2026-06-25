@@ -2,7 +2,14 @@
 
     python -m src.temporal.worker
 
-액티비티가 동기 함수(블로킹 I/O)이므로 ThreadPoolExecutor로 실행한다.
+한 프로세스에서 큐별 Worker 인스턴스를 동시에 띄운다(asyncio.gather):
+- ORCH_QUEUE      : EpisodeChainWorkflow + 가벼운 판정/메타 액티비티.
+- STEP1/2/3_QUEUE : 무거운 step 작업 액티비티. 각 워커를 max_concurrent_activities=1로
+                    제한해 step별 전역 동시성 1을 보장한다(개인 서버 자원 보호).
+
+액티비티가 동기 함수(블로킹 I/O)이므로 ThreadPoolExecutor로 실행한다. step 워커는 동시성 1
+이라 단일 스레드 executor면 충분하고, 오케스트레이터 워커는 가벼운 판정 액티비티 다수를
+동시에 처리할 수 있게 약간의 여유를 둔다.
 """
 from __future__ import annotations
 
@@ -14,14 +21,15 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from src.temporal import activities
-from src.temporal.shared import TASK_QUEUE, TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE
-from src.temporal.workflows import (
-    EpisodeFaceIdentifyWorkflow,
-    EpisodeSceneWorkflow,
-    EpisodeStep1Workflow,
-    EpisodeWorkflow,
-    WebtoonWorkflow,
+from src.temporal.shared import (
+    ORCH_QUEUE,
+    STEP1_QUEUE,
+    STEP2_QUEUE,
+    STEP3_QUEUE,
+    TEMPORAL_ADDRESS,
+    TEMPORAL_NAMESPACE,
 )
+from src.temporal.workflows import EpisodeChainWorkflow
 
 logging.basicConfig(level=logging.INFO)
 
@@ -45,27 +53,65 @@ async def _connect_with_retry() -> Client:
 async def main() -> None:
     client = await _connect_with_retry()
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        worker = Worker(
-            client,
-            task_queue=TASK_QUEUE,
-            workflows=[WebtoonWorkflow, EpisodeWorkflow, EpisodeStep1Workflow, EpisodeFaceIdentifyWorkflow, EpisodeSceneWorkflow],
-            activities=[
-                activities.get_episode_max_cut,
-                activities.resolve_episode,
-                activities.mark_phase1_complete,
-                activities.prepare_episode,
-                activities.step1_episode,
-                activities.face_identify_episode,
-                activities.is_phase1_done,
-                activities.is_phase3_enabled,
-                activities.prepare_scene,
-                activities.scene_llm_cut,
-            ],
-            activity_executor=executor,
+    # 오케스트레이터: 체인 워크플로 + 가벼운 판정/메타 액티비티(동시 처리 여유 8).
+    orch_executor = ThreadPoolExecutor(max_workers=8)
+    orch_worker = Worker(
+        client,
+        task_queue=ORCH_QUEUE,
+        workflows=[EpisodeChainWorkflow],
+        activities=[
+            activities.resolve_episode_for_chain,
+            activities.next_chain_episode,
+            activities.mark_phase_complete,
+            activities.is_phase3_enabled,
+        ],
+        activity_executor=orch_executor,
+    )
+
+    # step별 워커: 무거운 작업, 동시성 1(전역 step 직렬화).
+    step1_executor = ThreadPoolExecutor(max_workers=1)
+    step1_worker = Worker(
+        client,
+        task_queue=STEP1_QUEUE,
+        activities=[activities.prepare_episode, activities.step1_episode],
+        activity_executor=step1_executor,
+        max_concurrent_activities=1,
+    )
+
+    step2_executor = ThreadPoolExecutor(max_workers=1)
+    step2_worker = Worker(
+        client,
+        task_queue=STEP2_QUEUE,
+        activities=[activities.face_identify_episode],
+        activity_executor=step2_executor,
+        max_concurrent_activities=1,
+    )
+
+    step3_executor = ThreadPoolExecutor(max_workers=1)
+    step3_worker = Worker(
+        client,
+        task_queue=STEP3_QUEUE,
+        activities=[activities.step3_episode],
+        activity_executor=step3_executor,
+        max_concurrent_activities=1,
+    )
+
+    logging.info(
+        "temporal worker 시작 — orch=%s step1=%s step2=%s step3=%s addr=%s",
+        ORCH_QUEUE, STEP1_QUEUE, STEP2_QUEUE, STEP3_QUEUE, TEMPORAL_ADDRESS,
+    )
+    try:
+        await asyncio.gather(
+            orch_worker.run(),
+            step1_worker.run(),
+            step2_worker.run(),
+            step3_worker.run(),
         )
-        logging.info("temporal worker 시작 — task_queue=%s addr=%s", TASK_QUEUE, TEMPORAL_ADDRESS)
-        await worker.run()
+    finally:
+        orch_executor.shutdown(wait=False)
+        step1_executor.shutdown(wait=False)
+        step2_executor.shutdown(wait=False)
+        step3_executor.shutdown(wait=False)
 
 
 if __name__ == "__main__":
