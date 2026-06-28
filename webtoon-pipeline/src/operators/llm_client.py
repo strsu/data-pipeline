@@ -95,8 +95,28 @@ def call_llm_json(
         resp = _get_client().post(endpoint, json=body, headers=headers)
     resp.raise_for_status()
     data = resp.json()
-    text = data["choices"][0]["message"]["content"]
+    text = extract_message_text(data["choices"][0]["message"])
     return _parse_json_content(text)
+
+
+def extract_message_text(message: dict) -> str:
+    """assistant 메시지에서 본문 텍스트를 모델 차이에 무관하게 뽑는다.
+
+    모델별 응답 위치가 다르다:
+      - 대부분(kanana/zai/openai 등): 답이 `content`.
+      - 일부(예: intern-vl): `content`가 null이고 답이 `reasoning`에 들어옴.
+    규칙: **content 우선, 비어 있으면 reasoning → reasoning_content 폴백.**
+    호출부가 항상 이 함수만 쓰면 모델 추가 시 파싱 실수가 없다.
+
+    스트리밍(delta)에서도 동일 키 우선순위로 동작한다(delta dict 전달).
+    """
+    if not isinstance(message, dict):
+        return ""
+    for key in ("content", "reasoning", "reasoning_content"):
+        val = message.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
 
 
 def _parse_json_content(text: str) -> dict:

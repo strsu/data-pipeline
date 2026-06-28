@@ -37,11 +37,19 @@ _SYSTEM_PROMPT = (
     "**블록을 병합·분할·생략·재번호하지 마세요.**\n"
     "2) 각 block의 corrected_text는 **그 index의 OCR 텍스트만** 문맥에 맞게 교정하세요. "
     "다른 블록의 내용을 끌어오거나 합치지 마세요(여러 줄이 한 문장이어도 각 줄은 자기 조각만 교정).\n"
-    "3) type은 블록별로 narration/speech/sfx/caption/other 중 하나. speaker는 대사(speech)면 "
-    "오버레이된 얼굴 라벨↔말풍선 꼬리로 화자를 정하고, 아니면 null.\n"
+    "3) type은 블록별로 narration/speech/monologue/sfx/caption/other 중 하나. "
+    "speech=인물이 입 밖으로 낸 말(일반 말풍선), monologue=인물이 입 밖으로 내지 않고 속으로 "
+    "생각하는 독백(구름/각진 말풍선 등), narration=특정 화자가 아닌 세계관·상황 해설(사각 박스 등). "
+    "speaker는 speech 또는 monologue일 때 정한다: "
+    "말풍선 꼬리가 가리키는, 오버레이된 얼굴의 라벨(F0/F1 등)을 **그대로** 적는다. "
+    "이 컷에 화자의 얼굴이 없지만 문맥상 누가 말하거나 생각하는지 분명하면 그 인물의 이름을 적는다. "
+    "narration/sfx/caption/other 이거나 화자를 알 수 없으면 speaker는 null.\n"
+    "4) **모든 자연어 문자열 값은 반드시 한국어로 작성하세요.** "
+    "특히 scene_meta.action_summary, scene_meta.key_objects, name_discoveries.evidence 는 "
+    "영어가 아닌 한국어로만 출력합니다(고유명사 제외). corrected_text 는 OCR 원문 언어를 유지합니다.\n"
     "반드시 아래 JSON 스키마만 출력하세요:\n"
-    '{"blocks":[{"index":<int>,"type":"narration|speech|sfx|caption|other",'
-    '"speaker":"<이름 또는 null>","corrected_text":"<해당 블록만 교정>"}],'
+    '{"blocks":[{"index":<int>,"type":"narration|speech|monologue|sfx|caption|other",'
+    '"speaker":"<F라벨(F0 등) 또는 인물 이름 또는 null>","corrected_text":"<해당 블록만 교정>"}],'
     '"scene_meta":{"action_summary":"<현재 컷 줄거리>","key_objects":["..."]},'
     '"name_discoveries":[{"face_id":"F0","name":"<대사/나레이션에서 드러난 실제 이름>",'
     '"confidence":<0~1>,"evidence":"<근거>"}]}'
@@ -128,12 +136,12 @@ def _load_regions(cut_id: int) -> list[dict]:
 
 
 def _load_faces(cut_id: int) -> list[dict]:
-    """컷의 식별된 얼굴: id=F{face_idx}, bbox, 현재 캐릭터명, appearance_id."""
+    """컷의 식별된 얼굴: id=F{face_idx}, bbox, 현재 캐릭터명, appearance_id, character_id."""
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
-                   fr.appearance_id, c.name
+                   fr.appearance_id, c.name, c.id
             FROM face_record fr
             LEFT JOIN character_appearance ca ON fr.appearance_id = ca.id
             LEFT JOIN character c ON ca.character_id = c.id
@@ -143,14 +151,61 @@ def _load_faces(cut_id: int) -> list[dict]:
             (cut_id,),
         )
         return [
-            {"id": f"F{r[0]}", "bbox": [r[1], r[2], r[3], r[4]], "appearance_id": r[5], "name": r[6]}
+            {"id": f"F{r[0]}", "bbox": [r[1], r[2], r[3], r[4]],
+             "appearance_id": r[5], "name": r[6], "character_id": r[7]}
             for r in cur.fetchall()
         ]
 
 
 # ── 저장 ──────────────────────────────────────────────────────────────────────
 
-def _upsert_llm_annotation(region_id: int, block: dict, model_name: str) -> None:
+def _find_character_by_name(webtoon_id: int, name: str) -> Optional[int]:
+    """웹툰 내 기존 Character 를 이름/alias 로 찾는다(NEW_CHAR placeholder 제외). 확정 캐릭터 우선."""
+    n = (name or "").strip()
+    if not n:
+        return None
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id FROM character
+            WHERE webtoon_id = %s AND deleted_at IS NULL
+              AND name !~ '^NEW_CHAR_[0-9]+$'
+              AND (LOWER(name) = LOWER(%s)
+                   OR EXISTS (
+                        SELECT 1 FROM jsonb_array_elements_text(COALESCE(aliases, '[]')::jsonb) a
+                        WHERE LOWER(a) = LOWER(%s)))
+            ORDER BY is_confirmed DESC, id ASC
+            LIMIT 1
+            """,
+            (webtoon_id, n, n),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def _resolve_speaker_id(webtoon_id: int, faces: list[dict], speaker_raw) -> Optional[int]:
+    """LLM speaker → Character.id(FK). 순서: 얼굴라벨 동일값 > 컷 얼굴명 일치 > 웹툰 기존 이름/alias.
+
+    narration/caption/sfx 등 화자 없는 블록은 speaker_raw 가 비거나 null → None.
+    """
+    s = (speaker_raw or "").strip()
+    if not s or s.lower() in ("null", "none", "nan"):
+        return None
+    # 1) 얼굴 라벨 동일값 매칭 (F0/F1 …) — 결정론적
+    for f in faces:
+        if f["id"] == s:
+            return f.get("character_id")
+    # 2) 이 컷 얼굴들의 현재 캐릭터명과 일치 (placeholder 제외)
+    for f in faces:
+        fn = (f.get("name") or "").strip()
+        if fn and not fn.startswith("NEW_CHAR_") and fn.lower() == s.lower():
+            return f.get("character_id")
+    # 3) 얼굴 없는 화자 — 웹툰 내 기존 캐릭터 이름/alias 매칭
+    return _find_character_by_name(webtoon_id, s)
+
+
+def _upsert_llm_annotation(region_id: int, block: dict, model_name: str,
+                           speaker_id: Optional[int]) -> None:
     now = datetime.now(timezone.utc)
     btype = block.get("type")
     if btype not in ("narration", "speech", "sfx", "caption", "other"):
@@ -159,15 +214,15 @@ def _upsert_llm_annotation(region_id: int, block: dict, model_name: str) -> None
         cur.execute(
             """
             INSERT INTO text_annotation
-                (region_id, source, text, type, speaker, model_version, created_at, updated_at)
+                (region_id, source, text, type, speaker_id, model_version, created_at, updated_at)
             VALUES (%s, 'llm', %s, %s, %s, %s, %s, %s)
             ON CONFLICT (region_id, source)
             DO UPDATE SET text = EXCLUDED.text, type = EXCLUDED.type,
-                          speaker = EXCLUDED.speaker, model_version = EXCLUDED.model_version,
+                          speaker_id = EXCLUDED.speaker_id, model_version = EXCLUDED.model_version,
                           updated_at = EXCLUDED.updated_at
             """,
             (region_id, block.get("corrected_text", ""), btype,
-             block.get("speaker"), model_name, now, now),
+             speaker_id, model_name, now, now),
         )
 
 
@@ -188,8 +243,12 @@ def _upsert_scene_meta(cut_id: int, scene_meta: dict) -> None:
         )
 
 
-def _apply_name_discoveries(faces: list[dict], discoveries: list[dict]) -> None:
-    """confidence>=0.85 → Character 이름 자동 지정(is_name_auto_assigned). 미만 → extra에 제안 적재."""
+def _apply_name_discoveries(webtoon_id: int, faces: list[dict], discoveries: list[dict]) -> None:
+    """confidence>=0.85 → NEW_CHAR Character 이름 자동 지정(is_name_auto_assigned). 미만 → extra에 제안 적재.
+
+    단 동일 이름의 기존 Character 가 이미 있으면 rename 하지 않는다(중복 생성 방지).
+    is_confirmed(사람 확정)는 LLM 이 절대 건드리지 않는다.
+    """
     face_by_id = {f["id"]: f for f in faces}
     now = datetime.now(timezone.utc)
     for d in discoveries or []:
@@ -198,6 +257,9 @@ def _apply_name_discoveries(faces: list[dict], discoveries: list[dict]) -> None:
             continue
         name = (d.get("name") or "").strip()
         if not name:
+            continue
+        # 모델이 제공된 placeholder(NEW_CHAR_xxx)를 '발견한 이름'인 양 에코하는 경우 무시
+        if name.startswith("NEW_CHAR_"):
             continue
         conf = float(d.get("confidence", 0) or 0)
         with db_cursor() as cur:
@@ -214,7 +276,14 @@ def _apply_name_discoveries(faces: list[dict], discoveries: list[dict]) -> None:
                 continue
             char_id, cur_name, is_confirmed, extra = row
             extra = extra if isinstance(extra, dict) else {}
-            if conf >= _NAME_AUTO_CONFIDENCE and not is_confirmed and (cur_name or "").startswith("NEW_CHAR_"):
+            existing = _find_character_by_name(webtoon_id, name)
+            can_rename = (
+                conf >= _NAME_AUTO_CONFIDENCE
+                and not is_confirmed
+                and (cur_name or "").startswith("NEW_CHAR_")
+                and (existing is None or existing == char_id)  # 동명 기존 캐릭터 있으면 rename 안 함
+            )
+            if can_rename:
                 # 자동 지정 (human 미확정 상태로 — UI에서 검토)
                 cur.execute(
                     "UPDATE character SET name=%s, is_name_auto_assigned=true, updated_at=%s WHERE id=%s",
@@ -284,7 +353,8 @@ def analyze_cut_scene(
         idx = block.get("index")
         rid = region_by_index.get(idx)
         if rid is not None:
-            _upsert_llm_annotation(rid, block, ctx["name"])
+            speaker_id = _resolve_speaker_id(webtoon_id, faces, block.get("speaker"))
+            _upsert_llm_annotation(rid, block, ctx["name"], speaker_id)
             matched_idx.add(idx)
     missing = [r["index"] for r in regions if r["index"] not in matched_idx]
     if missing:
@@ -294,7 +364,7 @@ def analyze_cut_scene(
         )
     scene_meta = result.get("scene_meta") or {}
     _upsert_scene_meta(cut_id, scene_meta)
-    _apply_name_discoveries(faces, result.get("name_discoveries"))
+    _apply_name_discoveries(webtoon_id, faces, result.get("name_discoveries"))
     _mark_cut_analyzed(cut_id, ctx.get("id"))
 
     logger.info("[step3] %s/%s ep=%s cut=%s — blocks=%s discoveries=%s",
