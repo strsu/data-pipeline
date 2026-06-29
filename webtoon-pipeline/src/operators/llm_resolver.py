@@ -11,13 +11,13 @@ from typing import Optional
 
 from src.config.db import db_cursor
 
-# 시드 누락 대비 폴백 (마이그레이션 0010 시드와 동일: 비전 모델 default)
+# 시드 누락 대비 폴백 (현재 기본값과 동일: vllm 경유 비전 모델). endpoint 생략 → VLLM_API_HOST.
 _FALLBACK = {
     "id": None,
-    "name": "glm-5v-turbo",
-    "provider": "zai",
-    "model_id": "glm-5v-turbo",
-    "params": {"endpoint": "https://api.z.ai/api/paas/v4/chat/completions", "temperature": 0.2},
+    "name": "glm-4.6v",
+    "provider": "vllm",
+    "model_id": "glm-4.6v",
+    "params": {"temperature": 0.2},
     "supports_vision": True,
 }
 

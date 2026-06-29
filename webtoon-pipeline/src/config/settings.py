@@ -27,16 +27,22 @@ SOURCE_MEDIA_PATH: dict[str, str] = {
 
 # Model API
 MODEL_API_URL = os.getenv("MODEL_API_URL", "http://localhost:8000")
-# 모델별 서비스 URL (미설정 시 폴백 체인).
-OCR_YOLO_API_URL = os.getenv("OCR_YOLO_API_URL", MODEL_API_URL)  # 결합(레거시/하위호환)
-# OCR/YOLO 분리: 각자 별도 서비스. 미설정 시 결합 URL로 폴백.
-OCR_API_URL = os.getenv("OCR_API_URL", OCR_YOLO_API_URL)    # 원래 호출 대상(CPU 서버)
-YOLO_API_URL = os.getenv("YOLO_API_URL", OCR_YOLO_API_URL)  # 원래 호출 대상(CPU 서버)
-# 우선 호출(priority) — GPU 서버. 먼저 호출하고 실패/무응답 시 위 OCR_API_URL/YOLO_API_URL로 폴백.
-# TODO(임시 하드코딩): 정식 운영 시 OCR_API_PRIORITY_URL/YOLO_API_PRIORITY_URL 환경변수로 관리.
-_GPU_OCR_YOLO_API = "http://192.168.1.245:8000"
-OCR_API_PRIORITY_URL = os.getenv("OCR_API_PRIORITY_URL", _GPU_OCR_YOLO_API)
-YOLO_API_PRIORITY_URL = os.getenv("YOLO_API_PRIORITY_URL", _GPU_OCR_YOLO_API)
+
+
+def _normalize_host(value: str) -> str:
+    """호스트만 들어와도(예: "gpgpu.prup.xyz") 스킴이 없으면 https 로 보정."""
+    v = (value or "").strip().rstrip("/")
+    if v and not v.startswith(("http://", "https://")):
+        v = "https://" + v
+    return v
+
+
+# OCR/YOLO — GPU 서버 단일 타깃. GPU_SERVER(예: gpgpu.prup.xyz)를 사용한다.
+# 클라이언트가 {base}/ocr · {base}/yolo 로 호출하므로 base 는 스킴+호스트까지만 둔다.
+_OCR_YOLO_API = _normalize_host(os.getenv("GPU_SERVER", "")) or os.getenv("OCR_YOLO_API_URL", MODEL_API_URL)
+OCR_API_URL = os.getenv("OCR_API_URL", _OCR_YOLO_API)
+YOLO_API_URL = os.getenv("YOLO_API_URL", _OCR_YOLO_API)
+OCR_YOLO_API_URL = os.getenv("OCR_YOLO_API_URL", _OCR_YOLO_API)  # 결합(레거시 /ocr-yolo) 호환
 EMBED_CLIP_API_URL = os.getenv("EMBED_CLIP_API_URL", MODEL_API_URL)
 EMBED_CCIP_API_URL = os.getenv("EMBED_CCIP_API_URL", MODEL_API_URL)
 
