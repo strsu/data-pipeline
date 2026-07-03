@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -74,6 +75,14 @@ def _resolve_endpoint(ctx: dict) -> str:
         if host:
             return f"{host}/v1/chat/completions"
     return ""
+
+# vllm.prup.xyz도 Cloudflare 터널 경유라 502/522/530(터널 재연결/일시 다운) 등이 간헐적으로
+# 발생한다(prd.md §16.1). ocr_yolo_client.py와 동일한 패턴(재시도 10회 + 지수 백오프,
+# 4xx는 즉시 실패)을 적용 — 여기서 흡수해야 step3.py 쪽 컷 스킵(_PASS1_RETRIES)이 실제
+# 일시 장애 구간(수십 초~분 단위)을 버틸 수 있다.
+_LLM_MAX_ATTEMPTS = 10
+_LLM_RETRY_BASE_DELAY = 1.0
+_LLM_RETRY_MAX_DELAY = 8.0
 
 _client: httpx.Client | None = None
 
@@ -141,45 +150,75 @@ def call_llm_json(
 
     headers = {"Authorization": f"Bearer {_resolve_api_key(ctx)}"}
     # 스트리밍으로 호출한다 — Cloudflare 터널 idle timeout 회피(토큰이 계속 흘러와 연결 유휴 없음).
-    # 추론형 모델(glm-4.6v 등)은 사고과정이 reasoning_content delta로, 최종 답은 content delta로
-    # 나뉘어 온다. content 와 reasoning 을 **분리 누적**해 content 우선 사용한다
-    # (delta마다 폴백으로 합치면 reasoning이 섞여 JSON이 깨진다).
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
+
+    last_exc: Exception = RuntimeError("unreachable")
+    for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
+        try:
+            # 동시호출 제한(glm-5v-turbo=1) 준수 — 전역 직렬화. 백오프 대기 중엔 슬롯을
+            # 비워둬야 다른 컷의 시도가 막히지 않으므로 세마포어는 시도 단위로만 쥔다.
+            with _LLM_SEMAPHORE:
+                return _stream_llm_once(endpoint, body, headers)
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+                _logger.error("[llm] %s 4xx 실패(재시도 안 함) — %s", endpoint, e)
+                raise
+            last_exc = e
+            if attempt == _LLM_MAX_ATTEMPTS:
+                _logger.error(
+                    "[llm] %s 최종 실패(%d/%d회 모두 실패) — %s",
+                    endpoint, attempt, _LLM_MAX_ATTEMPTS, e,
+                )
+                break
+            delay = min(_LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1)), _LLM_RETRY_MAX_DELAY)
+            _logger.warning(
+                "[llm] %s 실패(attempt %d/%d) — %s — %.1fs 후 재시도",
+                endpoint, attempt, _LLM_MAX_ATTEMPTS, e, delay,
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+def _stream_llm_once(endpoint: str, body: dict, headers: dict) -> LLMCallResult:
+    """스트리밍 LLM 콜 1회 시도(재시도 없음 — `call_llm_json`이 감싼다).
+
+    추론형 모델(glm-4.6v 등)은 사고과정이 reasoning_content delta로, 최종 답은 content delta로
+    나뉘어 온다. content 와 reasoning 을 **분리 누적**해 content 우선 사용한다
+    (delta마다 폴백으로 합치면 reasoning이 섞여 JSON이 깨진다).
+    """
     content_chunks: list[str] = []
     reasoning_chunks: list[str] = []
     usage: Optional[dict] = None
     finish: Optional[str] = None
-    # 동시호출 제한(glm-5v-turbo=1) 준수 — 전역 직렬화.
-    with _LLM_SEMAPHORE:
-        with _get_client().stream("POST", endpoint, json=body, headers=headers) as resp:
-            if resp.status_code >= 400:
-                resp.read()
-                resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if line == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("usage"):
-                    usage = obj["usage"]
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                if choices[0].get("finish_reason"):
-                    finish = choices[0]["finish_reason"]
-                delta = choices[0].get("delta") or {}
-                if isinstance(delta.get("content"), str):
-                    content_chunks.append(delta["content"])
-                for k in ("reasoning", "reasoning_content"):
-                    if isinstance(delta.get(k), str):
-                        reasoning_chunks.append(delta[k])
+    with _get_client().stream("POST", endpoint, json=body, headers=headers) as resp:
+        if resp.status_code >= 400:
+            resp.read()
+            resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("usage"):
+                usage = obj["usage"]
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            if choices[0].get("finish_reason"):
+                finish = choices[0]["finish_reason"]
+            delta = choices[0].get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                content_chunks.append(delta["content"])
+            for k in ("reasoning", "reasoning_content"):
+                if isinstance(delta.get(k), str):
+                    reasoning_chunks.append(delta[k])
     if usage:
         _logger.info(
             "[llm] usage: prompt=%s completion=%s total=%s finish=%s",
@@ -188,7 +227,18 @@ def call_llm_json(
         )
     # content 우선, 비어 있으면 reasoning 폴백(intern-vl처럼 답이 reasoning에만 오는 모델 대응).
     text = "".join(content_chunks).strip() or "".join(reasoning_chunks).strip()
-    return LLMCallResult(result=_parse_json_content(text), usage=_build_usage(usage, finish))
+    try:
+        parsed = _parse_json_content(text)
+    except (ValueError, json.JSONDecodeError) as e:
+        # finish_reason='length'면 max_tokens 절단이 원인 — 추론형 모델(glm-4.6v 등)은
+        # 사고과정(reasoning_content)이 토큰 예산을 먼저 소모해 본문이 잘릴 수 있다.
+        # 원인 판별이 바로 되도록 finish_reason/토큰 사용량/응답 길이를 에러 메시지에 싣는다.
+        raise ValueError(
+            f"LLM 응답 JSON 파싱 실패(finish_reason={finish!r}, "
+            f"completion_tokens={(usage or {}).get('completion_tokens')!r}, "
+            f"응답 길이={len(text)}자): {e}"
+        ) from e
+    return LLMCallResult(result=parsed, usage=_build_usage(usage, finish))
 
 
 def extract_message_text(message: dict) -> str:

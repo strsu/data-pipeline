@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
@@ -33,9 +35,18 @@ _NAME_AUTO_CONFIDENCE = 0.85
 
 # Pass-1(컷별 provisional 추출) 상수 — 비전 1콜 throughput/품질 가드.
 _PASS1_MAX_DIM = 1280          # 다운스케일 상한(긴 변, px)
-_PASS1_MIN_MAX_TOKENS = 4096   # Req 7.2 — 절단 방지(>=4096)
+_PASS1_MIN_MAX_TOKENS = 8192   # Req 7.2 — 절단 방지(>=4096, 실운영은 8192로 상향).
+# glm-4.6v 등 추론형 모델은 답 이전에 reasoning_content로 사고과정을 먼저 소모하는데,
+# max_tokens는 reasoning+content 합산 예산이라 4096으로는 컷이 복잡하면(블록 많음 등)
+# 본문이 잘려 JSON 파싱이 깨진다(실사례: ep=11 cut=2 "Unterminated string" — 2026-07-04).
+# DB(llm_model.params)에 명시적 max_tokens가 없어 이 floor가 그대로 적용되는 게 확인됨.
 _PASS1_MAX_TEMPERATURE = 0.2   # Req 7.5 — 추출 단계 저온도(0.0~0.2)
 _PASS1_RETRIES = 2             # Req 7.4 — 파싱/일시 오류 1회 재시도(총 2회 시도)
+# 컷 간 belief 의존성 없음(연속성은 Pass-2 담당 — Req 1.2) → extract_cut 호출 자체는 컷 간
+# 병렬 처리 가능. 다만 실제 동시 요청 수는 llm_client._LLM_SEMAPHORE(LLM_MAX_CONCURRENCY,
+# 기본 1 — 모델 서버 동시호출 제한)가 최종적으로 가드하므로, 여기 워커 수를 올려도
+# LLM_MAX_CONCURRENCY를 같이 올리지 않으면 실질 동시성은 늘지 않는다.
+_PASS1_WORKERS = int(os.getenv("PASS1_WORKERS", "4") or "4")
 _BLOCK_TYPES = ("speech", "monologue", "narration", "system", "other")
 _SPEAKER_BASES = ("tail", "face", "context", "none")
 _PROMINENCE = ("main", "minor", "extra")
@@ -84,6 +95,8 @@ _SYSTEM_PROMPT = (
 _PASS1_SYSTEM_PROMPT = (
     "당신은 웹툰 컷 분석기입니다. 입력: 현재 컷 이미지(얼굴 bbox에 F0/F1 라벨 오버레이), "
     "identified_faces(F라벨+알려진 이름), ocr_blocks(index+text). 현재 컷만 분석해 **JSON만** 출력.\n"
+    "⚠️ **모든 자연어 출력(cut_summary/key_objects/name_evidence 등)은 반드시 한국어로 작성한다** "
+    "(예외: corrected_text만 OCR 원문 언어 유지). 영어 등 다른 언어로 답하지 말 것.\n"
     "규칙:\n"
     "1) blocks는 ocr_blocks의 모든 index에 1:1(병합·분할·생략·재번호 금지), index 유지.\n"
     "2) **[1단계: 분류 먼저]** 모든 블록의 type을 먼저 정한다. type: speech|monologue|narration|system|other. "
@@ -97,7 +110,7 @@ _PASS1_SYSTEM_PROMPT = (
     "corrected_text는 OCR 원문 언어 유지.\n"
     "5) characters: 이 컷에 보이는 인물. face_label, prominence(main|minor|extra: 전경/크기/디테일/대사인접), emotion.\n"
     "6) name_evidence: 대사/나레이션에서 인물 실제 이름이 드러나면 [{face_label,name,confidence,evidence}].\n"
-    "7) 없는 사물/인물/이름 지어내지 마. 모르면 null/생략. 자연어는 한국어(corrected_text 제외).\n"
+    "7) 없는 사물/인물/이름 지어내지 마. 모르면 null/생략. **자연어는 반드시 한국어(corrected_text 제외).**\n"
     "스키마: {\"cut_summary\":\"\",\"key_objects\":[],"
     "\"characters\":[{\"face_label\":\"F0\",\"prominence\":\"main|minor|extra\",\"emotion\":\"\"}],"
     "\"blocks\":[{\"index\":0,\"type\":\"speech|monologue|narration|system|other\",\"type_confidence\":0,"
@@ -861,22 +874,39 @@ def extract_episode(
         cut_numbers = [r[0] for r in cur.fetchall()]
 
     belief = _init_belief()
-    records: list[Pass1Record] = []
     analyzed = 0
     skipped = 0
     agg = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
-    for processed, cn in enumerate(cut_numbers, start=1):
-        rec = extract_cut(
-            webtoon_episode_id, cn,
-            ep_info=info, webtoon_id=webtoon_id, ctx=ctx, belief=belief,
-        )
-        records.append(rec)
+    # 컷 간 belief 의존 없음(연속성은 Pass-2 담당 — Req 1.2)이라 extract_cut 호출 자체는
+    # 컷을 가로질러 동시 처리한다(step2._fetch_and_embed_all과 같은 패턴). 실제 동시 요청 수는
+    # llm_client._LLM_SEMAPHORE가 최종 가드. belief는 컷 국소 분석에 안 쓰이는 예약
+    # 파라미터라 병렬 호출에는 넘기지 않는다(넘겨봐야 애초에 "직전 컷 반영"과 병렬은 상충).
+    # 완료 순서는 뒤섞이므로, 순서 의존 후처리(belief 누적/usage 집계)는 cut_number로
+    # 재정렬한 뒤 단일 스레드로 수행한다.
+    records_by_cut: dict[int, Pass1Record] = {}
+    processed = 0
+    workers = min(_PASS1_WORKERS, len(cut_numbers)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(extract_cut, webtoon_episode_id, cn,
+                        ep_info=info, webtoon_id=webtoon_id, ctx=ctx): cn
+            for cn in cut_numbers
+        }
+        for future in as_completed(futures):
+            cn = futures[future]
+            records_by_cut[cn] = future.result()
+            processed += 1
+            if heartbeat_cb:
+                heartbeat_cb(processed)
 
+    records = [records_by_cut[cn] for cn in cut_numbers]
+    for rec in records:
         if rec.skipped is not None:
             skipped += 1
         else:
-            # 비전 콜이 일어난 컷 — provisional 결과를 belief에 누적.
+            # 비전 콜이 일어난 컷 — provisional 결과를 belief에 누적. _accumulate_belief의
+            # last_seen_cut 갱신이 순서에 의존하므로 반드시 cut_number 순으로 호출한다.
             _accumulate_belief(belief, rec)
 
         # 비전 콜이 실제 완료된 컷만 per-call usage 적재(Req 6.7). 빈컷/이미지없음/에러는 제외.
@@ -888,9 +918,6 @@ def extract_episode(
             agg["completion_tokens"] += int(rec.usage.get("completion_tokens", 0) or 0)
             agg["total_tokens"] += int(rec.usage.get("total_tokens", 0) or 0)
             agg["calls"] += 1
-
-        if heartbeat_cb:
-            heartbeat_cb(processed)
 
     logger.info(
         "[step3.pass1] episode %s — %s컷 중 분석=%s 스킵=%s, roster=%s pending=%s name_evidence=%s tokens=%s",
@@ -924,6 +951,8 @@ _SIGNIFICANCE = ("main", "supporting", "minor_functional", "extra")  # Req 2.3
 
 _PASS2_SYSTEM_PROMPT = (
     "당신은 웹툰 에피소드 전체를 보고 컷별 provisional 분석을 **전역 해소**하는 분석기입니다. "
+    "⚠️ **beats/episode(summary/appeal_point/cliffhanger/foreshadowing)/threads(description) 등 "
+    "모든 자연어 출력은 반드시 한국어로 작성한다. 영어 등 다른 언어로 답하지 말 것.** "
     "정체성 기준은 character_id(Step2가 부여한 안정적 인물 id)입니다. 컷 내 F라벨은 그 컷 한정. "
     "⚠️ **중요**: identified_faces의 character_id/이름은 Step2 **얼굴인식 추정값**이며 정답이 아니다"
     "(is_confirmed가 아니면 신뢰 금물). **대사·호칭·맥락 증거가 얼굴 라벨보다 우선**한다. "
@@ -954,7 +983,7 @@ _PASS2_SYSTEM_PROMPT = (
     "[{description, type(foreshadowing|mystery|goal|...), status(open|resolved), "
     "planted_episode, planted_cut, resolved_episode, resolved_cut, confidence}]. "
     "이번 화에서 심긴 것은 open, 이번 화에서 해소된 것은 resolved. 없으면 빈 배열.\n"
-    "없는 정보는 지어내지 말 것(null). 자연어는 한국어."
+    "없는 정보는 지어내지 말 것(null). **자연어는 반드시 한국어.**"
 )
 
 

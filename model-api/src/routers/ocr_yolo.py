@@ -3,6 +3,7 @@ from io import BytesIO
 
 from fastapi import APIRouter, UploadFile
 from PIL import Image
+from starlette.concurrency import run_in_threadpool
 
 from src.models.ocr import run_ocr
 from src.models.yolo import detect_faces
@@ -23,6 +24,6 @@ async def ocr_yolo(
     w, h = Image.open(BytesIO(image_bytes)).size
     log.info("[ocr-yolo] %s/%s ep=%d cut=%d — 수신 %dx%d (%s bytes)",
              source, title_id, episode_no, cut, w, h, f"{len(image_bytes):,}")
-    ocr_blocks = run_ocr(image_bytes)
-    faces = detect_faces(image_bytes)
+    ocr_blocks = await run_in_threadpool(run_ocr, image_bytes)
+    faces = await run_in_threadpool(detect_faces, image_bytes)
     return {"ocr": ocr_blocks, "faces": faces}

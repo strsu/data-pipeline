@@ -3,6 +3,7 @@ from io import BytesIO
 
 from fastapi import APIRouter, UploadFile
 from PIL import Image
+from starlette.concurrency import run_in_threadpool
 
 from src.models.yolo import detect_faces
 
@@ -22,4 +23,4 @@ async def yolo(
     w, h = Image.open(BytesIO(image_bytes)).size
     log.info("[yolo] %s/%s ep=%d cut=%d — 수신 %dx%d (%s bytes)",
              source, title_id, episode_no, cut, w, h, f"{len(image_bytes):,}")
-    return {"faces": detect_faces(image_bytes)}
+    return {"faces": await run_in_threadpool(detect_faces, image_bytes)}

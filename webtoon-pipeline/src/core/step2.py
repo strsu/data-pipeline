@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 # S3 다운로드 + model-api 임베딩 요청은 얼굴 간 독립적인 I/O라 동시 처리.
 # 매칭/캐릭터 할당은 같은 에피소드 내 순서 의존(신규 캐릭터가 다음 얼굴의 매칭 후보가
 # 될 수 있음)이라 순차 유지 — 병렬화 대상은 fetch+embed 단계로 한정.
-_EMBED_WORKERS = 8
+# embed-ccip-api가 gunicorn --workers=2(replicas=1)라 그 이상 동시 요청을 보내면
+# 대기열이 쌓여 gunicorn --timeout=120에 걸려 워커가 SIGKILL/재시작된다
+# (prd.md §16.2) — 서버 워커 수에 맞춰 2로 제한.
+_EMBED_WORKERS = 2
 
 
 # ── DB 헬퍼 ───────────────────────────────────────────────────────────────────
