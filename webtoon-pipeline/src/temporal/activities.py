@@ -14,9 +14,13 @@ chromadb/boto3/psycopg2를 끌어오지 않게 해, 오케스트레이션 단위
 """
 from __future__ import annotations
 
+import logging
+
 from temporalio import activity
 
 from src.temporal.shared import STEP_PHASE, ChainInput, EpisodeInput
+
+logger = logging.getLogger(__name__)
 
 
 # ── 체인 메타/판정 (오케스트레이터 큐) ────────────────────────────────────────
@@ -151,15 +155,27 @@ def step1_episode(ep: EpisodeInput) -> dict:
 
     단일 다운로드/분할로 세그먼트마다 OCR과 YOLO를 함께 실행한다. 세그먼트 완료마다
     heartbeat_cb(처리한 세그먼트 수)를 호출해 Temporal 하트비트로 전달한다.
+    네트워크 순단 등으로 도중 실패해 Temporal이 재시도할 때는 마지막 하트비트 detail
+    (resume_from)을 읽어, 이미 커밋된 세그먼트를 다시 처리하지 않고 이어서 진행한다
+    (`face_identify_episode`와 동일한 resume 패턴).
     반환: {"segments": n, "texts": t, "faces": f}.
     """
     from src.core import step1
+
+    info = activity.info()
+    resume_from = info.heartbeat_details[0] if info.heartbeat_details else 0
+    logger.info(
+        "[step1_episode] %s/%s ep=%s webtoon_episode_id=%s — attempt=%d resume_from=%d",
+        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id,
+        info.attempt, resume_from,
+    )
 
     def _hb(done: int) -> None:
         activity.heartbeat(done)
 
     return step1.process_episode_step1(
-        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id, heartbeat_cb=_hb
+        ep.source, ep.title_id, ep.episode_no, ep.webtoon_episode_id,
+        heartbeat_cb=_hb, resume_from=resume_from,
     )
 
 

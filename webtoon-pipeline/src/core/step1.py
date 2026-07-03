@@ -22,6 +22,7 @@ Temporal 액티비티가 호출한다. OCR과 YOLO는 **통합 단일 다운로�
 """
 from __future__ import annotations
 
+import logging
 import time
 from bisect import bisect_right
 from collections.abc import Iterator
@@ -37,6 +38,8 @@ from src.config.db import db_cursor
 from src.config.s3 import delete_face_crop, fetch_cut_image, upload_face_crop
 from src.operators.cut_merger import _content_intervals
 from src.operators.ocr_yolo_client import run_ocr, run_yolo
+
+logger = logging.getLogger(__name__)
 
 FACE_PAD_RATIO = 0.15
 FACE_CROP_SIZE = (112, 112)
@@ -203,14 +206,20 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
     for face_id in face_ids:
         try:
             delete_face_crop(face_id, source, title_id)
-        except Exception as e:
-            print(f"[step1] S3 crop 삭제 실패 face_id={face_id}: {e}")
+        except Exception:
+            logger.warning(
+                "[step1] S3 crop 삭제 실패 face_id=%s source=%s title_id=%s",
+                face_id, source, title_id, exc_info=True,
+            )
 
     for model, doc_ids in chroma_entries.items():
         try:
             get_face_collection(source, title_id, model).delete(ids=doc_ids)
-        except Exception as e:
-            print(f"[step1] Chroma 삭제 실패 model={model}: {e}")
+        except Exception:
+            logger.warning(
+                "[step1] Chroma 삭제 실패 model=%s source=%s title_id=%s doc_ids=%d개",
+                model, source, title_id, len(doc_ids), exc_info=True,
+            )
 
     if face_ids:
         with db_cursor() as cur:
@@ -429,7 +438,7 @@ def _iter_episode_segments(
     # [0] Common_Width 헤더 선스캔으로 W·총 컷 수 확정(픽셀 디코드/보관 없음).
     W, total_cuts = _scan_common_width(source, title_id, episode_no)
     if total_cuts == 0:
-        print(f"[step1.stream] {ep} — 컷 없음")
+        logger.info("[step1.stream] %s — 컷 없음", ep)
         return  # 빈 에피소드 → 방출 없음
 
     # EpisodeState 초기화(전역 스트립 누적 오프셋은 0에서 시작).
@@ -441,7 +450,7 @@ def _iter_episode_segments(
     next_cut = 1          # 다음에 다운로드할 컷 번호(오름차순)
     seg_index = 0         # 방출 세그먼트 순번(episode_segment.index) — Task 4.2/4.3에서 사용
     t0 = time.perf_counter()
-    print(f"[step1.stream] {ep} — 스트리밍 시작 (W={W}, 총 컷 {total_cuts})")
+    logger.info("[step1.stream] %s — 스트리밍 시작 (W=%d, 총 컷 %d)", ep, W, total_cuts)
 
     def _cuts_remaining() -> bool:
         """아직 버퍼에 적재하지 않은 컷이 남아 있는가."""
@@ -569,8 +578,10 @@ def _iter_episode_segments(
         # 함께 분할된다(Req 2.4).
         buf.discard_before(carry_start)
 
-    print(f"[step1.stream] {ep} — 컷 {total_cuts}개 적재 완료 "
-          f"(세그먼트 {seg_index}개, {time.perf_counter() - t0:.1f}s)")
+    logger.info(
+        "[step1.stream] %s — 컷 %d개 적재 완료 (세그먼트 %d개, %.1fs)",
+        ep, total_cuts, seg_index, time.perf_counter() - t0,
+    )
     return
 
 
@@ -646,6 +657,56 @@ def _assign_line_groups(
     return out
 
 
+def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[int, int], dict[int, list]]:
+    """이미 커밋된 text_region/face_record로부터 region_index/face_index/used_bboxes 복원.
+
+    재시도(attempt) 시 이전 attempt에서 이미 커밋된 세그먼트를 건너뛰더라도, 그 세그먼트가
+    속한 컷의 다음 index/face_idx 카운터와 YOLO 전역 dedup용 승인 bbox를 DB 상태로부터
+    다시 계산해 이어받는다. 정상 신규 실행(기존 행 없음)에서는 모두 빈 dict를 반환하므로
+    process_episode_step1 초기화와 동일하게 동작한다.
+    """
+    region_index: dict[int, int] = {}
+    face_index: dict[int, int] = {}
+    used_bboxes: dict[int, list] = {}
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT tr.cut_id, MAX(tr.index)
+            FROM text_region tr JOIN webtoon_cut wc ON wc.id = tr.cut_id
+            WHERE wc.episode_id = %s
+            GROUP BY tr.cut_id
+            """,
+            (webtoon_episode_id,),
+        )
+        for cut_id, max_index in cur.fetchall():
+            region_index[cut_id] = max_index + 1
+
+        cur.execute(
+            """
+            SELECT fr.cut_id, MAX(fr.face_idx)
+            FROM face_record fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
+            WHERE wc.episode_id = %s
+            GROUP BY fr.cut_id
+            """,
+            (webtoon_episode_id,),
+        )
+        for cut_id, max_idx in cur.fetchall():
+            face_index[cut_id] = max_idx + 1
+
+        cur.execute(
+            """
+            SELECT fr.cut_id, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2
+            FROM face_record fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
+            WHERE wc.episode_id = %s AND fr.is_used = true
+            """,
+            (webtoon_episode_id,),
+        )
+        for cut_id, x1, y1, x2, y2 in cur.fetchall():
+            used_bboxes.setdefault(cut_id, []).append([x1, y1, x2, y2])
+
+    return region_index, face_index, used_bboxes
+
+
 def prepare_episode_segments(webtoon_episode_id: int) -> None:
     """에피소드의 episode_segment 행 제거(재처리 멱등). 검출은 prepare_episode_ocr/yolo가 먼저 정리."""
     with db_cursor() as cur:
@@ -715,23 +776,38 @@ def _process_segment_ocr(
         is_used = score is not None and float(score) >= OCR_MIN_SCORE
         idx = state.region_index.get(cut_id, 0)
         state.region_index[cut_id] = idx + 1
+        # ON CONFLICT DO NOTHING: (1) resume_from 이어받기가 커버 못하는 경합/재시도 상황(예:
+        # heartbeat_timeout 좀비 실행)에 대한 안전망. text_region/text_annotation은 같은
+        # 트랜잭션(segment 단위)에서 함께 커밋되므로, region이 이미 있으면 annotation도 이미
+        # 있는 것이 보장된다 — 조회 없이 region 쪽만 확인해 스킵해도 안전하다. is_excluded 등
+        # human 리뷰 필드를 덮어쓰지 않도록 DO UPDATE가 아니라 DO NOTHING을 쓴다.
         cur.execute(
             """
             INSERT INTO text_region
                 (cut_id, segment_id, index, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
                  score, line_group, is_used, is_excluded, created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
+            ON CONFLICT ON CONSTRAINT uniq_text_region_cut_index DO NOTHING
             RETURNING id
             """,
             (cut_id, segment_id, idx, lb[0], lb[1], lb[2], lb[3],
              score, gid, is_used, now, now),
         )
-        region_id = cur.fetchone()[0]
+        res = cur.fetchone()
+        if not res:
+            # 이미 커밋된 (cut_id, index) — 재시도/경합 안전망으로 스킵.
+            logger.warning(
+                "[step1] text_region 중복 스킵(안전망) cut_id=%s index=%s segment_id=%s",
+                cut_id, idx, segment_id,
+            )
+            continue
+        region_id = res[0]
         cur.execute(
             """
             INSERT INTO text_annotation
                 (region_id, source, text, confidence, resolution_status, created_at, updated_at)
             VALUES (%s, 'paddle', %s, %s, 'unresolved', %s, %s)
+            ON CONFLICT ON CONSTRAINT uniq_text_annotation_region_source DO NOTHING
             """,
             (region_id, blk["text"], score, now, now),
         )
@@ -804,6 +880,11 @@ def _process_segment_yolo(
         )
         res = cur.fetchone()
         if not res:
+            # 이미 커밋된 (cut_id, face_idx) — 재시도/경합 안전망으로 스킵.
+            logger.warning(
+                "[step1] face_record 중복 스킵(안전망) cut_id=%s face_idx=%s segment_id=%s",
+                cut_id, fidx, segment_id,
+            )
             continue
         face_record_id = res[0]
         count += 1
@@ -811,14 +892,17 @@ def _process_segment_yolo(
             try:
                 crop_bytes = _crop_face(seg.image_bytes, fb)
                 upload_face_crop(face_record_id, source, title_id, crop_bytes)
-            except Exception as e:
-                print(f"[step1] face crop upload 실패 face_id={face_record_id}: {e}")
+            except Exception:
+                logger.warning(
+                    "[step1] face crop upload 실패 face_id=%s source=%s title_id=%s",
+                    face_record_id, source, title_id, exc_info=True,
+                )
     return count
 
 
 def process_episode_step1(
     source: str, title_id: str, episode_no: int, webtoon_episode_id: int,
-    heartbeat_cb=None,
+    heartbeat_cb=None, resume_from: int = 0,
 ) -> dict:
     """에피소드 단위 통합 Step1 처리기 — 단일 다운로드/분할로 세그먼트마다 OCR(+YOLO) 실행.
 
@@ -838,7 +922,16 @@ def process_episode_step1(
                         반환값 최종 집계. 제너레이터를 1회만 소비하므로 다운로드/분할 패스도
                         에피소드당 1회다(단일 다운로드 보장 — Req 6.1, 11.2).
 
-    반환: {"segments": n, "texts": t, "faces": f}.  빈 에피소드(컷 0)는 모든 값 0.
+    resume_from: 이 인덱스 미만의 세그먼트는 이전 attempt에서 이미 커밋된 것으로 보고
+                 OCR/YOLO 호출과 DB 쓰기를 건너뛴다(세그먼트 다운로드/분할 자체는 계속 소비 —
+                 전역 y 귀속에 필요). Temporal이 활동을 재시도할 때(네트워크 순단 등으로 도중
+                 실패) 이미 끝난 세그먼트를 다시 처리하다 text_region 등의 unique 제약을
+                 위반하지 않도록 한다. region_index/face_index/used_bboxes는 건너뛴 세그먼트의
+                 것이라도 DB에 이미 반영된 값을 `_load_resume_state`로 복원해 이어받는다.
+
+    반환: {"segments": n, "texts": t, "faces": f}. resume_from>0이면 이번 attempt에서
+    새로 처리한 세그먼트/텍스트/얼굴 수만 집계한다(이미 끝난 세그먼트는 세지 않음).
+    빈 에피소드(컷 0)는 모든 값 0.
     """
     ep = f"{source}/{title_id} ep={episode_no}"
 
@@ -846,37 +939,66 @@ def process_episode_step1(
     # 제너레이터가 컷을 적재하며 갱신하고, region_index(및 Task 5.2의 used_bboxes/face_index)는
     # 처리기가 세그먼트를 처리하며 갱신한다 — 같은 인스턴스이므로 컷이 점진적으로 늘어나도
     # 전역 y 귀속·인덱싱이 일관되게 유지된다(Req 9.3, 9.4).
+    # region_index/face_index/used_bboxes는 재시도 이어받기를 위해 DB의 기존 커밋 상태로
+    # 초기화한다 — 신규 실행(빈 에피소드)에서는 조회 결과가 없어 기존과 동일하게 빈 dict.
+    region_index, face_index, used_bboxes = _load_resume_state(webtoon_episode_id)
     state = EpisodeState(
         width=0, bounds=[], cut_numbers=[], cut_id_map={},
-        used_bboxes={}, face_index={}, region_index={},
+        used_bboxes=used_bboxes, face_index=face_index, region_index=region_index,
     )
 
     seg_count = 0
+    skipped = 0
     texts = 0
     faces = 0  # Task 5.2(YOLO 경로)에서 채워짐
     now = datetime.now(timezone.utc)
     t0 = time.perf_counter()
-    print(f"[step1] {ep} — 통합 처리 시작")
+    logger.info(
+        "[step1] %s — 통합 처리 시작 (resume_from=%d, region_index 복원 %d개 컷, "
+        "face_index 복원 %d개 컷, used_bboxes 복원 %d개 컷)",
+        ep, resume_from, len(region_index), len(face_index), len(used_bboxes),
+    )
 
     for seg in _iter_episode_segments(source, title_id, episode_no, webtoon_episode_id, state):
-        with db_cursor() as cur:
-            # OCR/YOLO가 공유할 단일 episode_segment 행(방출 Content_Segment당 1개 — Req 6.6).
-            # 세그먼트 처리 시작에 _ensure_segment 를 한 번만 호출하고, 이 segment_id 를 OCR과
-            # YOLO 양쪽에 그대로 넘겨 두 결과가 동일한 episode_segment 행을 참조하게 한다(Task 5.3).
-            segment_id = _ensure_segment(
-                cur, webtoon_episode_id, seg.index, seg.g_y0, seg.g_y1, seg.width
-            )
+        if seg.index < resume_from:
+            # 이전 attempt에서 이미 커밋된 세그먼트 — OCR/YOLO 재호출·재삽입 없이 건너뛴다.
+            # 제너레이터는 계속 소비해 bounds/cut_id_map(전역 y 귀속)만 갱신시킨다.
+            skipped += 1
+            if heartbeat_cb:
+                heartbeat_cb(seg.index + 1)
+            continue
 
-            # ── OCR 경로 (Task 5.1) ──────────────────────────────────────────
-            texts += _process_segment_ocr(
-                cur, seg, state, segment_id, source, title_id, episode_no, now
-            )
+        try:
+            with db_cursor() as cur:
+                # OCR/YOLO가 공유할 단일 episode_segment 행(방출 Content_Segment당 1개 — Req 6.6).
+                # 세그먼트 처리 시작에 _ensure_segment 를 한 번만 호출하고, 이 segment_id 를 OCR과
+                # YOLO 양쪽에 그대로 넘겨 두 결과가 동일한 episode_segment 행을 참조하게 한다(Task 5.3).
+                segment_id = _ensure_segment(
+                    cur, webtoon_episode_id, seg.index, seg.g_y0, seg.g_y1, seg.width
+                )
 
-            # ── YOLO 경로 (Task 5.2) ─────────────────────────────────────────
-            # OCR과 동일한 seg.image_bytes / segment_id 를 공유한다(Req 6.6, 8.4).
-            faces += _process_segment_yolo(
-                cur, seg, state, segment_id, source, title_id, episode_no, now
+                # ── OCR 경로 (Task 5.1) ──────────────────────────────────────────
+                texts += _process_segment_ocr(
+                    cur, seg, state, segment_id, source, title_id, episode_no, now
+                )
+
+                # ── YOLO 경로 (Task 5.2) ─────────────────────────────────────────
+                # OCR과 동일한 seg.image_bytes / segment_id 를 공유한다(Req 6.6, 8.4).
+                faces += _process_segment_yolo(
+                    cur, seg, state, segment_id, source, title_id, episode_no, now
+                )
+        except Exception:
+            # 어느 세그먼트에서, 몇 번째 처리 중, 얼마나 진행된 상태에서 실패했는지 남긴다.
+            # 이 세그먼트의 DB 쓰기는 트랜잭션 전체가 롤백되므로(Task 5.3), 다음 attempt는
+            # heartbeat_details(마지막으로 완료된 seg.index+1)부터 안전하게 재개된다.
+            logger.error(
+                "[step1] %s — 세그먼트 처리 실패 seg.index=%s (g_y0=%s, g_y1=%s), "
+                "이번 attempt 진행: 완료 %d개/스킵 %d개(resume_from=%d), "
+                "누적 텍스트 %d개, 누적 얼굴 %d개, %.1fs 경과",
+                ep, seg.index, seg.g_y0, seg.g_y1, seg_count, skipped, resume_from,
+                texts, faces, time.perf_counter() - t0, exc_info=True,
             )
+            raise
 
         # ── 하트비트/진행 (Task 5.3) ─────────────────────────────────────────
         # 세그먼트 하나(OCR+YOLO+episode_segment 영속화)가 끝날 때마다 진행 정보(처리된
@@ -885,9 +1007,13 @@ def process_episode_step1(
         if heartbeat_cb:
             heartbeat_cb(seg.index + 1)
         seg_count += 1
-        print(f"[step1] {ep} — 세그먼트 {seg_count} 처리 "
-              f"(누적 텍스트 {texts}개, 누적 얼굴 {faces}개, {time.perf_counter() - t0:.1f}s)")
+        logger.info(
+            "[step1] %s — 세그먼트 %d 처리(누적 텍스트 %d개, 누적 얼굴 %d개, %.1fs)",
+            ep, seg_count, texts, faces, time.perf_counter() - t0,
+        )
 
-    print(f"[step1] {ep} — 통합 처리 완료 (세그먼트 {seg_count}개, 텍스트 {texts}개, "
-          f"얼굴 {faces}개, {time.perf_counter() - t0:.1f}s)")
+    logger.info(
+        "[step1] %s — 통합 처리 완료 (세그먼트 %d개 처리/%d개 스킵, 텍스트 %d개, 얼굴 %d개, %.1fs)",
+        ep, seg_count, skipped, texts, faces, time.perf_counter() - t0,
+    )
     return {"segments": seg_count, "texts": texts, "faces": faces}
