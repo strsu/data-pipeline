@@ -9,7 +9,8 @@ chromadb/boto3/psycopg2를 끌어오지 않게 해, 오케스트레이션 단위
 - 오케스트레이터 큐(ORCH_QUEUE)에서 도는 가벼운 메타/판정 액티비티
   (resolve_episode_for_chain / next_chain_episode / mark_phase_complete / is_phase3_enabled).
 - step별 전용 큐(STEP1/2/3_QUEUE, 동시성 1)에서 도는 무거운 작업 액티비티
-  (prepare_episode / step1_episode / face_identify_episode / step3_episode).
+  (prepare_episode / step1_episode / face_identify_episode /
+  step3a_extract / step3b_resolve / step3c_apply).
 어느 큐에서 실행할지는 호출하는 워크플로(EpisodeChainWorkflow)가 task_queue로 지정한다.
 """
 from __future__ import annotations

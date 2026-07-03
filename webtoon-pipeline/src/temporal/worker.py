@@ -91,7 +91,11 @@ async def main() -> None:
     step3_worker = Worker(
         client,
         task_queue=STEP3_QUEUE,
-        activities=[activities.step3_episode],
+        activities=[
+            activities.step3a_extract,
+            activities.step3b_resolve,
+            activities.step3c_apply,
+        ],
         activity_executor=step3_executor,
         max_concurrent_activities=1,
     )
