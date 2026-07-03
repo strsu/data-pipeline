@@ -305,11 +305,12 @@ def _upsert_llm_annotation(region_id: int, block: dict, model_name: str,
         cur.execute(
             """
             INSERT INTO text_annotation
-                (region_id, source, text, type, speaker_id, model_version, created_at, updated_at)
-            VALUES (%s, 'llm', %s, %s, %s, %s, %s, %s)
+                (region_id, source, text, type, speaker_id, model_version, resolution_status, created_at, updated_at)
+            VALUES (%s, 'llm', %s, %s, %s, %s, 'resolved', %s, %s)
             ON CONFLICT (region_id, source)
             DO UPDATE SET text = EXCLUDED.text, type = EXCLUDED.type,
                           speaker_id = EXCLUDED.speaker_id, model_version = EXCLUDED.model_version,
+                          resolution_status = EXCLUDED.resolution_status,
                           updated_at = EXCLUDED.updated_at
             """,
             (region_id, block.get("corrected_text", ""), btype,

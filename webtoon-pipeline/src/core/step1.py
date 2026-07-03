@@ -730,8 +730,8 @@ def _process_segment_ocr(
         cur.execute(
             """
             INSERT INTO text_annotation
-                (region_id, source, text, confidence, created_at, updated_at)
-            VALUES (%s, 'paddle', %s, %s, %s, %s)
+                (region_id, source, text, confidence, resolution_status, created_at, updated_at)
+            VALUES (%s, 'paddle', %s, %s, 'unresolved', %s, %s)
             """,
             (region_id, blk["text"], score, now, now),
         )
