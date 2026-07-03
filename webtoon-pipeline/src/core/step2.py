@@ -475,6 +475,10 @@ def identify_episode_faces(
             char_name = allocated["char_name"]
             match_score = None
             n_new += 1
+            # 방금 만든 appearance_id를 실존 집합에 즉시 반영 — 그래야 같은 에피소드 내
+            # 다음 얼굴이 이 캐릭터와 매칭됐을 때 "valid_appearance_ids 스냅샷에 없다"는
+            # 이유로 유령(ghost)으로 오판되어 신규 캐릭터로 잘못 쪼개지는 걸 막는다.
+            valid_appearance_ids.add(appearance_id)
 
         b = face["bbox"]
         meta_doc = {
