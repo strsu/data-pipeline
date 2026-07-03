@@ -2153,6 +2153,28 @@ def _commit_threads(
     return inserted
 
 
+def _normalize_threads_for_fold(threads: list[dict], this_ep_no: int) -> list[dict]:
+    """`narrative_context.fold` 입력용 threads를 `_commit_threads`가 실제 커밋한 값과 일치시킨다.
+
+    `_commit_threads`는 status='resolved'이면서 이번 화에 심긴 게 아닌 경우를 제외하면(주로
+    이번 화에 새로 심긴 open 떡밥), LLM이 뭐라 답했든 `planted_episode_id`를 **항상 이번 화**로
+    저장한다(위 함수의 else 분기). 이 정규화 없이 `result.threads`(LLM 원본)를 그대로 fold에
+    넘기면, DB(narrative_thread)와 캐시(webtoon_narrative_state.open_threads)의 planted_episode가
+    서로 어긋나 다음 화 프롬프트에 잘못된 값이 그대로 흘러간다(예: 최초 처리 화에서 LLM이
+    `planted_episode=1`을 반환했는데 실제로는 2화였던 경우).
+    """
+    normalized = []
+    for t in threads or []:
+        t = dict(t)
+        planted_no = t.get("planted_episode")
+        status = t.get("status") or "open"
+        planted_here = planted_no is None or planted_no == this_ep_no
+        if not (status == "resolved" and not planted_here):
+            t["planted_episode"] = this_ep_no
+        normalized.append(t)
+    return normalized
+
+
 def _commit_claims(
     webtoon_episode_id: int,
     cut_map: dict[int, int],
@@ -2296,7 +2318,7 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
         "episode_no": episode_no,
         "episode_id": webtoon_episode_id,
         "characters": result.characters,
-        "threads": result.threads,
+        "threads": _normalize_threads_for_fold(result.threads, episode_no),
         "episode": result.episode,
         "stats": {
             "speakers_resolved": n_speakers,
