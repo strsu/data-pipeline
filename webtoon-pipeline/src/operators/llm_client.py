@@ -12,11 +12,45 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMCallResult:
+    """LLM 호출 결과 + 토큰 사용량.
+
+    호출부는 `result`(파싱된 JSON dict)를 그대로 쓰고, `usage`를 `LLMUsage` 테이블에
+    적재한다(Req 6.7). `usage`는 provider가 값을 생략하면 0/None으로 채운 안정 shape:
+      {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int,
+       "finish_reason": str|None}
+    """
+
+    result: dict
+    usage: dict = field(default_factory=dict)
+
+
+def _build_usage(raw: Optional[dict], finish: Optional[str]) -> dict:
+    """provider usage(OpenAI 호환) → 안정 shape로 정규화. 누락 값은 0/None 기본."""
+    raw = raw or {}
+
+    def _int(key: str) -> int:
+        val = raw.get(key)
+        try:
+            return int(val) if val is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "prompt_tokens": _int("prompt_tokens"),
+        "completion_tokens": _int("completion_tokens"),
+        "total_tokens": _int("total_tokens"),
+        "finish_reason": finish,
+    }
 
 # glm-5v-turbo 등 동시호출 제한 모델 대응 — LLM HTTP 호출을 전역 직렬화.
 # webtoon-pipeline replicas=1 전제(프로세스 세마포어). 한도가 늘면 LLM_MAX_CONCURRENCY로 상향.
@@ -77,10 +111,12 @@ def call_llm_json(
     system_prompt: str,
     user_text: str,
     images: list[bytes],
-) -> dict:
-    """멀티모달 LLM 호출 → JSON dict 반환.
+) -> LLMCallResult:
+    """멀티모달 LLM 호출 → `LLMCallResult`(파싱 JSON + 토큰 usage) 반환.
 
     ctx: resolve_llm_model() 결과. images: 순서대로 전달할 이미지 바이트 목록.
+    반환 `.result`는 파싱된 JSON dict, `.usage`는 LLMUsage 적재용
+    {prompt_tokens, completion_tokens, total_tokens, finish_reason} (Req 6.7).
     """
     params = ctx.get("params") or {}
     endpoint = _resolve_endpoint(ctx)
@@ -152,7 +188,7 @@ def call_llm_json(
         )
     # content 우선, 비어 있으면 reasoning 폴백(intern-vl처럼 답이 reasoning에만 오는 모델 대응).
     text = "".join(content_chunks).strip() or "".join(reasoning_chunks).strip()
-    return _parse_json_content(text)
+    return LLMCallResult(result=_parse_json_content(text), usage=_build_usage(usage, finish))
 
 
 def extract_message_text(message: dict) -> str:
@@ -175,18 +211,25 @@ def extract_message_text(message: dict) -> str:
     return ""
 
 
+# 강건 JSON 파싱용 디코더 — raw_decode로 첫 객체만 떼어내 뒤 잡텍스트("Extra data")를 무시한다.
+_DECODER = json.JSONDecoder()
+
+
 def _parse_json_content(text: str) -> dict:
-    """모델 응답에서 JSON 추출(코드펜스/잡텍스트 방어)."""
+    """모델 응답에서 첫 JSON 객체만 강건하게 추출(코드펜스/여분 텍스트 방어).
+
+    raw_decode 기반: 코드펜스(```json ... ```)를 벗기고, 첫 '{' 위치부터 한 개의
+    JSON 객체만 디코드한다. 객체 뒤에 잡텍스트가 따라와도(JSONDecoder.raw_decode가
+    Extra data를 던지지 않으므로) 무시하고 첫 객체만 반환한다.
+    """
     s = (text or "").strip()
     if s.startswith("```"):
         s = s.split("```", 2)[1] if "```" in s[3:] else s.strip("`")
         if s.startswith("json"):
             s = s[4:]
         s = s.strip().rstrip("`").strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        start, end = s.find("{"), s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(s[start:end + 1])
-        raise
+    i = s.find("{")
+    if i == -1:
+        raise ValueError("no json object")
+    obj, _ = _DECODER.raw_decode(s[i:])  # 첫 객체만, 뒤 잡텍스트 무시
+    return obj

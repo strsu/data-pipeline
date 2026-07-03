@@ -122,12 +122,43 @@ class EpisodeChainWorkflow:
                     ep.source, ep.title_id, ep.episode_no,
                 )
                 return
-        await workflow.execute_activity(
-            activities.step3_episode, ep,
+
+        # 에피소드 단위 2-pass(Req 9.1): step3a(추출) → step3b(해소) → step3c(커밋).
+        # LLM 스테이지는 2개(Pass-1 비전, Pass-2a 텍스트)로 한정하며, 세 액티비티 모두 STEP3_QUEUE에서
+        # 돌아 LLM 스테이지 전체에 걸쳐 동시성 1(두 에피소드의 step3가 동시에 돌지 않음)을 보존한다(Req 9.2).
+        # 단계 간 데이터는 activity 반환값/입력으로 흘린다(Req 9.3): step3a의 ExtractResult dict를
+        # step3b 입력으로, step3b의 ResolveResult dict를 step3c 입력으로 직접 전달한다.
+        workflow.logger.info(
+            "[chain] %s/%s ep=%s — step3 2-pass 시작(extract→resolve→apply)",
+            ep.source, ep.title_id, ep.episode_no,
+        )
+
+        # step3a: 컷별 비전 루프(Pass-1). 길어서 관대한 start_to_close + 컷 단위 heartbeat.
+        extract = await workflow.execute_activity(
+            activities.step3a_extract, ep,
             task_queue=STEP3_QUEUE,
             start_to_close_timeout=timedelta(hours=2),
             heartbeat_timeout=timedelta(minutes=10), retry_policy=_RETRY,
         )
+
+        # step3b: 에피소드 텍스트 전역 해소(Pass-2a). extract 결과 dict를 입력으로 thread.
+        resolution = await workflow.execute_activity(
+            activities.step3b_resolve,
+            args=[ep, extract],
+            task_queue=STEP3_QUEUE,
+            start_to_close_timeout=timedelta(hours=1),
+            heartbeat_timeout=timedelta(minutes=10), retry_policy=_RETRY,
+        )
+
+        # step3c: 결정론 커밋(Pass-2b, LLM 없음). resolution 결과 dict를 입력으로 thread.
+        await workflow.execute_activity(
+            activities.step3c_apply,
+            args=[ep, resolution],
+            task_queue=STEP3_QUEUE,
+            start_to_close_timeout=timedelta(minutes=15),
+            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
+
         await self._mark(ep, 3)
 
     async def _mark(self, ep: EpisodeInput, phase: int) -> None:

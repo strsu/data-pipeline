@@ -200,3 +200,95 @@ def step3_episode(ep: EpisodeInput) -> dict:
         activity.heartbeat(done)
 
     return step3.analyze_episode_scenes(ep.webtoon_episode_id, heartbeat_cb=_hb)
+
+
+# ── step3 2-pass (step3a 추출 → step3b 해소 → step3c 커밋) ─────────────────────
+#
+# 에피소드 단위 2-pass 재구성(Req 9.1). LLM 스테이지는 2개로 한정한다:
+#   step3a_extract — 비전(Pass-1, 컷당 1콜),  step3b_resolve — 텍스트(Pass-2a, 윈도우).
+#   step3c_apply   — LLM 없음(Pass-2b, 결정론 커밋).
+#
+# 단계 간 데이터 전달(Req 9.3): step3a의 `ExtractResult`(Pass-1 레코드 + belief)와 step3b의
+# `ResolveResult`를 activity 반환값/입력으로 흘린다. 이 레포 Temporal 워커는 기본 데이터 컨버터를
+# 쓰며 별도 커스텀 컨버터가 없다(shared.EpisodeInput 데이터클래스를 그대로 주고받는 것이 그 증거).
+# 다만 activities 모듈은 **무거운 코어 의존성을 지연 import** 하는 계약을 지켜야 하므로(모듈 import만으로
+# chromadb/boto3/psycopg2를 끌어오지 않음), 코어 데이터클래스(ExtractResult/ResolveResult/Pass1Record)를
+# 모듈 최상단에서 import해 시그니처 타입으로 쓰지 않는다. 대신 **경계에서 dict로 직렬화**한다
+# (반환은 dataclasses.asdict, 입력은 함수 내부 지연 import로 재구성). 시그니처 타입은 내장 `dict`라
+# 컨버터가 그대로 통과시키며, 코어 dict/list 필드는 모두 JSON 직렬화 가능하다.
+
+
+@activity.defn
+def step3a_extract(ep: EpisodeInput) -> dict:
+    """Pass-1 추출(step3a) — 에피소드 컷을 비전 1콜씩 순회. 반환: `ExtractResult` 직렬화 dict.
+
+    `step3.extract_episode`가 컷마다 `heartbeat_cb`(누적 처리 컷 수)를 호출하므로, 컷 단위로
+    Temporal 하트비트를 보내 긴 비전 루프에서도 타임아웃 타이머를 갱신한다(Req 9.4). 결과
+    `ExtractResult`(Pass-1 레코드 + belief state + usage 집계)는 `asdict`로 직렬화해 step3b 입력으로
+    넘긴다(Req 9.3). per-call LLMUsage 적재는 코어가 내부에서 수행한다(Req 6.7).
+    """
+    from dataclasses import asdict
+    from src.core import step3
+
+    def _hb(done: int) -> None:
+        activity.heartbeat(done)
+
+    result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb)
+    return asdict(result)
+
+
+@activity.defn
+def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
+    """Pass-2a 전역 해소(step3b) — 누적 서사 prior 조립 후 에피소드 텍스트 해소. 반환: `ResolveResult` dict.
+
+    `extract`는 step3a_extract가 반환한 `ExtractResult` 직렬화 dict다. 누적 서사 컨텍스트(prior)는
+    `narrative_context.load_prior(webtoon_id, ep.episode_no)`로 조립한다(이전 화까지의 확정 로스터/
+    미해결 떡밥/running 요약 — Req 4.1, 11.3). webtoon_id는 `EpisodeInput`에 없으므로 코어 헬퍼
+    `step3._get_webtoon_id(webtoon_episode_id)`로 해석한다(현재 코어에 공개 경로가 없어 private 헬퍼를
+    사용 — 문서화). 해소 진입점은 컨텍스트 적응형 윈도우(`resolve_episode_windowed`)이며 토큰 예산에
+    따라 단일콜/다중윈도우를 자동 선택한다(Req 8). 윈도우 경로는 콜백 기반 하트비트가 없으므로 긴
+    텍스트 콜 전에 최소 1회 하트비트를 보낸다(Req 9.4).
+    """
+    from dataclasses import asdict
+    from src.core import step3
+    from src.core.step3 import ExtractResult, Pass1Record
+    from src.operators.narrative_context import load_prior
+
+    # 긴 텍스트 해소 콜 전 하트비트(윈도우 경로는 콜백 없음 — 최소 1회 갱신).
+    activity.heartbeat("resolve:start")
+
+    webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
+    prior = load_prior(webtoon_id, ep.episode_no)
+
+    # ExtractResult 재구성(records는 Pass1Record 데이터클래스로 복원 — windowed 경로가 속성 접근).
+    records = [Pass1Record(**r) for r in extract.get("records", [])]
+    extract_obj = ExtractResult(
+        webtoon_episode_id=extract.get("webtoon_episode_id", ep.webtoon_episode_id),
+        records=records,
+        belief=extract.get("belief", {}),
+        cuts_total=extract.get("cuts_total", 0),
+        cuts_analyzed=extract.get("cuts_analyzed", 0),
+        cuts_skipped=extract.get("cuts_skipped", 0),
+        usage_total=extract.get("usage_total", {}),
+    )
+
+    result = step3.resolve_episode_windowed(extract_obj, prior, webtoon_id=webtoon_id)
+    return asdict(result)
+
+
+@activity.defn
+def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
+    """Pass-2b 결정론 커밋(step3c) — **LLM 없음**. `ResolveResult`를 에피소드 전체 DB에 투영. 반환: episode_meta.
+
+    `resolution`은 step3b_resolve가 반환한 `ResolveResult` 직렬화 dict다. 함수 내부에서 `ResolveResult`로
+    복원해 `step3.apply_resolution`에 넘긴다(소급 전파·멱등·동결 보장 — Req 5). 결정론 단계라 빠르지만,
+    안전하게 시작 시 하트비트를 1회 보낸다. apply_resolution은 커밋 후 `narrative_context.fold`로 누적
+    서사 상태를 갱신하고 fold 입력으로 쓴 episode_meta dict를 반환한다(Req 11.4).
+    """
+    from src.core import step3
+    from src.core.step3 import ResolveResult
+
+    activity.heartbeat("apply:start")
+
+    result = ResolveResult(**resolution)
+    return step3.apply_resolution(ep.webtoon_episode_id, result)
