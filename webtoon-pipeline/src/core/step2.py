@@ -202,6 +202,28 @@ def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
         return [row[0] for row in cur.fetchall()]
 
 
+def _get_valid_appearance_ids(webtoon_id: int) -> set[int]:
+    """이 웹툰에 실제로 존재하는(하드 삭제 안 된) character_appearance id 집합.
+
+    `_get_excluded_appearance_ids`는 "존재하는 행 중 매칭에서 뺄 것"만 다루므로, 행 자체가
+    하드 삭제돼 아예 없는 경우(예: 관리자 "분석데이터 초기화"가 DB는 지우고 Chroma 컬렉션
+    정리에는 실패하는 경우 — 재현 확인됨)는 걸러내지 못한다. Chroma 앵커/매칭 결과의
+    appearance_id를 쓰기 전에 이 집합으로 실존 여부를 검증해, 유령 appearance_id가
+    face_record.appearance_id FK 위반으로 이어지는 것을 막는다.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT ca.id
+            FROM character_appearance ca
+            JOIN character c ON ca.character_id = c.id
+            WHERE c.webtoon_id = %s
+            """,
+            (webtoon_id,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
 def _seed_confirmed_faces(
     webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str,
     heartbeat_cb: Optional[Callable[[int], None]] = None, heartbeat_value: int = 0,
@@ -370,7 +392,10 @@ def identify_episode_faces(
         webtoon_id, source, title_id, collection, model_name, metric_type,
         heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
     )
-    excluded_appearance_ids = _get_excluded_appearance_ids(webtoon_id)
+    # 리스트로 고정 — 아래에서 유령 appearance_id를 발견할 때마다 append해 이후 쿼리에서도
+    # 제외되게 한다(list는 참조로 넘겨지므로 find_match 재호출 시 갱신된 내용이 그대로 반영됨).
+    excluded_appearance_ids = list(_get_excluded_appearance_ids(webtoon_id))
+    valid_appearance_ids = _get_valid_appearance_ids(webtoon_id)
 
     # collection.get()/일괄 임베딩이 heartbeat_timeout(2분)보다 오래 걸릴 수 있어,
     # 순차 루프 진입 전인 이 구간에서도 heartbeat로 타임아웃 타이머를 미리 갱신해둔다.
@@ -381,6 +406,17 @@ def identify_episode_faces(
     # collection.get()으로 전체 재조회하지 않도록 에피소드당 1회만 적재해 캐시한다.
     # 새로 추가되는 얼굴(매칭/신규 캐릭터)은 루프 중 캐시에 직접 append해 갱신.
     ccip_anchors = load_ccip_anchors(collection, excluded_appearance_ids) if metric_type == "ccip" else None
+
+    if ccip_anchors is not None:
+        stale = [a for a in ccip_anchors if a["meta"]["appearance_id"] not in valid_appearance_ids]
+        if stale:
+            stale_ids = sorted({a["meta"]["appearance_id"] for a in stale})
+            logger.warning(
+                "[step2] ep_id=%s — Chroma anchor %d개가 Postgres에 없는 appearance_id를 "
+                "가리켜 매칭 후보에서 제외(DB/Chroma 드리프트, 예: 리셋 후 Chroma 정리 누락): %s",
+                webtoon_episode_id, len(stale), stale_ids,
+            )
+            ccip_anchors = [a for a in ccip_anchors if a["meta"]["appearance_id"] in valid_appearance_ids]
 
     faces = _load_face_records(webtoon_episode_id)
     pending = faces[resume_from:]
@@ -411,6 +447,21 @@ def identify_episode_faces(
             collection, feature, metric_type, threshold, excluded_appearance_ids,
             ccip_anchors=ccip_anchors,
         )
+        if match is not None and match["meta"]["appearance_id"] not in valid_appearance_ids:
+            # cosine 경로는 Chroma를 직접 쿼리해 사전 필터(위 ccip_anchors 필터링)를
+            # 못 거치므로 여기서 최종 방어선으로 재검증한다. 발견한 유령 id는 이후
+            # 같은 에피소드 내 재매칭을 막도록 제외 목록에 추가(list라 참조로 반영됨).
+            stale_id = match["meta"]["appearance_id"]
+            logger.warning(
+                "[step2] ep_id=%s cut=%s face_idx=%s — 매칭된 appearance_id=%s가 Postgres에 "
+                "없음(DB/Chroma 드리프트) — 신규 캐릭터로 재할당",
+                webtoon_episode_id, face["cut_number"], face["face_idx"], stale_id,
+            )
+            excluded_appearance_ids.append(stale_id)
+            if ccip_anchors is not None:
+                ccip_anchors = [a for a in ccip_anchors if a["meta"]["appearance_id"] != stale_id]
+            match = None
+
         if match is not None:
             meta = match["meta"]
             appearance_id = meta["appearance_id"]
