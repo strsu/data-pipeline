@@ -24,6 +24,12 @@ _FALLBACK = {
 _cache: dict[int, dict] = {}
 _lock = threading.Lock()
 
+# 폴백 모델 이름 패턴(name ILIKE) — llm_model에 이 이름을 포함하는 활성 행을 등록해두면
+# 비전 콜이 기본 모델로 재시도까지 모두 실패했을 때 3차 시도로 쓰인다(Req 7.4 확장).
+_FALLBACK_MODEL_NAME_PATTERN = "%qwen%"
+_fallback_cache: Optional[dict] = None
+_fallback_lock = threading.Lock()
+
 
 def _parse_params(raw) -> dict:
     if isinstance(raw, dict):
@@ -91,9 +97,54 @@ def resolve_llm_model(webtoon_id: int) -> dict:
     return result
 
 
+def resolve_fallback_llm_model() -> Optional[dict]:
+    """비전/텍스트 콜 폴백 모델 조회(Req 7.4 3차 시도) — 웹툰별 설정과 무관한 전역 폴백.
+
+    `llm_model`에 이름이 `_FALLBACK_MODEL_NAME_PATTERN`(예: qwen)에 매칭하는 활성 행이
+    등록돼 있으면 그 모델을 반환한다. 미등록이면 None(호출부는 폴백 없이 기존대로 스킵).
+    """
+    global _fallback_cache
+    with _fallback_lock:
+        if _fallback_cache is not None:
+            return _fallback_cache.get("model")
+
+    result: Optional[dict] = None
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, provider, model_id, params, supports_vision
+                FROM llm_model
+                WHERE is_active = true AND deleted_at IS NULL AND name ILIKE %s
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (_FALLBACK_MODEL_NAME_PATTERN,),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                result = {
+                    "id": row[0],
+                    "name": row[1],
+                    "provider": row[2],
+                    "model_id": row[3],
+                    "params": _parse_params(row[4]),
+                    "supports_vision": bool(row[5]),
+                }
+    except Exception as e:
+        print(f"[llm_resolver] fallback resolve 실패, 폴백 생략: {e}")
+
+    with _fallback_lock:
+        _fallback_cache = {"model": result}
+    return result
+
+
 def clear_cache(webtoon_id: Optional[int] = None) -> None:
+    global _fallback_cache
     with _lock:
         if webtoon_id is None:
             _cache.clear()
         else:
             _cache.pop(webtoon_id, None)
+    with _fallback_lock:
+        _fallback_cache = None

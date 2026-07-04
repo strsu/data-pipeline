@@ -26,7 +26,7 @@ from src.config.db import db_cursor
 from src.config.s3 import fetch_cut_image
 from src.operators import narrative_context
 from src.operators.llm_client import call_llm_json
-from src.operators.llm_resolver import resolve_llm_model
+from src.operators.llm_resolver import resolve_fallback_llm_model, resolve_llm_model
 from src.operators.overlay import overlay_faces
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,7 @@ class Pass1Record:
     `faces`/`name_evidence`/`provisional_speakers`는 step3b(extract_episode) belief state
     누적용 캐리오버(roster/pending/name_evidence). `usage`는 LLMUsage 적재용(Req 6.7).
     `skipped`(empty|no_image) 또는 `error`가 채워지면 비전 콜이 생략/실패한 컷이다.
+    `llm_model_id`는 실제로 결과를 만든 모델의 id(기본 모델 또는 폴백 — Req 7.4 확장)다.
     """
 
     cut_number: int
@@ -139,6 +140,7 @@ class Pass1Record:
     usage: dict = field(default_factory=dict)
     skipped: Optional[str] = None
     error: Optional[str] = None
+    llm_model_id: Optional[int] = None
 
 
 @dataclass
@@ -595,6 +597,54 @@ def _upsert_provisional_annotation(region_id: int, block: dict, model_name: str)
         )
 
 
+def _call_llm_with_fallback(
+    primary_ctx: dict,
+    ctx_wrap,
+    system_prompt: str,
+    user_text: str,
+    images: list[bytes],
+    retries: int,
+) -> tuple[dict, dict, Optional[str], dict]:
+    """LLM JSON 콜 — 기본 모델 `retries`회 시도 후, 모두 실패하면 폴백 모델로 1회 더(Req 7.4 확장).
+
+    폴백 모델은 `resolve_fallback_llm_model()`이 DB(`llm_model`)에서 찾아준다(예: qwen —
+    등록돼 있지 않으면 None이라 폴백 생략, 기존 동작과 동일). `ctx_wrap`은 `_pass1_ctx`/
+    `_pass2_ctx`처럼 콜 전용 파라미터 보정을 적용하는 함수다.
+
+    반환 `(raw_result, usage, err, used_ctx)` — `err`가 None이 아니면 폴백까지 모두 실패한
+    것이고, `used_ctx`는 실제로 결과를 만들어낸 ctx(기본 또는 폴백)다.
+    """
+    raw_result: dict = {}
+    usage: dict = {}
+    err: Optional[str] = None
+    used_ctx = primary_ctx
+    for _attempt in range(retries):
+        try:
+            call = call_llm_json(primary_ctx, system_prompt, user_text, images)
+            raw_result = call.result if isinstance(call.result, dict) else {}
+            usage = call.usage or {}
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001 — 컷/에피소드 단위 격리(run 중단 금지)
+            err = str(e)
+            raw_result = {}
+
+    if err is not None:
+        fallback_model = resolve_fallback_llm_model()
+        if fallback_model is not None and fallback_model.get("model_id") != primary_ctx.get("model_id"):
+            fallback_ctx = ctx_wrap(fallback_model)
+            try:
+                call = call_llm_json(fallback_ctx, system_prompt, user_text, images)
+                raw_result = call.result if isinstance(call.result, dict) else {}
+                usage = call.usage or {}
+                used_ctx = fallback_ctx
+                err = None
+            except Exception as e:  # noqa: BLE001
+                err = f"{err} | 폴백({fallback_ctx.get('name')}) 실패: {e}"
+
+    return raw_result, usage, err, used_ctx
+
+
 def extract_cut(
     webtoon_episode_id: int,
     cut_number: int,
@@ -620,8 +670,10 @@ def extract_cut(
     반환 `Pass1Record`는 `result`(검증된 JSON) + belief 캐리오버(faces/name_evidence/
     provisional_speakers) + `usage`(LLMUsage 적재용)를 노출한다.
 
-    Req 7.4 — 파싱/일시 오류는 1회 재시도하고, 그래도 실패하면 해당 컷만 빈 결과로 스킵
-    (run 중단 금지). Req 1.10 — OCR·얼굴이 모두 없으면 비전 콜을 생략한다.
+    Req 7.4 — 파싱/일시 오류는 기본 모델로 1회 재시도(총 2회)하고, 그래도 실패하면 폴백
+    모델(`resolve_fallback_llm_model` — DB에 등록돼 있을 때만)로 1회 더 시도한다. 그마저
+    실패하면 해당 컷만 빈 결과로 스킵(run 중단 금지). Req 1.10 — OCR·얼굴이 모두 없으면
+    비전 콜을 생략한다.
     """
     cut_id = _cut_id(webtoon_episode_id, cut_number)
     if cut_id is None:
@@ -654,20 +706,11 @@ def extract_cut(
         "ocr_blocks": [{"index": r["index"], "text": r["text"]} for r in regions],
     }, ensure_ascii=False)
 
-    # Req 7.4 — 1회 재시도(총 2회). 모두 실패하면 빈 결과로 스킵.
-    raw_result: dict = {}
-    usage: dict = {}
-    err: Optional[str] = None
-    for _attempt in range(_PASS1_RETRIES):
-        try:
-            call = call_llm_json(call_ctx, _PASS1_SYSTEM_PROMPT, user_text, [overlay_img])
-            raw_result = call.result if isinstance(call.result, dict) else {}
-            usage = call.usage or {}
-            err = None
-            break
-        except Exception as e:  # noqa: BLE001 — 컷 단위 격리(run 중단 금지)
-            err = str(e)
-            raw_result = {}
+    # Req 7.4 — 기본 모델 1회 재시도(총 2회) 후 모두 실패하면 폴백 모델(qwen 등, DB 등록 시)로
+    # 1회 더. 그래도 실패하면 빈 결과로 스킵.
+    raw_result, usage, err, call_ctx = _call_llm_with_fallback(
+        call_ctx, _pass1_ctx, _PASS1_SYSTEM_PROMPT, user_text, [overlay_img], _PASS1_RETRIES,
+    )
     if err is not None:
         logger.warning(
             "[step3.pass1] %s/%s ep=%s cut=%s — 비전 콜 실패(스킵): %s",
@@ -707,7 +750,7 @@ def extract_cut(
     return Pass1Record(
         cut_number=cut_number, cut_id=cut_id, result=result, faces=faces,
         name_evidence=result["name_evidence"], provisional_speakers=provisional_speakers,
-        usage=usage,
+        usage=usage, llm_model_id=call_ctx.get("id"),
     )
 
 
@@ -913,7 +956,8 @@ def extract_episode(
         if rec.skipped is None and rec.usage:
             analyzed += 1
             _insert_llm_usage(webtoon_id, webtoon_episode_id, rec.cut_id,
-                              llm_model_id, rec.usage, stage=_PASS1_STAGE, image_count=1)
+                              rec.llm_model_id or llm_model_id, rec.usage,
+                              stage=_PASS1_STAGE, image_count=1)
             agg["prompt_tokens"] += int(rec.usage.get("prompt_tokens", 0) or 0)
             agg["completion_tokens"] += int(rec.usage.get("completion_tokens", 0) or 0)
             agg["total_tokens"] += int(rec.usage.get("total_tokens", 0) or 0)
@@ -1303,10 +1347,11 @@ def resolve_episode(
     stage(비전/텍스트) 분리 인자를 지원하지 않아 기본 모델을 텍스트 콜에 그대로 쓴다(텍스트 모델
     분리 해석은 후속). max_tokens는 대용량 구조화 출력에 맞춰 넉넉히, temperature는 0.0~0.2.
 
-    Req 7.4 — 파싱/일시 오류는 1회 재시도하고, 그래도 실패하면 빈 결과(+error)로 반환해 run을
-    중단하지 않는다. 콜이 완료되면 `llm_usage`에 per-call 1행 적재(stage='pass2_resolve',
-    episode_id=<에피소드>, cut_id=NULL — Req 6.7). 적응형 윈도우/belief 캐리오버(Req 8)는 task
-    6.2가 본 단일콜 경로를 감싼다.
+    Req 7.4 — 파싱/일시 오류는 기본 모델로 1회 재시도(총 2회)하고, 그래도 실패하면 폴백 모델
+    (`resolve_fallback_llm_model` — DB에 등록돼 있을 때만)로 1회 더 시도한다. 그마저 실패하면
+    빈 결과(+error)로 반환해 run을 중단하지 않는다. 콜이 완료되면 `llm_usage`에 per-call 1행
+    적재(stage='pass2_resolve', episode_id=<에피소드>, cut_id=NULL — Req 6.7). 적응형 윈도우/
+    belief 캐리오버(Req 8)는 task 6.2가 본 단일콜 경로를 감싼다.
     """
     if isinstance(ep, ExtractResult):
         webtoon_episode_id = ep.webtoon_episode_id
@@ -1329,20 +1374,11 @@ def resolve_episode(
     payload = _build_pass2_user_payload(records, prior_context)
     user_text = json.dumps(payload, ensure_ascii=False)
 
-    # Req 7.4 — 1회 재시도(총 2회). 모두 실패하면 빈 결과(+error)로 스킵. 텍스트 콜이므로 images=[].
-    raw_result: dict = {}
-    usage: dict = {}
-    err: Optional[str] = None
-    for _attempt in range(_PASS2_RETRIES):
-        try:
-            call = call_llm_json(call_ctx, _PASS2_SYSTEM_PROMPT, user_text, [])
-            raw_result = call.result if isinstance(call.result, dict) else {}
-            usage = call.usage or {}
-            err = None
-            break
-        except Exception as e:  # noqa: BLE001 — 에피소드 단위 격리(run 중단 금지)
-            err = str(e)
-            raw_result = {}
+    # Req 7.4 — 기본 모델 1회 재시도(총 2회) 후 모두 실패하면 폴백 모델로 1회 더.
+    # 텍스트 콜이므로 images=[].
+    raw_result, usage, err, call_ctx = _call_llm_with_fallback(
+        call_ctx, _pass2_ctx, _PASS2_SYSTEM_PROMPT, user_text, [], _PASS2_RETRIES,
+    )
 
     if err is not None:
         logger.warning(
@@ -1355,7 +1391,7 @@ def resolve_episode(
     # per-call usage 적재(Req 6.7) — 에피소드 텍스트 콜: episode_id 채움, cut_id=NULL, image_count=NULL.
     if persist_usage:
         _insert_llm_usage(
-            webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
+            webtoon_id, webtoon_episode_id, None, call_ctx.get("id"), usage,
             stage=_PASS2_STAGE, image_count=None,
         )
 
