@@ -158,8 +158,8 @@ class EpisodeChainWorkflow:
             start_to_close_timeout=timedelta(minutes=15),
             heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
         )
-
-        await self._mark(ep, 3)
+        # v4.0: step3 완료 마킹은 별도 없음 — step3c가 resolve run을 succeeded로 전이하는 것이
+        # 진행도의 정본이다(§17.1). _mark는 step1/2(run 원장 완료 기록)에만 쓴다.
 
     async def _mark(self, ep: EpisodeInput, phase: int) -> None:
         await workflow.execute_activity(

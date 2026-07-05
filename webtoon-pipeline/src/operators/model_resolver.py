@@ -30,8 +30,8 @@ def resolve_embedding_model(webtoon_id: int) -> dict:
             cur.execute(
                 """
                 SELECT em.name, em.metric_type, COALESCE(wes.threshold, em.default_threshold)
-                FROM webtoon_embedding_setting wes
-                JOIN embedding_model em ON wes.embedding_model_id = em.id
+                FROM config_webtoon_embedding_setting wes
+                JOIN config_embedding_model em ON wes.embedding_model_id = em.id
                 WHERE wes.webtoon_id = %s
                   AND wes.is_enabled = true
                   AND wes.deleted_at IS NULL
@@ -46,7 +46,7 @@ def resolve_embedding_model(webtoon_id: int) -> dict:
                 cur.execute(
                     """
                     SELECT name, metric_type, default_threshold
-                    FROM embedding_model
+                    FROM config_embedding_model
                     WHERE is_default = true AND is_active = true AND deleted_at IS NULL
                     ORDER BY id ASC
                     LIMIT 1

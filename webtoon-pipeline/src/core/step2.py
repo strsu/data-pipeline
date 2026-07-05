@@ -58,7 +58,7 @@ def _load_face_records(webtoon_episode_id: int) -> list[dict]:
             SELECT fr.id, fr.face_idx,
                    fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
                    fr.conf, wc.id AS cut_id, wc.cut_number
-            FROM face_record fr
+            FROM analysis_face_detection fr
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             WHERE wc.episode_id = %s
               AND fr.is_used = true
@@ -77,34 +77,28 @@ def _load_face_records(webtoon_episode_id: int) -> list[dict]:
 
 
 def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: int) -> dict:
-    """신규 Character + CharacterAppearance 생성 (NEW_CHAR_{N:03d}, 웹툰 글로벌)."""
+    """신규 얼굴 클러스터(Character kind=cluster) + CharacterAppearance 생성(v4.0 §17.2).
+
+    클러스터는 기계 산출물이라 이름이 없다(name="") — 구 NEW_CHAR_{N} placeholder 관습 폐기.
+    실명 확정/승격(kind=character)은 Stage R apply 또는 human이 수행한다.
+    """
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT COALESCE(MAX(
-                CASE WHEN name ~ '^NEW_CHAR_[0-9]+$'
-                THEN CAST(SUBSTRING(name FROM 10) AS INTEGER) ELSE 0 END
-            ), 0) + 1
-            FROM character WHERE webtoon_id = %s
-            """,
-            (webtoon_id,),
-        )
-        char_name = f"NEW_CHAR_{cur.fetchone()[0]:03d}"
-        cur.execute(
-            """
-            INSERT INTO character
-                (webtoon_id, name, aliases, extra, first_seen_episode_id, first_seen_cut,
+            INSERT INTO analysis_character
+                (webtoon_id, kind, name, aliases, extra, first_seen_episode_id, first_seen_cut,
                  is_confirmed, is_name_auto_assigned, is_match_excluded, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, false, false, false, %s, %s)
+            VALUES (%s, 'cluster', '', %s, %s, %s, %s, false, false, false, %s, %s)
             RETURNING id
             """,
-            (webtoon_id, char_name, Json([]), Json({}), webtoon_episode_id, cut_number, now, now),
+            (webtoon_id, Json([]), Json({}), webtoon_episode_id, cut_number, now, now),
         )
         char_id = cur.fetchone()[0]
+        char_name = f"cluster#{char_id}"  # 로그/Chroma 메타 표시용 라벨(DB name은 빈 문자열)
         cur.execute(
             """
-            INSERT INTO character_appearance
+            INSERT INTO analysis_character_appearance
                 (character_id, label, is_canonical, first_seen_episode_id, first_seen_cut, created_at, updated_at)
             VALUES (%s, '기본', true, %s, %s, %s, %s)
             RETURNING id
@@ -115,12 +109,23 @@ def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: in
         return {"char_id": char_id, "char_name": char_name, "appearance_id": appearance_id}
 
 
-def _update_face_record(face_id: int, appearance_id: int) -> None:
+def _upsert_face_identity(
+    face_id: int, appearance_id: int, score: Optional[float], run_id: Optional[int],
+) -> None:
+    """step2 정체 행 upsert — human 행은 절대 건드리지 않는다(레이어 분리, v4.0 §17.2)."""
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
-            "UPDATE face_record SET appearance_id = %s, updated_at = %s WHERE id = %s",
-            (appearance_id, now, face_id),
+            """
+            INSERT INTO analysis_face_identity
+                (detection_id, source, appearance_id, score, run_id, created_at, updated_at)
+            VALUES (%s, 'step2', %s, %s, %s, %s, %s)
+            ON CONFLICT ON CONSTRAINT uniq_face_identity_detection_source
+            DO UPDATE SET appearance_id = EXCLUDED.appearance_id,
+                          score = EXCLUDED.score, run_id = EXCLUDED.run_id,
+                          deleted_at = NULL, updated_at = EXCLUDED.updated_at
+            """,
+            (face_id, appearance_id, score, run_id, now, now),
         )
 
 
@@ -129,10 +134,10 @@ def _upsert_face_embedding(face_id: int, model: str, doc_id: str, match_score: O
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO face_embedding
-                (face_record_id, embedding_model, chroma_doc_id, match_score, created_at, updated_at)
+            INSERT INTO analysis_face_embedding
+                (detection_id, embedding_model, chroma_doc_id, match_score, created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (face_record_id, embedding_model)
+            ON CONFLICT (detection_id, embedding_model)
             DO UPDATE SET chroma_doc_id = EXCLUDED.chroma_doc_id,
                           match_score   = EXCLUDED.match_score,
                           updated_at    = EXCLUDED.updated_at
@@ -146,11 +151,11 @@ def _update_character_first_seen(appearance_id: int, episode_id: int, episode_no
     with db_cursor() as cur:
         cur.execute(
             """
-            UPDATE character
+            UPDATE analysis_character
             SET first_seen_episode_id = %s, first_seen_cut = %s, updated_at = %s
             WHERE id = (
-                SELECT c.id FROM character c
-                JOIN character_appearance ca ON ca.character_id = c.id
+                SELECT c.id FROM analysis_character c
+                JOIN analysis_character_appearance ca ON ca.character_id = c.id
                 WHERE ca.id = %s
             )
             AND (
@@ -161,22 +166,6 @@ def _update_character_first_seen(appearance_id: int, episode_id: int, episode_no
             )
             """,
             (episode_id, cut_number, now, appearance_id, episode_no, episode_no, cut_number),
-        )
-
-
-def _complete_episode_state(webtoon_id: int, webtoon_episode_id: int) -> None:
-    now = datetime.now(timezone.utc)
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE webtoon_pipeline_state
-            SET phase2_status = 'running',
-                phase2_last_completed_episode_id = %s,
-                phase2_processed_count = phase2_processed_count + 1,
-                updated_at = %s
-            WHERE webtoon_id = %s
-            """,
-            (webtoon_episode_id, now, webtoon_id),
         )
 
 
@@ -191,8 +180,8 @@ def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
         cur.execute(
             """
             SELECT ca.id
-            FROM character_appearance ca
-            JOIN character c ON ca.character_id = c.id
+            FROM analysis_character_appearance ca
+            JOIN analysis_character c ON ca.character_id = c.id
             WHERE c.webtoon_id = %s
               AND (
                 c.is_match_excluded = true
@@ -218,8 +207,8 @@ def _get_valid_appearance_ids(webtoon_id: int) -> set[int]:
         cur.execute(
             """
             SELECT ca.id
-            FROM character_appearance ca
-            JOIN character c ON ca.character_id = c.id
+            FROM analysis_character_appearance ca
+            JOIN analysis_character c ON ca.character_id = c.id
             WHERE c.webtoon_id = %s
             """,
             (webtoon_id,),
@@ -242,16 +231,18 @@ def _seed_confirmed_faces(
         cur.execute(
             """
             SELECT fr.id, fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
-                   fr.conf, fr.appearance_id, wc.cut_number, we.no AS episode_no,
+                   fr.conf, fi.appearance_id, wc.cut_number, we.no AS episode_no,
                    ca.label AS appearance_label, c.name AS character_name, fe.chroma_doc_id
-            FROM face_record fr
+            FROM analysis_face_detection fr
+            JOIN analysis_face_identity fi ON fi.detection_id = fr.id
+                 AND fi.source = 'human' AND fi.deleted_at IS NULL
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             JOIN webtoon_episode we ON wc.episode_id = we.id
-            JOIN character_appearance ca ON fr.appearance_id = ca.id
-            JOIN character c ON ca.character_id = c.id
-            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id AND fe.embedding_model = %s
-            WHERE c.webtoon_id = %s AND fr.is_confirmed = true
-              AND fr.appearance_id IS NOT NULL AND fr.deleted_at IS NULL
+            JOIN analysis_character_appearance ca ON fi.appearance_id = ca.id
+            JOIN analysis_character c ON ca.character_id = c.id
+            LEFT JOIN analysis_face_embedding fe ON fe.detection_id = fr.id AND fe.embedding_model = %s
+            WHERE c.webtoon_id = %s
+              AND fi.appearance_id IS NOT NULL AND fr.deleted_at IS NULL
               AND fr.is_used = true
               AND c.is_match_excluded = false
               AND c.deleted_at IS NULL
@@ -346,18 +337,20 @@ def _fetch_and_embed_all(
 
 
 def _summarize_episode_faces(webtoon_episode_id: int) -> tuple[int, int]:
-    """face_record/face_embedding 현재 상태로 matched/new_chars 집계 (재시도 후에도 정확).
-    match_score IS NULL이면 신규 캐릭터, 값이 있으면 기존 캐릭터 매칭."""
+    """face_identity(step2)/face_embedding 현재 상태로 matched/new_chars 집계 (재시도 후에도 정확).
+    match_score IS NULL이면 신규 클러스터, 값이 있으면 기존 캐릭터/클러스터 매칭."""
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT
                 COUNT(*) FILTER (WHERE fe.match_score IS NOT NULL) AS matched,
                 COUNT(*) FILTER (WHERE fe.match_score IS NULL) AS new_chars
-            FROM face_record fr
+            FROM analysis_face_detection fr
+            JOIN analysis_face_identity fi ON fi.detection_id = fr.id
+                 AND fi.source = 'step2' AND fi.deleted_at IS NULL
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
-            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id
-            WHERE wc.episode_id = %s AND fr.appearance_id IS NOT NULL
+            LEFT JOIN analysis_face_embedding fe ON fe.detection_id = fr.id
+            WHERE wc.episode_id = %s AND fi.appearance_id IS NOT NULL
               AND fr.is_used = true
             """,
             (webtoon_episode_id,),
@@ -373,6 +366,7 @@ def identify_episode_faces(
     episode_no: int,
     heartbeat_cb: Optional[Callable[[int], None]] = None,
     resume_from: int = 0,
+    run_id: Optional[int] = None,
 ) -> dict:
     """에피소드의 모든 얼굴을 임베딩+매칭 1패스로 식별. 반환: 처리 요약.
 
@@ -496,7 +490,7 @@ def identify_episode_faces(
             # 같은 에피소드 내 다음 얼굴이 방금 만든 신규 캐릭터와 매칭될 수 있어 캐시에 반영.
             ccip_anchors.append({"embedding": feature, "meta": meta_doc})
 
-        _update_face_record(face["id"], appearance_id)
+        _upsert_face_identity(face["id"], appearance_id, match_score, run_id)
         _upsert_face_embedding(face["id"], model_name, doc_id, match_score)
 
         done = i + 1
@@ -511,7 +505,6 @@ def identify_episode_faces(
             heartbeat_cb(resume_from + i + 1)
 
     matched_n, new_n = _summarize_episode_faces(webtoon_episode_id)
-    _complete_episode_state(webtoon_id, webtoon_episode_id)
     logger.info(
         "[step2] 에피소드 식별 완료 ep_id=%s episode_no=%s: faces=%d, matched=%d, new_chars=%d",
         webtoon_episode_id, episode_no, len(faces), matched_n, new_n,

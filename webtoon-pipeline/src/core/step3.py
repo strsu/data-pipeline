@@ -35,10 +35,12 @@ _NAME_AUTO_CONFIDENCE = 0.85
 
 # Pass-1(컷별 provisional 추출) 상수 — 비전 1콜 throughput/품질 가드.
 _PASS1_MAX_DIM = 1280          # 다운스케일 상한(긴 변, px)
-_PASS1_MIN_MAX_TOKENS = 8192   # Req 7.2 — 절단 방지(>=4096, 실운영은 8192로 상향).
+_PASS1_MIN_MAX_TOKENS = 16384  # Req 7.2 — 절단 방지(>=4096 → 8192 → 16384로 재상향).
 # glm-4.6v 등 추론형 모델은 답 이전에 reasoning_content로 사고과정을 먼저 소모하는데,
 # max_tokens는 reasoning+content 합산 예산이라 4096으로는 컷이 복잡하면(블록 많음 등)
 # 본문이 잘려 JSON 파싱이 깨진다(실사례: ep=11 cut=2 "Unterminated string" — 2026-07-04).
+# 8192로도 naver/820097 전 회차에서 finish_reason='length' 절단이 7건 잔존(2026-07-05 실측)
+# → 16384로 재상향. GLM-4.6v 비전 컨텍스트 32K 중 입력(이미지 ~1.3K + 프롬프트)이 작아 여유 있음.
 # DB(llm_model.params)에 명시적 max_tokens가 없어 이 floor가 그대로 적용되는 게 확인됨.
 _PASS1_MAX_TEMPERATURE = 0.2   # Req 7.5 — 추출 단계 저온도(0.0~0.2)
 _PASS1_RETRIES = 2             # Req 7.4 — 파싱/일시 오류 1회 재시도(총 2회 시도)
@@ -54,39 +56,10 @@ _SPEAKER_TYPES = ("speech", "monologue")  # 화자 귀속 대상 type
 # belief state: 이 임계값 미만이거나 face_label/name이 모두 없는 화자 후보는 'pending'으로
 # 적재해 Pass-2a가 맥락으로 해소하게 둔다(Req 1.5 과확신 금지 / Req 2.4 해소 대상).
 _PENDING_SPEAKER_MAX_CONFIDENCE = 0.5
-_PASS1_STAGE = "pass1"  # LLMUsage.stage (Req 6.7) — 비전 추출 콜(step3a).
+_PASS1_STAGE = "vision"  # LLMUsage.stage — Stage V 컷 비전 콜(step3a).
 # LLMUsage.stage 허용값(service `LLMStage` enum과 일치) — usage 적재의 단일 진실원천.
-# pass1=비전 컷콜(step3a), pass2_resolve=텍스트 에피소드콜(step3b), step4=회차 요약.
-_USAGE_STAGES = ("pass1", "pass2_resolve", "step4")
-
-_SYSTEM_PROMPT = (
-    "당신은 웹툰 컷을 분석하는 도우미입니다. 이미지(N-2, N-1, 현재 컷 N, 그리고 얼굴 bbox에 "
-    "F0/F1 라벨을 오버레이한 현재 컷)와 OCR 텍스트(ocr_blocks), 식별된 얼굴 정보를 받습니다. "
-    "현재 컷 N에 대해서만 결과를 JSON으로 출력하세요.\n"
-    "【중요 규칙】\n"
-    "1) ocr_blocks의 **모든 index에 대해 정확히 하나씩** block을 출력하세요. "
-    "입력 블록 개수와 출력 blocks 개수가 같아야 하며, index를 그대로 유지합니다. "
-    "**블록을 병합·분할·생략·재번호하지 마세요.**\n"
-    "2) 각 block의 corrected_text는 **그 index의 OCR 텍스트만** 문맥에 맞게 교정하세요. "
-    "다른 블록의 내용을 끌어오거나 합치지 마세요(여러 줄이 한 문장이어도 각 줄은 자기 조각만 교정).\n"
-    "3) type은 블록별로 narration/speech/monologue/sfx/caption/other 중 하나. "
-    "speech=인물이 입 밖으로 낸 말(일반 말풍선), monologue=인물이 입 밖으로 내지 않고 속으로 "
-    "생각하는 독백(구름/각진 말풍선 등), narration=특정 화자가 아닌 세계관·상황 해설(사각 박스 등). "
-    "speaker는 speech 또는 monologue일 때 정한다: "
-    "말풍선 꼬리가 가리키는, 오버레이된 얼굴의 라벨(F0/F1 등)을 **그대로** 적는다. "
-    "이 컷에 화자의 얼굴이 없지만 문맥상 누가 말하거나 생각하는지 분명하면 그 인물의 이름을 적는다. "
-    "narration/sfx/caption/other 이거나 화자를 알 수 없으면 speaker는 null.\n"
-    "4) **모든 자연어 문자열 값은 반드시 한국어로 작성하세요.** "
-    "특히 scene_meta.action_summary, scene_meta.key_objects, name_discoveries.evidence 는 "
-    "영어가 아닌 한국어로만 출력합니다(고유명사 제외). corrected_text 는 OCR 원문 언어를 유지합니다.\n"
-    "반드시 아래 JSON 스키마만 출력하세요:\n"
-    '{"blocks":[{"index":<int>,"type":"narration|speech|monologue|sfx|caption|other",'
-    '"speaker":"<F라벨(F0 등) 또는 인물 이름 또는 null>","corrected_text":"<해당 블록만 교정>"}],'
-    '"scene_meta":{"action_summary":"<현재 컷 줄거리>","key_objects":["..."]},'
-    '"name_discoveries":[{"face_id":"F0","name":"<대사/나레이션에서 드러난 실제 이름>",'
-    '"confidence":<0~1>,"evidence":"<근거>"}]}'
-)
-
+# vision=컷 비전(V), resolve=정체·화자 해소(R), narrative=서사 분석(N), arc=아크 종합(A).
+_USAGE_STAGES = ("vision", "resolve", "narrative", "arc")
 
 # ── Pass-1 (컷별 provisional 추출) ────────────────────────────────────────────
 # 정본: qwen-vl/_pass1.py SYS 프롬프트를 그대로 이관(분류 먼저→화자 나중, strict JSON,
@@ -94,7 +67,9 @@ _SYSTEM_PROMPT = (
 # speaker.basis, "지어내지 마"). 연속성은 Pass-1이 아니라 Pass-2가 담당(Req 1.2).
 _PASS1_SYSTEM_PROMPT = (
     "당신은 웹툰 컷 분석기입니다. 입력: 현재 컷 이미지(얼굴 bbox에 F0/F1 라벨 오버레이), "
-    "identified_faces(F라벨+알려진 이름), ocr_blocks(index+text). 현재 컷만 분석해 **JSON만** 출력.\n"
+    "identified_faces(F라벨+알려진 이름+confirmed), ocr_blocks(index+text). 현재 컷만 분석해 **JSON만** 출력.\n"
+    "identified_faces의 confirmed=true는 **사람이 확정한 정체성(진실)** — 그대로 신뢰한다. "
+    "confirmed=false는 얼굴인식 추정값이라 이미지/대사와 어긋나 보이면 name_evidence로 이의만 남긴다.\n"
     "⚠️ **모든 자연어 출력(cut_summary/key_objects/name_evidence 등)은 반드시 한국어로 작성한다** "
     "(예외: corrected_text만 OCR 원문 언어 유지). 영어 등 다른 언어로 답하지 말 것.\n"
     "규칙:\n"
@@ -191,9 +166,9 @@ def prepare_episode_scene(webtoon_episode_id: int) -> None:
     with db_cursor() as cur:
         cur.execute(
             """
-            DELETE FROM text_annotation
+            DELETE FROM analysis_text_annotation
             WHERE source = 'llm' AND region_id IN (
-                SELECT tr.id FROM text_region tr
+                SELECT tr.id FROM analysis_text_region tr
                 JOIN webtoon_cut wc ON tr.cut_id = wc.id
                 WHERE wc.episode_id = %s
             )
@@ -202,7 +177,7 @@ def prepare_episode_scene(webtoon_episode_id: int) -> None:
         )
         cur.execute(
             """
-            DELETE FROM cut_scene_meta
+            DELETE FROM analysis_cut_scene_meta
             WHERE cut_id IN (SELECT id FROM webtoon_cut WHERE episode_id = %s)
             """,
             (webtoon_episode_id,),
@@ -226,8 +201,8 @@ def _load_regions(cut_id: int) -> list[dict]:
             """
             SELECT tr.id, tr.index, tr.bbox_x1, tr.bbox_y1, tr.bbox_x2, tr.bbox_y2,
                    ta.text
-            FROM text_region tr
-            LEFT JOIN text_annotation ta ON ta.region_id = tr.id AND ta.source = 'paddle'
+            FROM analysis_text_region tr
+            LEFT JOIN analysis_text_annotation ta ON ta.region_id = tr.id AND ta.source = 'paddle'
             WHERE tr.cut_id = %s AND tr.is_excluded = false
             ORDER BY tr.index
             """,
@@ -240,23 +215,41 @@ def _load_regions(cut_id: int) -> list[dict]:
 
 
 def _load_faces(cut_id: int) -> list[dict]:
-    """컷의 식별된 얼굴: id=F{face_idx}, bbox, 현재 캐릭터명, appearance_id, character_id."""
+    """컷의 식별된 얼굴: id=F{face_idx}, bbox, 현재 캐릭터명, appearance_id, character_id, confirmed.
+
+    `confirmed`는 human이 그 얼굴↔캐릭터 매칭을 확정(`face_record.is_confirmed`)했는지다 —
+    Pass-1/2a 프롬프트가 "is_confirmed는 진실로 동결"을 지시하므로 **모델 입력에 실제로 실어야**
+    작동한다(이전엔 프롬프트만 있고 데이터가 없었음 — 2026-07-05 수정).
+    """
     with db_cursor() as cur:
+        # 정체는 face_identity 레이어에서 human > step2 우선으로 해석한다(v4.0 §17.2).
+        # DISTINCT ON: detection당 우선순위 최상 1행. 'human' < 'step2' (알파벳) → human 우선.
         cur.execute(
             """
             SELECT fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
-                   fr.appearance_id, c.name, c.id
-            FROM face_record fr
-            LEFT JOIN character_appearance ca ON fr.appearance_id = ca.id
-            LEFT JOIN character c ON ca.character_id = c.id
-            WHERE fr.cut_id = %s
+                   fi.appearance_id, c.name, c.id, (fi.source = 'human') AS confirmed
+            FROM analysis_face_detection fr
+            LEFT JOIN LATERAL (
+                SELECT source, appearance_id
+                FROM analysis_face_identity
+                WHERE detection_id = fr.id AND deleted_at IS NULL
+                ORDER BY source ASC
+                LIMIT 1
+            ) fi ON true
+            LEFT JOIN analysis_character_appearance ca ON fi.appearance_id = ca.id
+            LEFT JOIN analysis_character c ON ca.character_id = c.id
+            WHERE fr.cut_id = %s AND fr.is_used = true
             ORDER BY fr.face_idx
             """,
             (cut_id,),
         )
         return [
             {"id": f"F{r[0]}", "bbox": [r[1], r[2], r[3], r[4]],
-             "appearance_id": r[5], "name": r[6], "character_id": r[7]}
+             "appearance_id": r[5],
+             # 클러스터는 name=""(미명명) — 프롬프트에는 None으로 실어 "이름 모름"을 명시.
+             "name": (r[6] or None),
+             "character_id": r[7],
+             "confirmed": bool(r[8])}
             for r in cur.fetchall()
         ]
 
@@ -264,16 +257,16 @@ def _load_faces(cut_id: int) -> list[dict]:
 # ── 저장 ──────────────────────────────────────────────────────────────────────
 
 def _find_character_by_name(webtoon_id: int, name: str) -> Optional[int]:
-    """웹툰 내 기존 Character 를 이름/alias 로 찾는다(NEW_CHAR placeholder 제외). 확정 캐릭터 우선."""
+    """웹툰 내 기존 명명 인물(kind=character)을 이름/alias로 찾는다. 확정 캐릭터 우선."""
     n = (name or "").strip()
     if not n:
         return None
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT id FROM character
+            SELECT id FROM analysis_character
             WHERE webtoon_id = %s AND deleted_at IS NULL
-              AND name !~ '^NEW_CHAR_[0-9]+$'
+              AND kind = 'character' AND name <> ''
               AND (LOWER(name) = LOWER(%s)
                    OR EXISTS (
                         SELECT 1 FROM jsonb_array_elements_text(COALESCE(aliases, '[]')::jsonb) a
@@ -287,134 +280,22 @@ def _find_character_by_name(webtoon_id: int, name: str) -> Optional[int]:
         return row[0] if row else None
 
 
-def _resolve_speaker_id(webtoon_id: int, faces: list[dict], speaker_raw) -> Optional[int]:
-    """LLM speaker → Character.id(FK). 순서: 얼굴라벨 동일값 > 컷 얼굴명 일치 > 웹툰 기존 이름/alias.
-
-    narration/caption/sfx 등 화자 없는 블록은 speaker_raw 가 비거나 null → None.
-    """
-    s = (speaker_raw or "").strip()
-    if not s or s.lower() in ("null", "none", "nan"):
-        return None
-    # 1) 얼굴 라벨 동일값 매칭 (F0/F1 …) — 결정론적
-    for f in faces:
-        if f["id"] == s:
-            return f.get("character_id")
-    # 2) 이 컷 얼굴들의 현재 캐릭터명과 일치 (placeholder 제외)
-    for f in faces:
-        fn = (f.get("name") or "").strip()
-        if fn and not fn.startswith("NEW_CHAR_") and fn.lower() == s.lower():
-            return f.get("character_id")
-    # 3) 얼굴 없는 화자 — 웹툰 내 기존 캐릭터 이름/alias 매칭
-    return _find_character_by_name(webtoon_id, s)
-
-
-def _upsert_llm_annotation(region_id: int, block: dict, model_name: str,
-                           speaker_id: Optional[int]) -> None:
-    now = datetime.now(timezone.utc)
-    btype = block.get("type")
-    if btype not in ("speech", "monologue", "narration", "system", "other"):
-        btype = None
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO text_annotation
-                (region_id, source, text, type, speaker_id, model_version, resolution_status, created_at, updated_at)
-            VALUES (%s, 'llm', %s, %s, %s, %s, 'resolved', %s, %s)
-            ON CONFLICT (region_id, source)
-            DO UPDATE SET text = EXCLUDED.text, type = EXCLUDED.type,
-                          speaker_id = EXCLUDED.speaker_id, model_version = EXCLUDED.model_version,
-                          resolution_status = EXCLUDED.resolution_status,
-                          updated_at = EXCLUDED.updated_at
-            """,
-            (region_id, block.get("corrected_text", ""), btype,
-             speaker_id, model_name, now, now),
-        )
-
-
-def _upsert_scene_meta(cut_id: int, scene_meta: dict) -> None:
+def _upsert_scene_meta(cut_id: int, scene_meta: dict, run_id: Optional[int] = None) -> None:
+    """cut_scene_meta upsert(OneToOne) — Stage V 산출(action_summary/key_objects) + run 귀속."""
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO cut_scene_meta
-                (cut_id, action_summary, key_objects, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO analysis_cut_scene_meta
+                (cut_id, action_summary, key_objects, run_id, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (cut_id)
             DO UPDATE SET action_summary = EXCLUDED.action_summary,
-                          key_objects = EXCLUDED.key_objects, updated_at = EXCLUDED.updated_at
+                          key_objects = EXCLUDED.key_objects, run_id = EXCLUDED.run_id,
+                          updated_at = EXCLUDED.updated_at
             """,
             (cut_id, scene_meta.get("action_summary", ""),
-             Json(scene_meta.get("key_objects", [])), now, now),
-        )
-
-
-def _apply_name_discoveries(webtoon_id: int, faces: list[dict], discoveries: list[dict]) -> None:
-    """confidence>=0.85 → NEW_CHAR Character 이름 자동 지정(is_name_auto_assigned). 미만 → extra에 제안 적재.
-
-    단 동일 이름의 기존 Character 가 이미 있으면 rename 하지 않는다(중복 생성 방지).
-    is_confirmed(사람 확정)는 LLM 이 절대 건드리지 않는다.
-    """
-    face_by_id = {f["id"]: f for f in faces}
-    now = datetime.now(timezone.utc)
-    for d in discoveries or []:
-        face = face_by_id.get(d.get("face_id"))
-        if not face or not face.get("appearance_id"):
-            continue
-        name = (d.get("name") or "").strip()
-        if not name:
-            continue
-        # 모델이 제공된 placeholder(NEW_CHAR_xxx)를 '발견한 이름'인 양 에코하는 경우 무시
-        if name.startswith("NEW_CHAR_"):
-            continue
-        conf = float(d.get("confidence", 0) or 0)
-        with db_cursor() as cur:
-            cur.execute(
-                """
-                SELECT c.id, c.name, c.is_confirmed, c.extra
-                FROM character c JOIN character_appearance ca ON ca.character_id = c.id
-                WHERE ca.id = %s
-                """,
-                (face["appearance_id"],),
-            )
-            row = cur.fetchone()
-            if not row:
-                continue
-            char_id, cur_name, is_confirmed, extra = row
-            extra = extra if isinstance(extra, dict) else {}
-            # Req 10.5/3.4 — human 확정 Character는 **동결**: rename도, 이름 제안 적재도 하지 않는다
-            # (2-pass 경로 `_project_characters`가 is_confirmed를 skip하는 것과 동일하게 정합).
-            if is_confirmed:
-                continue
-            existing = _find_character_by_name(webtoon_id, name)
-            can_rename = (
-                conf >= _NAME_AUTO_CONFIDENCE
-                and not is_confirmed
-                and (cur_name or "").startswith("NEW_CHAR_")
-                and (existing is None or existing == char_id)  # 동명 기존 캐릭터 있으면 rename 안 함
-            )
-            if can_rename:
-                # 자동 지정 (human 미확정 상태로 — UI에서 검토)
-                cur.execute(
-                    "UPDATE character SET name=%s, is_name_auto_assigned=true, updated_at=%s WHERE id=%s",
-                    (name[:64], now, char_id),
-                )
-            else:
-                # 제안 큐(전용 테이블 없음 → extra.name_suggestions에 적재)
-                sugg = extra.get("name_suggestions") or []
-                sugg.append({"name": name, "confidence": conf, "evidence": d.get("evidence", "")})
-                extra["name_suggestions"] = sugg[-20:]
-                cur.execute(
-                    "UPDATE character SET extra=%s, updated_at=%s WHERE id=%s",
-                    (Json(extra), now, char_id),
-                )
-
-
-def _mark_cut_analyzed(cut_id: int, llm_model_id: Optional[int]) -> None:
-    now = datetime.now(timezone.utc)
-    with db_cursor() as cur:
-        cur.execute(
-            "UPDATE webtoon_cut SET llm_analyzed_at=%s, llm_model_id=%s, is_stale=false, updated_at=%s WHERE id=%s",
-            (now, llm_model_id, now, cut_id),
+             Json(scene_meta.get("key_objects", [])), run_id, now, now),
         )
 
 
@@ -568,11 +449,17 @@ def _sanitize_pass1(result: dict, regions: list[dict]) -> dict:
     }
 
 
-def _upsert_provisional_annotation(region_id: int, block: dict, model_name: str) -> None:
+def _upsert_provisional_annotation(
+    region_id: int, block: dict, model_name: str, speaker_id: Optional[int] = None,
+    run_id: Optional[int] = None,
+) -> None:
     """Pass-1 블록을 provisional(`resolution_status='unresolved'`)로 적재.
 
-    Req 1.9 — 최종 확정 필드(speaker_id)는 직접 쓰지 않는다(Pass-2b가 확정). 화자 후보는
-    Pass1Record(belief)로만 캐리오버. type은 허용목록 외면 None.
+    화자 후보도 함께 영속한다(2026-07-05 설계 변경): Pass-1이 얼굴 라벨 기반으로 확신
+    (confidence>=임계값)한 화자는 `speaker_id`로 저장하되 `resolution_status='unresolved'`를
+    유지한다 — 확정(resolved 전이)은 여전히 Pass-2b만 한다. 이전 설계(speaker_id 항상 NULL,
+    후보는 belief로만 캐리오버)는 Pass-2a가 재출력하지 않은 확신 화자가 전부 유실돼 화자
+    매칭률이 1~2%에 그치는 원인이었다(naver/820097 전 회차 실측). type은 허용목록 외면 None.
     """
     now = datetime.now(timezone.utc)
     btype = block.get("type")
@@ -581,18 +468,42 @@ def _upsert_provisional_annotation(region_id: int, block: dict, model_name: str)
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO text_annotation
+            INSERT INTO analysis_text_annotation
                 (region_id, source, text, type, speaker_id, resolution_status,
-                 model_version, created_at, updated_at)
-            VALUES (%s, 'llm', %s, %s, NULL, 'unresolved', %s, %s, %s)
+                 model_version, run_id, created_at, updated_at)
+            VALUES (%s, 'llm', %s, %s, %s, 'unresolved', %s, %s, %s, %s)
             ON CONFLICT (region_id, source)
             DO UPDATE SET text = EXCLUDED.text, type = EXCLUDED.type,
-                          speaker_id = NULL, resolution_status = 'unresolved',
-                          model_version = EXCLUDED.model_version,
+                          speaker_id = EXCLUDED.speaker_id, resolution_status = 'unresolved',
+                          model_version = EXCLUDED.model_version, run_id = EXCLUDED.run_id,
                           updated_at = EXCLUDED.updated_at
             """,
-            (region_id, block.get("corrected_text", ""), btype, model_name, now, now),
+            (region_id, block.get("corrected_text", ""), btype, speaker_id,
+             model_name, run_id, now, now),
         )
+
+
+def _provisional_speaker_id(block: dict, faces: list[dict]) -> Optional[int]:
+    """Pass-1 블록의 얼굴 기반 화자 후보 → character_id (provisional 영속용).
+
+    speech/monologue 블록에서 speaker.face_label이 이 컷 얼굴에 매핑되고
+    confidence >= `_PENDING_SPEAKER_MAX_CONFIDENCE`(0.5)일 때만 반환한다.
+    그 미만/얼굴 없음은 None — Pass-2a가 맥락으로 해소할 몫으로 남긴다.
+    """
+    if block.get("type") not in _SPEAKER_TYPES:
+        return None
+    sp = block.get("speaker") or {}
+    label = sp.get("face_label")
+    try:
+        conf = float(sp.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if not label or conf < _PENDING_SPEAKER_MAX_CONFIDENCE:
+        return None
+    for f in faces or []:
+        if f.get("id") == label:
+            return f.get("character_id")
+    return None
 
 
 def extract_cut(
@@ -606,6 +517,7 @@ def extract_cut(
     webtoon_id: Optional[int] = None,
     ctx: Optional[dict] = None,
     persist: bool = True,
+    run_id: Optional[int] = None,
 ) -> Pass1Record:
     """컷 1개를 비전 LLM 1콜로 분석해 Pass-1 provisional 레코드를 만든다(step3a 단위).
 
@@ -648,7 +560,8 @@ def extract_cut(
     overlay_img = _downscale(overlay_faces(img, faces), _PASS1_MAX_DIM)
     user_text = json.dumps({
         "identified_faces": [
-            {"id": f["id"], "name": f.get("name"), "character_id": f.get("character_id")}
+            {"id": f["id"], "name": f.get("name"), "character_id": f.get("character_id"),
+             "confirmed": bool(f.get("confirmed"))}
             for f in faces
         ],
         "ocr_blocks": [{"index": r["index"], "text": r["text"]} for r in regions],
@@ -684,11 +597,15 @@ def extract_cut(
         for block in result["blocks"]:
             rid = region_by_index.get(block["index"])
             if rid is not None:
-                _upsert_provisional_annotation(rid, block, call_ctx["name"])
+                _upsert_provisional_annotation(
+                    rid, block, call_ctx["name"],
+                    speaker_id=_provisional_speaker_id(block, faces),
+                    run_id=run_id,
+                )
         _upsert_scene_meta(cut_id, {
             "action_summary": result["cut_summary"],
             "key_objects": result["key_objects"],
-        })
+        }, run_id=run_id)
 
     # belief 캐리오버용 화자 후보(pending) — speech/monologue 블록만.
     provisional_speakers = [
@@ -723,6 +640,7 @@ def _insert_llm_usage(
     stage: str = _PASS1_STAGE,
     image_count: Optional[int] = 1,
     extra: Optional[dict] = None,
+    run_id: Optional[int] = None,
 ) -> None:
     """LLM 콜 1회당 `llm_usage` 1행 적재 — usage 적재의 **단일 진실원천**(Req 6.7).
 
@@ -754,11 +672,11 @@ def _insert_llm_usage(
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO llm_usage
+            INSERT INTO analysis_llm_usage
                 (webtoon_id, episode_id, cut_id, stage, llm_model_id,
                  prompt_tokens, completion_tokens, total_tokens, image_count,
-                 finish_reason, extra, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 finish_reason, extra, run_id, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 webtoon_id, episode_id, cut_id, stage, llm_model_id,
@@ -768,6 +686,7 @@ def _insert_llm_usage(
                 image_count,
                 u.get("finish_reason"),
                 Json(extra) if extra else None,
+                run_id,
                 now, now,
             ),
         )
@@ -840,6 +759,7 @@ def extract_episode(
     heartbeat_cb=None,
     *,
     prepare: bool = True,
+    run_id: Optional[int] = None,
 ) -> ExtractResult:
     """에피소드의 모든 컷을 Pass-1(비전 1콜)로 순회 추출하고 belief state를 누적한다(step3a).
 
@@ -890,7 +810,7 @@ def extract_episode(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(extract_cut, webtoon_episode_id, cn,
-                        ep_info=info, webtoon_id=webtoon_id, ctx=ctx): cn
+                        ep_info=info, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id): cn
             for cn in cut_numbers
         }
         for future in as_completed(futures):
@@ -913,7 +833,8 @@ def extract_episode(
         if rec.skipped is None and rec.usage:
             analyzed += 1
             _insert_llm_usage(webtoon_id, webtoon_episode_id, rec.cut_id,
-                              llm_model_id, rec.usage, stage=_PASS1_STAGE, image_count=1)
+                              llm_model_id, rec.usage, stage=_PASS1_STAGE, image_count=1,
+                              run_id=run_id)
             agg["prompt_tokens"] += int(rec.usage.get("prompt_tokens", 0) or 0)
             agg["completion_tokens"] += int(rec.usage.get("completion_tokens", 0) or 0)
             agg["total_tokens"] += int(rec.usage.get("total_tokens", 0) or 0)
@@ -943,26 +864,27 @@ def extract_episode(
 # 계약). 이미지 없이 에피소드 전체 Pass-1 레코드(읽기순) + 누적 서사 컨텍스트(prior)를 텍스트 LLM
 # 1콜로 해소한다(Req 2.1). 윈도우 분할/belief 캐리오버(Req 8)는 task 6.2가 본 단일콜 경로를
 # 감싼다 — 본 태스크는 단일콜 경로만 구현한다.
-_PASS2_STAGE = "pass2_resolve"   # LLMUsage.stage (Req 6.7) — 에피소드 텍스트 해소 콜.
-_PASS2_MIN_MAX_TOKENS = 8192     # 대용량 구조화 출력(characters/beats/...) 절단 방지(넉넉히).
+_PASS2_STAGE = "resolve"        # LLMUsage.stage — Stage R 정체·화자 해소 콜(step3b 1/2).
+_NARRATIVE_STAGE = "narrative"  # LLMUsage.stage — Stage N 서사 분석 콜(step3b 2/2).
+_PASS2_MIN_MAX_TOKENS = 16384    # 대용량 구조화 출력(characters/beats/...) 절단 방지(넉넉히).
+# speaker_resolution이 '불확실 블록만'에서 '모든 speech/monologue 전수 테이블'로 바뀌어(2026-07-05)
+# 출력량이 크게 늘었고, 추론형 모델의 reasoning 소모까지 감안해 16384로 상향.
 _PASS2_MAX_TEMPERATURE = 0.2     # 해소는 결정론 지향(0.0~0.2).
 _PASS2_RETRIES = _PASS1_RETRIES  # 파싱/일시 오류 1회 재시도(총 2회 시도).
 _SIGNIFICANCE = ("main", "supporting", "minor_functional", "extra")  # Req 2.3
 
-_PASS2_SYSTEM_PROMPT = (
-    "당신은 웹툰 에피소드 전체를 보고 컷별 provisional 분석을 **전역 해소**하는 분석기입니다. "
-    "⚠️ **beats/episode(summary/appeal_point/cliffhanger/foreshadowing)/threads(description) 등 "
-    "모든 자연어 출력은 반드시 한국어로 작성한다. 영어 등 다른 언어로 답하지 말 것.** "
-    "정체성 기준은 character_id(Step2가 부여한 안정적 인물 id)입니다. 컷 내 F라벨은 그 컷 한정. "
-    "⚠️ **중요**: identified_faces의 character_id/이름은 Step2 **얼굴인식 추정값**이며 정답이 아니다"
-    "(is_confirmed가 아니면 신뢰 금물). **대사·호칭·맥락 증거가 얼굴 라벨보다 우선**한다. "
+_RESOLVE_SYSTEM_PROMPT = (
+    "당신은 웹툰 에피소드 전체를 보고 컷별 provisional 분석의 **인물 정체와 화자를 전역 해소**하는 "
+    "분석기입니다(Stage R). ⚠️ **모든 자연어 출력은 반드시 한국어로 작성한다.** "
+    "정체성 기준은 character_id(Step2가 부여한 안정적 인물/클러스터 id)입니다. 컷 내 F라벨은 그 컷 한정. "
+    "이름이 없는 character_id는 아직 명명되지 않은 얼굴 클러스터다 — 대사/호칭/나레이션 근거로 실명을 "
+    "확정할 수 있으면 name에 제시하라. "
+    "⚠️ **중요**: faces의 confirmed=false인 character_id는 Step2 **얼굴인식 추정값**이며 정답이 아니다. "
+    "**대사·호칭·맥락 증거가 얼굴 라벨보다 우선**한다. "
     "특히 **서사와 모순되는 얼굴 라벨**(예: 이미 죽은 인물이 다른 시대에 살아 등장, 나이/시대 불일치)은 "
     "**오인식(mis-ID)으로 의심**하고, name은 대사 근거로 정한 뒤 label_conflict에 사유를 적어라. "
-    "단 **is_confirmed/human 라벨은 정답으로 동결**한다(강등·재라벨 금지). "
-    "📜 **텍스트 진실성 등급**: narration/system=작가의 객관적 진실(전개 골격), monologue=인물의 진짜 속마음/의도(정직), "
-    "speech=남에게 한 말로 **거짓·과장·책략일 수 있는 주장**. **거짓/책략은 speech 주장이 monologue·narration·확정정체성과 충돌할 때** 드러난다. "
-    "입력의 confirmed_roster_prior(이전 화 확정 인물=진실 기준선)를 신뢰 기준으로 삼아라. "
-    "먼저 인물별 speech/monologue 타임라인을 정리하고 narration으로 전개를 잡은 뒤, **주장 vs 진실 괴리를 적극 탐색**하라. "
+    "단 **confirmed=true 얼굴과 confirmed_roster_prior는 human 확정 정답으로 동결**한다(강등·재라벨 금지, "
+    "화자 판정에도 그대로 신뢰). "
     "에피소드 전체 맥락(앞뒤 컷)을 활용해 다음을 **JSON만** 출력:\n"
     "1) characters: 에피소드에 등장한 character_id별로 "
     "{character_id, name(대사/나레이션/호칭 근거로 확정된 실제 이름 또는 null), "
@@ -972,17 +894,51 @@ _PASS2_SYSTEM_PROMPT = (
     "label_conflict(얼굴 라벨과 대사/맥락이 충돌하면 'Step2는 X로 인식했으나 대사상 Y' 식 설명, 없으면 null), "
     "merge_suggestion([같은 인물로 보이는 다른 character_id들])}. "
     "병합은 **제안만**(확신 있을 때만).\n"
-    "2) speaker_resolution: provisional speaker가 null이거나 불확실한 speech/monologue 블록을 "
-    "앞뒤 맥락으로 해소 → [{cut, block_index, character_id(또는 null), confidence, reason}].\n"
-    "3) beats: 연속 컷을 서사 단위로 묶음 → [{cut_start, cut_end, hook_type(자유 텍스트), appeal_point(소구포인트 한 줄), intensity(0~1)}]. "
-    "비트 개수 제약 없음(에피소드 전체가 1비트일 수도).\n"
-    "4) episode: {summary, appeal_point(에피소드 핵심 소구포인트), cliffhanger, foreshadowing:[...]}.\n"
-    "5) deceptions: 인물이 speech로 한 거짓/과장/책략(진실과 충돌) → "
-    "[{cut, character_id, claim(주장 내용), contradicts(어떤 진실과 충돌하는지), confidence}]. 없으면 빈 배열.\n"
-    "6) threads: 떡밥/복선/미스터리/목표 등 단위 경계를 가로지르는 서사 실 → "
+    "2) speaker_resolution: **모든 speech/monologue 블록에 대한 전수 화자 테이블** → "
+    "[{cut, block_index, character_id(또는 null), confidence, reason}]. "
+    "블록의 spk_face/spk_cid(Pass-1 얼굴 기반 후보)가 맥락과 맞으면 그 인물로 **확인**하고, "
+    "앞뒤 맥락·대화 흐름상 다른 인물이면 **교체**하라(교차 대화에서 말풍선 꼬리가 없는 블록은 "
+    "직전/직후 발화자와의 문답 관계로 추론). 진짜 판단 불가일 때만 character_id null. "
+    "**speech/monologue 블록을 빠뜨리지 마라.**\n"
+    "3) face_reassignments: confirmed=false 얼굴 중 **그 컷의 대사/호칭/맥락상 현재 cid 배정이 "
+    "명백히 틀린 얼굴**만 → [{cut, face(그 컷의 F라벨), "
+    "to_character_id(올바른 인물의 character_id — 로스터에 실재하는 id만, 누군지 모르면 null), "
+    "evidence(컷·대사 근거), confidence(0~1)}]. "
+    "인물 전반의 의심(특정 얼굴을 못 짚음)은 여기가 아니라 characters[].label_conflict에 적어라. "
+    "확신 있는 것만, 없으면 빈 배열.\n"
+    "없는 정보는 지어내지 말 것(null). **자연어는 반드시 한국어.**"
+)
+
+# Stage N — 서사 분석(정체·화자가 정정된 트랜스크립트 입력, 이미지 없음). §17.4/§17.5.
+_NARRATIVE_SYSTEM_PROMPT = (
+    "당신은 화자·정체가 확정된 웹툰 에피소드 트랜스크립트를 읽고 **서사를 분석**하는 분석기입니다(Stage N). "
+    "⚠️ **모든 자연어 출력은 반드시 한국어로 작성한다. 영어 등 다른 언어로 답하지 말 것.** "
+    "📜 **텍스트 진실성 등급**: narration/system=작가의 객관적 진실(전개 골격), monologue=인물의 진짜 속마음/의도(정직), "
+    "speech=남에게 한 말로 **거짓·과장·책략일 수 있는 주장**. "
+    "confirmed_roster_prior(이전 화까지의 인물 도감)와 open_threads(미회수 떡밥)를 서사 기준선으로 삼아라. "
+    "먼저 인물별 speech/monologue 타임라인을 정리하고 narration으로 전개를 잡은 뒤, **주장 vs 진실 괴리를 적극 탐색**하라. "
+    "다음을 **JSON만** 출력:\n"
+    "1) beats: 연속 컷을 서사 단위로 묶음 → [{cut_start, cut_end, hook_type(자유 텍스트), "
+    "appeal_point(소구포인트 한 줄), intensity(0~1)}]. 비트 개수 제약 없음(에피소드 전체가 1비트일 수도).\n"
+    "2) episode: {summary, teaser, appeal_point(핵심 소구포인트), cliffhanger, foreshadowing:[...]}. "
+    "**summary(정보성, 스포 허용, 2~3문장)**: narration과 컷에서 실제 일어난 사건에만 근거. "
+    "roster에 이미 있는 인물은 **수식어 없이 이름만** 쓴다('파문당한 귀족 에드' 금지 — 소개는 첫 등장 화에서 끝났다). "
+    "근거 없는 낙인·동기 추측·강한 단정(예: '분탕', '배신자' 같은 평가어) 금지. "
+    "**teaser(궁금증 유발 카피, 1~2문장, 스포 금지)**: 이번 화에서 밝혀진 진실(해소된 떡밥의 답, "
+    "폭로된 거짓)은 절대 언급하지 말고, 미회수 떡밥은 암시만 하라. 질문형/여운형 문장 허용.\n"
+    "3) deceptions: 인물이 **다른 인물을 속이려는 의도로** speech로 한 거짓/과장/책략(진실과 충돌) → "
+    "[{cut, character_id, claim(주장 내용), contradicts(어떤 진실과 충돌하는지), confidence}]. "
+    "⚠️ monologue(속마음)·혼잣말·자조·한탄·수사적 표현은 **deception이 아니다**(속일 상대가 없음). "
+    "확실한 것만, 없으면 빈 배열.\n"
+    "4) threads: 떡밥/복선/미스터리/목표 등 단위 경계를 가로지르는 서사 실 → "
     "[{description, type(foreshadowing|mystery|goal|...), status(open|resolved), "
     "planted_episode, planted_cut, resolved_episode, resolved_cut, confidence}]. "
     "이번 화에서 심긴 것은 open, 이번 화에서 해소된 것은 resolved. 없으면 빈 배열.\n"
+    "5) profiles: 이번 화에 **근거가 있는** 인물 메타 갱신 → [{character_id, "
+    "profile{gender(남|여|null), age_group(아동|10대|20대|30대|중년|노년|null), "
+    "affiliation(소속 집단/가문/조직 또는 null), role(서사 역할 한 줄), "
+    "personality([성격 키워드 1~4개]), traits({그 외 장르 특이 정보, 예: 신분/직업/능력 — 자유 key:value}), "
+    "key_facts([이번 화에서 확인된 사실 문장들])}]. 모르면 항목 생략(지어내기 금지).\n"
     "없는 정보는 지어내지 말 것(null). **자연어는 반드시 한국어.**"
 )
 
@@ -995,6 +951,8 @@ class ResolveResult:
       - characters: [{character_id, name, significance, name_confidence, evidence,
                       label_conflict, merge_suggestion}] (Req 2.3, 3.2)
       - speaker_resolution: [{cut, block_index, character_id, confidence, reason}] (Req 2.4)
+      - face_reassignments: [{cut, face(F라벨), to_character_id, evidence, confidence}]
+        — 얼굴 단위 재배정 제안(suggestion type=face_reassign 원료, §17.8 후속 구현)
       - beats: [{cut_start, cut_end, hook_type, appeal_point, intensity}] (Req 2.5)
       - episode: {summary, appeal_point, cliffhanger, foreshadowing} (Req 2.6)
       - deceptions: [{cut, character_id, claim, contradicts, confidence}] (Req 2.8)
@@ -1007,10 +965,12 @@ class ResolveResult:
     webtoon_episode_id: Optional[int]
     characters: list[dict] = field(default_factory=list)
     speaker_resolution: list[dict] = field(default_factory=list)
+    face_reassignments: list[dict] = field(default_factory=list)  # Stage R 얼굴 재배정 제안
     beats: list[dict] = field(default_factory=list)
     episode: dict = field(default_factory=dict)
     deceptions: list[dict] = field(default_factory=list)
     threads: list[dict] = field(default_factory=list)
+    profiles: list[dict] = field(default_factory=list)  # Stage N 산출 — 인물 메타 delta(v4.0)
     usage: dict = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -1097,13 +1057,15 @@ def _build_pass2_user_payload(records: list["Pass1Record"], prior) -> dict:
                 "text": b.get("corrected_text"),
                 "spk_face": sp.get("face_label"),
                 "spk_name": sp.get("name"),
+                "spk_cid": sp.get("character_id"),  # provisional 화자(character_id) — 재해소 경로 복원값
                 "conf": sp.get("confidence"),
                 "tail": sp.get("tail_hint"),
             })
         transcript.append({
             "cut": cut,
             "summary": res.get("cut_summary"),
-            "faces": [{"F": f.get("id"), "cid": f.get("character_id"), "name": f.get("name")}
+            "faces": [{"F": f.get("id"), "cid": f.get("character_id"), "name": f.get("name"),
+                       "confirmed": bool(f.get("confirmed"))}
                       for f in faces],
             "chars": res.get("characters") or [],
             "blocks": blocks,
@@ -1141,6 +1103,33 @@ def _pass2_ctx(ctx: dict) -> dict:
     params["max_tokens"] = max(mt, _PASS2_MIN_MAX_TOKENS)
     out = dict(ctx)
     out["params"] = params
+    return out
+
+
+def _sanitize_profile(raw) -> dict:
+    """characters[].profile 정규화 — 인물도감용 범용 메타(Req: 장르 불문 공통 키 + 자유 traits).
+
+    알려진 키(gender/age_group/affiliation/role)는 비어있지 않은 문자열만, personality는
+    문자열 리스트, traits는 str→str dict만 통과. 근거 없는(빈) 값은 키 자체를 뺀다.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in ("gender", "age_group", "affiliation", "role"):
+        v = _opt_str(raw.get(key))
+        if v:
+            out[key] = v
+    pers = raw.get("personality")
+    if isinstance(pers, list):
+        pers = [p.strip() for p in pers if isinstance(p, str) and p.strip()]
+        if pers:
+            out["personality"] = pers[:8]
+    traits = raw.get("traits")
+    if isinstance(traits, dict):
+        clean = {str(k)[:40]: str(v)[:200] for k, v in traits.items()
+                 if v not in (None, "") and str(k).strip()}
+        if clean:
+            out["traits"] = clean
     return out
 
 
@@ -1189,6 +1178,47 @@ def _sanitize_speaker_resolution(raw) -> list[dict]:
     return out
 
 
+def _sanitize_face_reassignments(raw) -> list[dict]:
+    """Stage R face_reassignments 정규화 — [{cut, face("F0"), to_character_id|None, evidence,
+    confidence}]. face는 F라벨 문자열로 통일(정수 face_idx도 수용), (cut, face) 중복은
+    confidence 높은 쪽만 유지. 실재/동결 검증은 커밋부(_commit_suggestions)가 DB 대조로 수행."""
+    if not isinstance(raw, list):
+        return []
+    best: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        cut = _opt_int(r.get("cut"))
+        face = r.get("face")
+        if isinstance(face, bool):
+            face = None
+        elif isinstance(face, int):
+            face = f"F{face}"
+        face = _opt_str(face)
+        if cut is None or not face:
+            continue
+        face = face.upper()
+        if not face.startswith("F"):
+            face = f"F{face}"
+        if not face[1:].isdigit():
+            continue
+        item = {
+            "cut": cut,
+            "face": face,
+            "to_character_id": _opt_int(r.get("to_character_id")),
+            "evidence": _str_or_empty(r.get("evidence")),
+            "confidence": _clampf(r.get("confidence", 0)),
+        }
+        key = (cut, face)
+        if key not in best:
+            best[key] = item
+            order.append(key)
+        elif item["confidence"] > best[key]["confidence"]:
+            best[key] = item
+    return [best[k] for k in order]
+
+
 def _sanitize_beats(raw) -> list[dict]:
     out: list[dict] = []
     if not isinstance(raw, list):
@@ -1220,6 +1250,7 @@ def _sanitize_episode_meta(raw) -> dict:
         foreshadowing = [fs.strip()]
     return {
         "summary": _str_or_empty(raw.get("summary")),
+        "teaser": _str_or_empty(raw.get("teaser")),
         "appeal_point": _str_or_empty(raw.get("appeal_point")),
         "cliffhanger": _str_or_empty(raw.get("cliffhanger")),
         "foreshadowing": foreshadowing,
@@ -1266,16 +1297,46 @@ def _sanitize_threads(raw) -> list[dict]:
     return out
 
 
+def _sanitize_profiles(raw) -> list[dict]:
+    """Stage N profiles 산출 정규화 — [{character_id, profile{...}}]."""
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        cid = _opt_int(item.get("character_id"))
+        prof = _sanitize_profile(item.get("profile") if isinstance(item.get("profile"), dict) else item)
+        # key_facts는 profile 밖에 실려올 수도 있어 별도 수용.
+        kf = item.get("key_facts") or (item.get("profile") or {}).get("key_facts") if isinstance(item.get("profile"), dict) else item.get("key_facts")
+        if isinstance(kf, list):
+            kf = [str(x).strip() for x in kf if str(x).strip()]
+            if kf:
+                prof["key_facts"] = kf[:12]
+        if cid is not None and prof:
+            out.append({"character_id": cid, "profile": prof})
+    return out
+
+
 def _sanitize_resolve(result: dict) -> dict:
-    """LLM 원시 출력 → ResolveResult 계약 dict로 정규화(enum 강등, confidence 클램프, int 강제)."""
+    """Stage R 원시 출력 → 계약 dict 정규화(characters + 전수 speaker_resolution)."""
     result = result if isinstance(result, dict) else {}
     return {
         "characters": _sanitize_resolve_characters(result.get("characters")),
         "speaker_resolution": _sanitize_speaker_resolution(result.get("speaker_resolution")),
+        "face_reassignments": _sanitize_face_reassignments(result.get("face_reassignments")),
+    }
+
+
+def _sanitize_narrative(result: dict) -> dict:
+    """Stage N 원시 출력 → 계약 dict 정규화(beats/episode(teaser)/deceptions/threads/profiles)."""
+    result = result if isinstance(result, dict) else {}
+    return {
         "beats": _sanitize_beats(result.get("beats")),
         "episode": _sanitize_episode_meta(result.get("episode")),
         "deceptions": _sanitize_deceptions(result.get("deceptions")),
         "threads": _sanitize_threads(result.get("threads")),
+        "profiles": _sanitize_profiles(result.get("profiles")),
     }
 
 
@@ -1287,12 +1348,13 @@ def resolve_episode(
     webtoon_id: Optional[int] = None,
     ctx: Optional[dict] = None,
     persist_usage: bool = True,
+    run_id: Optional[int] = None,
 ) -> ResolveResult:
     """에피소드 전체 Pass-1 레코드를 텍스트 LLM 1콜로 전역 해소한다(step3b, Pass-2a).
 
     입력: 에피소드 전체 Pass-1 레코드(읽기순) + 누적 서사 컨텍스트(prior). **이미지 없이**
     텍스트 LLM으로 화자/이름/중요도를 전역 해소하고 beats/episode/deceptions/threads를 산출한다
-    (Req 2.1~2.9, 3.1~3.3). 시스템 프롬프트는 `_pass2.py` SYS 정본(`_PASS2_SYSTEM_PROMPT`).
+    (Req 2.1~2.9, 3.1~3.3). 시스템 프롬프트는 `_RESOLVE_SYSTEM_PROMPT`(Stage R, v4.0 §17.4).
 
     `ep`는 step3a 산출 `ExtractResult`(records + webtoon_episode_id 보유) 또는 webtoon_episode_id
     정수다. 정수면 `records=`로 Pass-1 레코드를 명시해야 한다(본 단계는 Pass-1을 재실행하지 않음).
@@ -1335,7 +1397,7 @@ def resolve_episode(
     err: Optional[str] = None
     for _attempt in range(_PASS2_RETRIES):
         try:
-            call = call_llm_json(call_ctx, _PASS2_SYSTEM_PROMPT, user_text, [])
+            call = call_llm_json(call_ctx, _RESOLVE_SYSTEM_PROMPT, user_text, [])
             raw_result = call.result if isinstance(call.result, dict) else {}
             usage = call.usage or {}
             err = None
@@ -1356,14 +1418,12 @@ def resolve_episode(
     if persist_usage:
         _insert_llm_usage(
             webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
-            stage=_PASS2_STAGE, image_count=None,
+            stage=_PASS2_STAGE, image_count=None, run_id=run_id,
         )
 
     logger.info(
-        "[step3.pass2] episode %s — characters=%s speaker_resolution=%s beats=%s "
-        "deceptions=%s threads=%s tokens=%s",
+        "[step3.resolve] episode %s — characters=%s speaker_resolution=%s tokens=%s",
         webtoon_episode_id, len(sanitized["characters"]), len(sanitized["speaker_resolution"]),
-        len(sanitized["beats"]), len(sanitized["deceptions"]), len(sanitized["threads"]),
         (usage or {}).get("total_tokens"),
     )
 
@@ -1371,10 +1431,7 @@ def resolve_episode(
         webtoon_episode_id=webtoon_episode_id,
         characters=sanitized["characters"],
         speaker_resolution=sanitized["speaker_resolution"],
-        beats=sanitized["beats"],
-        episode=sanitized["episode"],
-        deceptions=sanitized["deceptions"],
-        threads=sanitized["threads"],
+        face_reassignments=sanitized["face_reassignments"],
         usage=usage,
     )
 
@@ -1430,7 +1487,7 @@ def _estimate_payload_tokens(records: list["Pass1Record"], prior) -> int:
     """
     payload = _build_pass2_user_payload(records, prior)
     text = json.dumps(payload, ensure_ascii=False)
-    return int((len(text) + len(_PASS2_SYSTEM_PROMPT)) / _CHARS_PER_TOKEN)
+    return int((len(text) + len(_RESOLVE_SYSTEM_PROMPT)) / _CHARS_PER_TOKEN)
 
 
 def _active_records(records: list["Pass1Record"]) -> list["Pass1Record"]:
@@ -1595,6 +1652,7 @@ def _merge_resolve_results(
 
     - characters: character_id로 union/dedup(후속 윈도우가 refine/add), id 없는 항목은 그대로 append.
     - speaker_resolution/beats/deceptions: 순서 유지 concat(비트는 윈도우를 넘지 않음 — 허용).
+    - face_reassignments: (cut, face)로 dedup concat(윈도우는 컷을 나눠 가지므로 사실상 concat).
     - episode: 필드별 마지막 non-empty 채택, foreshadowing은 dedup concat.
     - threads: thread_id/description 키로 union(후속이 refine).
     - usage: 윈도우 토큰 합(calls=윈도우 수), error는 모든 윈도우 실패 시에만 채움.
@@ -1603,6 +1661,8 @@ def _merge_resolve_results(
     chars_order: list = []
     chars_no_id: list[dict] = []
     speaker_resolution: list[dict] = []
+    fr_by_key: dict = {}
+    fr_order: list = []
     beats: list[dict] = []
     deceptions: list[dict] = []
     thr_by_key: dict = {}
@@ -1630,6 +1690,13 @@ def _merge_resolve_results(
                 chars_by_id[cid] = dict(c)
                 chars_order.append(cid)
         speaker_resolution.extend(res.speaker_resolution or [])
+        for fr in res.face_reassignments or []:
+            key = (fr.get("cut"), fr.get("face"))
+            if key not in fr_by_key:
+                fr_by_key[key] = fr
+                fr_order.append(key)
+            elif (fr.get("confidence") or 0) > (fr_by_key[key].get("confidence") or 0):
+                fr_by_key[key] = fr
         beats.extend(res.beats or [])
         deceptions.extend(res.deceptions or [])
         for t in res.threads or []:
@@ -1667,6 +1734,7 @@ def _merge_resolve_results(
         webtoon_episode_id=webtoon_episode_id,
         characters=characters,
         speaker_resolution=speaker_resolution,
+        face_reassignments=[fr_by_key[k] for k in fr_order],
         beats=beats,
         episode=episode,
         deceptions=deceptions,
@@ -1685,8 +1753,9 @@ def resolve_episode_windowed(
     webtoon_id: Optional[int] = None,
     ctx: Optional[dict] = None,
     persist_usage: bool = True,
+    run_id: Optional[int] = None,
 ) -> ResolveResult:
-    """컨텍스트 적응형 Pass-2a 해소(step3b 진입점) — 토큰 예산에 따라 단일콜/다중윈도우 자동 선택.
+    """컨텍스트 적응형 Stage R 해소 — 토큰 예산에 따라 단일콜/다중윈도우 자동 선택.
 
     `resolve_episode`(단일 텍스트 콜)를 감싼다. 모델 토큰 예산을 해석하고(Req 8.1) 에피소드 전체
     payload 추정이 예산 이내면 **기존 단일콜 경로로 그대로 위임**(동작/결과 동일), 초과하면 레코드를
@@ -1735,6 +1804,7 @@ def resolve_episode_windowed(
         return resolve_episode(
             webtoon_episode_id, prior_context,
             records=records, webtoon_id=webtoon_id, ctx=ctx, persist_usage=persist_usage,
+            run_id=run_id,
         )
 
     # 예산 초과 → 읽기순 윈도우 분할 + belief 캐리오버.
@@ -1752,6 +1822,7 @@ def resolve_episode_windowed(
         res = resolve_episode(
             webtoon_episode_id, win_prior,
             records=win, webtoon_id=webtoon_id, ctx=ctx, persist_usage=persist_usage,
+            run_id=run_id,
         )
         window_results.append(res)
         carried = _accumulate_carried(carried, res)  # 다음 윈도우로 belief 캐리오버
@@ -1762,6 +1833,184 @@ def resolve_episode_windowed(
         )
 
     return _merge_resolve_results(webtoon_episode_id, window_results)
+
+
+# ── Stage N (서사 분석, step3b 2/2) — 정정된 트랜스크립트 입력, 이미지 없음 ──────
+
+def _build_narrative_payload(
+    records: list["Pass1Record"], resolve_result: "ResolveResult", prior,
+    id_to_name: dict[int, str],
+) -> dict:
+    """Stage N 입력 — Stage R로 화자·정체가 **정정된** 컷 트랜스크립트(v4.0 §17.4).
+
+    R의 speaker_resolution((cut,block)→character_id)과 확정 이름 테이블을 블록에 주석해,
+    N이 "누가 말했는지 확정된 상태"의 이야기를 읽게 한다. provisional 화자(spk_cid)는 R이
+    다루지 않은 블록의 폴백. 이미지/얼굴 bbox는 싣지 않는다(서사 분석에 불필요 — 토큰 절약).
+    """
+    spk_map: dict[tuple, Optional[int]] = {}
+    for sr in resolve_result.speaker_resolution or []:
+        if sr.get("cut") is not None and sr.get("block_index") is not None:
+            spk_map[(sr["cut"], sr["block_index"])] = sr.get("character_id")
+    # R characters의 확정 이름을 id_to_name 위에 덮음(이번 화 신규 확정 반영).
+    names = dict(id_to_name)
+    for c in resolve_result.characters or []:
+        if c.get("character_id") is not None and c.get("name"):
+            names[c["character_id"]] = c["name"]
+
+    cuts = []
+    for rec in records:
+        if rec.skipped or rec.error or not rec.result:
+            continue
+        res = rec.result
+        blocks = []
+        for b in res.get("blocks") or []:
+            btype = b.get("type")
+            entry = {"i": b.get("index"), "type": btype, "text": b.get("corrected_text")}
+            if btype in _SPEAKER_TYPES:
+                cid = spk_map.get((rec.cut_number, b.get("index")))
+                if cid is None:
+                    cid = (b.get("speaker") or {}).get("character_id")
+                entry["speaker_id"] = cid
+                entry["speaker"] = names.get(cid) if cid is not None else None
+            blocks.append(entry)
+        cuts.append({"cut": rec.cut_number, "summary": res.get("cut_summary"), "blocks": blocks})
+
+    payload = dict(_prior_to_dict(prior))
+    payload["characters"] = [
+        {"character_id": cid, "name": nm} for cid, nm in sorted(names.items()) if nm
+    ]
+    payload["cuts"] = cuts
+    return payload
+
+
+def narrate_episode(
+    webtoon_episode_id: int,
+    records: list["Pass1Record"],
+    resolve_result: "ResolveResult",
+    prior_context=None,
+    *,
+    webtoon_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    persist_usage: bool = True,
+    run_id: Optional[int] = None,
+) -> dict:
+    """Stage N — 서사 분석 텍스트 1콜(beats/episode(summary+teaser)/deceptions/threads/profiles).
+
+    입력은 Stage R로 정정된 트랜스크립트(§17.4 — 서사 분석이 정체 정정 **후의** 텍스트를 읽는 것이
+    R/N 분리의 핵심 이점). 실패 시 빈 dict(+error 로그)로 격리한다 — R 산출(화자)은 이미 확보돼
+    있으므로 N 실패가 화자 데이터를 잃게 하지 않는다(실패 격리).
+    """
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    if ctx is None:
+        ctx = resolve_llm_model(webtoon_id)
+    call_ctx = _pass2_ctx(ctx)
+
+    id_to_name = _webtoon_character_names(webtoon_id)
+    payload = _build_narrative_payload(records, resolve_result, prior_context, id_to_name)
+    user_text = json.dumps(payload, ensure_ascii=False)
+
+    raw_result: dict = {}
+    usage: dict = {}
+    err: Optional[str] = None
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, _NARRATIVE_SYSTEM_PROMPT, user_text, [])
+            raw_result = call.result if isinstance(call.result, dict) else {}
+            usage = call.usage or {}
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001 — 스테이지 단위 격리
+            err = str(e)
+            raw_result = {}
+
+    if err is not None:
+        logger.warning("[step3.narrative] episode %s — 서사 콜 실패(스킵): %s", webtoon_episode_id, err)
+        return {"beats": [], "episode": {}, "deceptions": [], "threads": [], "profiles": [],
+                "usage": usage, "error": err}
+
+    sanitized = _sanitize_narrative(raw_result)
+    if persist_usage:
+        _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
+                          stage=_NARRATIVE_STAGE, image_count=None, run_id=run_id)
+    logger.info(
+        "[step3.narrative] episode %s — beats=%s deceptions=%s threads=%s profiles=%s tokens=%s",
+        webtoon_episode_id, len(sanitized["beats"]), len(sanitized["deceptions"]),
+        len(sanitized["threads"]), len(sanitized["profiles"]), (usage or {}).get("total_tokens"),
+    )
+    return {**sanitized, "usage": usage, "error": None}
+
+
+def _webtoon_character_names(webtoon_id: int) -> dict[int, str]:
+    """웹툰의 명명된 인물 id→이름(클러스터 제외) — Stage N 트랜스크립트 주석용."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name FROM analysis_character
+            WHERE webtoon_id = %s AND deleted_at IS NULL AND kind = 'character' AND name <> ''
+            """,
+            (webtoon_id,),
+        )
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def resolve_and_narrate(
+    ep: "ExtractResult | int",
+    prior_context=None,
+    *,
+    records: Optional[list["Pass1Record"]] = None,
+    webtoon_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    token_budget: Optional[int] = None,
+    run_id: Optional[int] = None,
+) -> ResolveResult:
+    """step3b 진입점(v4.0 §17.4) — Stage R(정체·화자, 윈도우 가능) → Stage N(서사) 순차 2콜.
+
+    반환은 두 스테이지 산출을 합친 단일 `ResolveResult`(step3c apply 입력). R이 통째로 실패하면
+    error를 채워 반환(스킵), N만 실패하면 화자 데이터는 유지된 채 서사 필드만 빈 값(실패 격리).
+    """
+    if isinstance(ep, ExtractResult):
+        webtoon_episode_id = ep.webtoon_episode_id
+        if records is None:
+            records = ep.records
+    else:
+        webtoon_episode_id = int(ep)
+        if records is None:
+            raise ValueError("resolve_and_narrate: ep가 정수면 records= 를 명시해야 합니다")
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    if ctx is None:
+        ctx = resolve_llm_model(webtoon_id)
+
+    r = resolve_episode_windowed(
+        webtoon_episode_id, prior_context,
+        records=records, webtoon_id=webtoon_id, ctx=ctx,
+        token_budget=token_budget, run_id=run_id,
+    )
+    if r.error:
+        return r
+
+    n = narrate_episode(
+        webtoon_episode_id, records or [], r, prior_context,
+        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+    )
+    usage = dict(r.usage or {})
+    n_usage = n.get("usage") or {}
+    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        usage[k] = int(usage.get(k, 0) or 0) + int(n_usage.get(k, 0) or 0)
+
+    return ResolveResult(
+        webtoon_episode_id=webtoon_episode_id,
+        characters=r.characters,
+        speaker_resolution=r.speaker_resolution,
+        face_reassignments=r.face_reassignments,
+        beats=n.get("beats") or [],
+        episode=n.get("episode") or {},
+        deceptions=n.get("deceptions") or [],
+        threads=n.get("threads") or [],
+        profiles=n.get("profiles") or [],
+        usage=usage,
+    )
 
 
 # ── Pass-2b (결정론 커밋, step3c) ──────────────────────────────────────────────
@@ -1790,7 +2039,7 @@ def _webtoon_character_ids(webtoon_id: int) -> set[int]:
     """웹툰의 유효(미삭제) character id 집합 — speaker_id/claim FK 가드용(존재하지 않는 id 무시)."""
     with db_cursor() as cur:
         cur.execute(
-            "SELECT id FROM character WHERE webtoon_id = %s AND deleted_at IS NULL",
+            "SELECT id FROM analysis_character WHERE webtoon_id = %s AND deleted_at IS NULL",
             (webtoon_id,),
         )
         return {r[0] for r in cur.fetchall()}
@@ -1816,7 +2065,7 @@ def _episode_region_map(webtoon_episode_id: int) -> dict[tuple[int, int], int]:
         cur.execute(
             """
             SELECT wc.cut_number, tr.index, tr.id
-            FROM text_region tr
+            FROM analysis_text_region tr
             JOIN webtoon_cut wc ON tr.cut_id = wc.id
             WHERE wc.episode_id = %s AND tr.is_excluded = false
             """,
@@ -1838,23 +2087,21 @@ def _episode_no_id_map(webtoon_id: int) -> dict[int, int]:
 def _project_characters(
     webtoon_id: int, characters: list[dict], valid_ids: set[int], now: datetime,
 ) -> list[dict]:
-    """이름 테이블을 character_id 키로 투영 + significance/is_match_excluded 커밋(소급 전파의 핵심).
+    """이름/중요도 투영 + **클러스터→캐릭터 승격**(v4.0 §17.2) — 소급 전파의 핵심.
 
-    기존 `_apply_name_discoveries`의 결정론 규칙(동결·NEW_CHAR rename·동명 회피)을 character_id
-    기준으로 계승한다:
+    결정론 규칙:
       - is_confirmed=true Character는 **동결**(이름/중요도/매칭 무변경 — Property 4).
-      - 이름 확정(rename)은 confidence>=_NAME_AUTO_CONFIDENCE & 현재 이름이 NEW_CHAR placeholder &
-        동명 기존 Character 부재(또는 자기자신)일 때만. is_name_auto_assigned=true.
-      - 그 외 이름 후보는 rename 대신 **제안**(NameDiscoverySuggestion)으로 반환한다.
-      - significance는 허용 enum이면 갱신, 'extra'면 is_match_excluded=true도 함께(Property 7, 가역:
-        역방향 자동 해제는 하지 않음 — human override 허용).
-    동일 apply 내 동명 중복 rename 방지를 위해 이번 run에서 확정한 이름을 메모리로 추적한다.
+      - 명명·승격(rename+kind=character)은 confidence>=_NAME_AUTO_CONFIDENCE(0.85) &
+        현재 kind='cluster'(미명명 기계 산출물) & 동명 기존 인물 부재일 때만 자동 수행
+        (is_name_auto_assigned=true). 그 외 이름 후보는 **제안**(suggestion type=name)으로만.
+      - significance는 허용 enum이면 갱신, 'extra'면 is_match_excluded=true도 함께(Property 7,
+        가역: 역방향 자동 해제 없음 — human override 허용).
     이름은 Character 행 1곳에만 쓰므로 speaker_id FK를 통해 전 컷에 소급 반영된다(Req 5.2).
 
-    Returns: NameDiscoverySuggestion 적재 대상 [{character_id, name, confidence, evidence}].
+    Returns: suggestion(type=name) 적재 대상 [{character_id, name, confidence, evidence}].
     """
     suggestions: list[dict] = []
-    claimed_names: set[str] = set()  # 이번 apply에서 rename으로 확정한 이름(동명 중복 rename 방지)
+    claimed_names: set[str] = set()  # 이번 apply에서 확정한 이름(동명 중복 승격 방지)
     for c in characters or []:
         cid = c.get("character_id")
         if cid is None or cid not in valid_ids:
@@ -1864,54 +2111,48 @@ def _project_characters(
         conf = float(c.get("name_confidence", 0) or 0)
         evidence = c.get("evidence") or ""
 
-        # 동명 기존 Character 탐색(NEW_CHAR placeholder 제외)은 DB 커밋 전에 미리(읽기 전용).
+        # 동명 기존 인물 탐색은 DB 커밋 전에 미리(읽기 전용).
         existing = _find_character_by_name(webtoon_id, name) if name else None
 
         with db_cursor() as cur:
             cur.execute(
                 """
-                SELECT name, is_confirmed, significance, is_match_excluded
-                FROM character WHERE id = %s AND webtoon_id = %s AND deleted_at IS NULL
+                SELECT name, kind, is_confirmed, significance, is_match_excluded
+                FROM analysis_character WHERE id = %s AND webtoon_id = %s AND deleted_at IS NULL
                 """,
                 (cid, webtoon_id),
             )
             row = cur.fetchone()
             if not row:
                 continue
-            cur_name, is_confirmed, _cur_sig, cur_excl = row
+            _cur_name, cur_kind, is_confirmed, _cur_sig, cur_excl = row
             if is_confirmed:
                 continue  # 동결 — human 확정 Character는 LLM이 건드리지 않음(Property 4)
 
             sets: list[str] = []
             params: list = []
 
-            # significance 투영(Property 7). Req 10.3/10.4 — significance/is_match_excluded는
-            # confidence와 무관하게 설정하되, 이는 **가역적·human-override 가능**한 라벨이라
-            # '저신뢰 위 강한 서사 결론'(10.3)에도, '자동 확정'(10.4)에도 해당하지 않는다:
-            # extra→is_match_excluded는 가역(하드삭제 아님), 역방향 자동 해제는 하지 않으며,
-            # is_confirmed는 위에서 동결되므로 human이 언제든 덮어쓸 수 있다. 비가역·고위험 액션
-            # (이름 rename)만 confidence>=0.85로 게이팅한다(아래).
+            # significance 투영(Property 7) — 가역적·human-override 가능 라벨.
             if sig in _SIGNIFICANCE:
                 sets.append("significance = %s")
                 params.append(sig)
                 if sig == "extra" and not cur_excl:
                     sets.append("is_match_excluded = true")
 
-            # 이름 rename(결정론 규칙 계승). Req 10.3/10.4 — rename은 유일한 비가역 식별 액션이므로
-            # confidence>=_NAME_AUTO_CONFIDENCE(0.85) & NEW_CHAR placeholder & 동명 부재일 때만
-            # 자동 수행하고, 그 외(저신뢰 포함)는 rename하지 않고 **제안**(NameDiscoverySuggestion)으로만
-            # 둔다(저신뢰 이름 위 강한 결론 금지 / 자동 확정 금지).
-            if name and not name.startswith("NEW_CHAR_"):
+            # 명명·승격 — 유일한 비가역성 식별 액션이므로 고신뢰 + 클러스터 + 동명 부재일 때만
+            # 자동 수행하고, 그 외는 suggestion(type=name)으로만 둔다(Req 10.3/10.4).
+            if name:
                 dup_in_run = name.lower() in claimed_names
-                can_rename = (
+                can_promote = (
                     conf >= _NAME_AUTO_CONFIDENCE
-                    and (cur_name or "").startswith("NEW_CHAR_")
+                    and cur_kind == "cluster"
                     and (existing is None or existing == cid)
                     and not dup_in_run
                 )
-                if can_rename:
+                if can_promote:
                     sets.append("name = %s")
                     params.append(name[:64])
+                    sets.append("kind = 'character'")
                     sets.append("is_name_auto_assigned = true")
                     claimed_names.add(name.lower())
                 else:
@@ -1925,37 +2166,195 @@ def _project_characters(
                 params.append(now)
                 params.append(cid)
                 cur.execute(
-                    f"UPDATE character SET {', '.join(sets)} WHERE id = %s", params,
+                    f"UPDATE analysis_character SET {', '.join(sets)} WHERE id = %s", params,
                 )
     return suggestions
 
 
-def _commit_name_suggestions(
-    webtoon_id: int, episode_id: int, suggestions: list[dict], now: datetime,
-) -> None:
-    """NameDiscoverySuggestion 적재 — 이 에피소드 스코프 clear-and-reinsert로 멱등.
+def _episode_face_detection_map(webtoon_episode_id: int) -> dict[tuple[int, int], dict]:
+    """에피소드의 (cut_number, face_idx) → 얼굴 현황 — face_reassign 제안의 대상 해석용.
 
-    source_episode_id로 이 에피소드가 만든 제안만 지우고 재적재한다(자연 unique 키 부재 →
-    스코프 delete-reinsert가 가장 단순한 멱등 전략). evidence는 jsonb 리스트로 적재.
+    detection_id(suggestion FK), 현재 배정 character_id(human>step2 우선 — `_load_faces`와 동일
+    해석), confirmed(human 배정 여부 — 동결 대상 판별)를 담는다.
     """
     with db_cursor() as cur:
         cur.execute(
-            "DELETE FROM name_discovery_suggestion WHERE source_episode_id = %s",
+            """
+            SELECT wc.cut_number, fr.face_idx, fr.id, c.id, (fi.source = 'human') AS confirmed
+            FROM analysis_face_detection fr
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            LEFT JOIN LATERAL (
+                SELECT source, appearance_id
+                FROM analysis_face_identity
+                WHERE detection_id = fr.id AND deleted_at IS NULL
+                ORDER BY source ASC
+                LIMIT 1
+            ) fi ON true
+            LEFT JOIN analysis_character_appearance ca ON fi.appearance_id = ca.id
+            LEFT JOIN analysis_character c ON ca.character_id = c.id
+            WHERE wc.episode_id = %s AND fr.is_used = true
+            """,
+            (webtoon_episode_id,),
+        )
+        return {
+            (r[0], r[1]): {"detection_id": r[2], "character_id": r[3], "confirmed": bool(r[4])}
+            for r in cur.fetchall()
+        }
+
+
+def _commit_suggestions(
+    webtoon_id: int, episode_id: int, name_suggestions: list[dict],
+    characters: list[dict], now: datetime, run_id: Optional[int] = None,
+    face_reassignments: Optional[list[dict]] = None,
+    face_map: Optional[dict] = None, valid_ids: Optional[set[int]] = None,
+) -> int:
+    """AI 제안을 통합 `suggestion` 큐에 적재(v4.0 §17.2) — 에피소드 스코프 pending 재적재로 멱등.
+
+    적재 대상:
+      - name: `_project_characters`가 자동 승격하지 않은 이름 후보.
+      - merge: Stage R characters[].merge_suggestion(자동 병합 금지 — 제안만, Req 10.4).
+      - label_conflict: Stage R characters[].label_conflict(얼굴 라벨↔대사 충돌, 인물 단위 —
+        특정 얼굴을 못 짚은 의심 신호. 자동 face_identity 변경은 하지 않는다).
+      - face_reassign: Stage R face_reassignments(얼굴 단위 — detection_id로 대상 고정, 수락 시
+        service가 human FaceIdentity를 생성). human 확정(confirmed) 얼굴·실재하지 않는 (cut,face)·
+        현재 배정과 동일한 제안은 버린다. to_character_id가 웹툰에 없는 id면 null로 강등
+        ("현재 배정이 틀렸다" 신호만 유지).
+    이 에피소드가 만든 pending 제안만 지우고 재적재한다(수락/거부된 것은 보존 — human 판단 존중).
+    """
+    inserted = 0
+    face_map = face_map or {}
+    valid_ids = valid_ids or set()
+    with db_cursor() as cur:
+        cur.execute(
+            "DELETE FROM analysis_suggestion WHERE episode_id = %s AND status = 'pending'",
             (episode_id,),
         )
-        for s in suggestions:
-            ev = s.get("evidence")
-            ev_list = [ev] if isinstance(ev, str) and ev.strip() else (ev if isinstance(ev, list) else [])
+
+        def _insert(stype: str, character_id, payload: dict, confidence,
+                    detection_id=None, cut=None) -> None:
+            nonlocal inserted
             cur.execute(
                 """
-                INSERT INTO name_discovery_suggestion
-                    (webtoon_id, character_id, appearance_id, name, confidence, evidence,
-                     source_episode_id, source_cut, status, created_at, updated_at)
-                VALUES (%s, %s, NULL, %s, %s, %s, %s, NULL, 'pending', %s, %s)
+                INSERT INTO analysis_suggestion
+                    (webtoon_id, type, character_id, detection_id, episode_id, cut,
+                     payload, confidence, run_id, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
                 """,
-                (webtoon_id, s["character_id"], (s["name"] or "")[:64],
-                 s.get("confidence"), Json(ev_list), episode_id, now, now),
+                (webtoon_id, stype, character_id, detection_id, episode_id, cut,
+                 Json(payload), confidence, run_id, now, now),
             )
+            inserted += 1
+
+        for sug in name_suggestions or []:
+            ev = sug.get("evidence")
+            ev_list = [ev] if isinstance(ev, str) and ev.strip() else (ev if isinstance(ev, list) else [])
+            _insert("name", sug["character_id"],
+                    {"name": (sug.get("name") or "")[:64], "evidence": ev_list},
+                    sug.get("confidence"))
+
+        for c in characters or []:
+            cid = c.get("character_id")
+            if cid is None:
+                continue
+            merge = c.get("merge_suggestion") or []
+            if merge:
+                _insert("merge", cid,
+                        {"other_character_ids": merge, "evidence": c.get("evidence") or ""},
+                        c.get("name_confidence"))
+            conflict = c.get("label_conflict")
+            if conflict:
+                _insert("label_conflict", cid, {"description": conflict}, None)
+
+        for fr in face_reassignments or []:
+            face = fr.get("face") or ""
+            try:
+                face_idx = int(face[1:])
+            except (TypeError, ValueError):
+                continue
+            target = face_map.get((fr.get("cut"), face_idx))
+            if not target or target["confirmed"]:
+                continue  # 실재하지 않는 얼굴(모델 착오) / human 확정 얼굴은 동결(Property 4)
+            to_cid = fr.get("to_character_id")
+            if to_cid is not None and to_cid not in valid_ids:
+                to_cid = None
+            if to_cid == target["character_id"]:
+                continue  # 현재 배정과 동일 — 재배정 아님
+            if to_cid is None and target["character_id"] is None:
+                continue  # 미배정 얼굴 + 대상 미상 — 액션 불가한 제안
+            _insert("face_reassign", target["character_id"],
+                    {"to_character_id": to_cid, "evidence": fr.get("evidence") or ""},
+                    fr.get("confidence"),
+                    detection_id=target["detection_id"], cut=fr.get("cut"))
+    return inserted
+
+
+def _commit_profiles(
+    webtoon_id: int, profiles: list[dict], valid_ids: set[int], now: datetime,
+    run_id: Optional[int] = None,
+) -> int:
+    """Stage N profiles → `character_profile` llm 행 병합 upsert(v4.0 §17.2).
+
+    human 행은 절대 건드리지 않는다(source 레이어링 — 서빙이 필드 단위 human 우선 병합).
+    스칼라는 최신값 우선, personality는 합집합(캡 8), traits는 dict 병합, key_facts는
+    append-dedup(캡 12) — 인물의 누적 사실 저장처(구 narrative_state key_facts 흡수).
+    """
+    updated = 0
+    with db_cursor() as cur:
+        for item in profiles or []:
+            cid = item.get("character_id")
+            prof = item.get("profile") or {}
+            if cid is None or cid not in valid_ids or not prof:
+                continue
+            cur.execute(
+                """
+                SELECT gender, age_group, affiliation, role, personality, traits, key_facts
+                FROM analysis_character_profile
+                WHERE character_id = %s AND source = 'llm' AND deleted_at IS NULL
+                """,
+                (cid,),
+            )
+            row = cur.fetchone()
+            cur_vals = {
+                "gender": row[0] if row else "", "age_group": row[1] if row else "",
+                "affiliation": row[2] if row else "", "role": row[3] if row else "",
+                "personality": (row[4] if row and isinstance(row[4], list) else []),
+                "traits": (row[5] if row and isinstance(row[5], dict) else {}),
+                "key_facts": (row[6] if row and isinstance(row[6], list) else []),
+            }
+            merged = dict(cur_vals)
+            for k in ("gender", "age_group", "affiliation", "role"):
+                if prof.get(k):
+                    merged[k] = str(prof[k])[:256 if k == "role" else 128]
+            for p in prof.get("personality") or []:
+                if p not in merged["personality"]:
+                    merged["personality"].append(p)
+            merged["personality"] = merged["personality"][-8:]
+            merged["traits"] = {**merged["traits"], **(prof.get("traits") or {})}
+            for f in prof.get("key_facts") or []:
+                if f not in merged["key_facts"]:
+                    merged["key_facts"].append(f)
+            merged["key_facts"] = merged["key_facts"][-12:]
+
+            cur.execute(
+                """
+                INSERT INTO analysis_character_profile
+                    (character_id, source, gender, age_group, affiliation, role,
+                     personality, traits, key_facts, run_id, created_at, updated_at)
+                VALUES (%s, 'llm', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT ON CONSTRAINT uniq_character_profile_character_source
+                DO UPDATE SET gender = EXCLUDED.gender, age_group = EXCLUDED.age_group,
+                              affiliation = EXCLUDED.affiliation, role = EXCLUDED.role,
+                              personality = EXCLUDED.personality, traits = EXCLUDED.traits,
+                              key_facts = EXCLUDED.key_facts, run_id = EXCLUDED.run_id,
+                              deleted_at = NULL, updated_at = EXCLUDED.updated_at
+                """,
+                (cid, merged["gender"][:16], merged["age_group"][:16],
+                 merged["affiliation"][:128], merged["role"][:256],
+                 Json(merged["personality"]), Json(merged["traits"]),
+                 Json(merged["key_facts"]), run_id, now, now),
+            )
+            updated += 1
+    return updated
 
 
 def _commit_speaker_resolution(
@@ -1970,9 +2369,13 @@ def _commit_speaker_resolution(
     - speech/monologue 해소: character_id 유효 & confidence>=임계값인 (cut, block_index)의 region을
       찾아 source='llm' 주석의 speaker_id + resolution_status='resolved' 설정(단방향). 임계값 미만/
       무효 id는 provisional 유지(Req 10.3). source='human'은 절대 갱신 안 함(동결 — Property 4).
+    - **provisional 화자 승격(2026-07-05)**: Pass-2a가 명시 해소하지 않았지만 Pass-1이 얼굴 기반으로
+      확신해 영속한 provisional speaker_id가 남아있는 speech/monologue 블록은 그 화자로 resolved
+      승격한다. Pass-2a가 일부 블록을 빠뜨려도(전수 테이블 미준수) 얼굴 근거 화자가 유실되지 않는
+      안전망 — 종전엔 이 유실이 화자 매칭률 1~2%의 주원인이었다.
     - 화자없는 블록(narration/system/other)은 speaker 없이 resolved로 전이(명시적 화자 없음 —
       Property 6). 역시 source='llm'만.
-    Returns: speaker_id가 실제 커밋된 블록 수.
+    Returns: speaker_id가 실제 커밋된 블록 수(명시 해소 + provisional 승격).
     """
     resolved = 0
     with db_cursor() as cur:
@@ -1990,7 +2393,7 @@ def _commit_speaker_resolution(
                 continue
             cur.execute(
                 """
-                UPDATE text_annotation
+                UPDATE analysis_text_annotation
                 SET speaker_id = %s, resolution_status = 'resolved', updated_at = %s
                 WHERE region_id = %s AND source = 'llm'
                 """,
@@ -1998,12 +2401,36 @@ def _commit_speaker_resolution(
             )
             resolved += cur.rowcount or 0
 
+        # provisional 화자 승격 — Pass-2a가 다루지 않은 speech/monologue 중 Pass-1 화자 보유 블록.
+        cur.execute(
+            """
+            UPDATE analysis_text_annotation ta
+            SET resolution_status = 'resolved', updated_at = %s
+            FROM analysis_text_region tr
+            JOIN webtoon_cut wc ON tr.cut_id = wc.id
+            WHERE ta.region_id = tr.id
+              AND wc.episode_id = %s
+              AND ta.source = 'llm'
+              AND ta.type = ANY(%s)
+              AND ta.speaker_id IS NOT NULL
+              AND ta.resolution_status <> 'resolved'
+            """,
+            (now, webtoon_episode_id, list(_SPEAKER_TYPES)),
+        )
+        promoted = cur.rowcount or 0
+        if promoted:
+            logger.info(
+                "[step3.apply] episode %s — provisional 화자 %s블록 resolved 승격(Pass-1 얼굴 근거)",
+                webtoon_episode_id, promoted,
+            )
+        resolved += promoted
+
         # 화자없는 블록 일괄 resolved(speaker NULL) — 에피소드 스코프, source='llm'만.
         cur.execute(
             """
-            UPDATE text_annotation ta
+            UPDATE analysis_text_annotation ta
             SET resolution_status = 'resolved', updated_at = %s
-            FROM text_region tr
+            FROM analysis_text_region tr
             JOIN webtoon_cut wc ON tr.cut_id = wc.id
             WHERE ta.region_id = tr.id
               AND wc.episode_id = %s
@@ -2022,7 +2449,8 @@ def _beat_stable_key(cut_start, cut_end, hook_type: str) -> str:
     return f"{cut_start}:{cut_end}:{hook}"[:128]
 
 
-def _commit_beats(webtoon_episode_id: int, beats: list[dict], now: datetime) -> int:
+def _commit_beats(webtoon_episode_id: int, beats: list[dict], now: datetime,
+                  run_id: Optional[int] = None) -> int:
     """EpisodeBeat 커밋 — stable_key upsert + 이번 결과에 없는 stale 비트 삭제(결정론 집합).
 
     stable_key = f(cut_start, cut_end, hook)로 동일 결과 재적용 시 동일 행을 in-place 갱신(멱등).
@@ -2040,51 +2468,56 @@ def _commit_beats(webtoon_episode_id: int, beats: list[dict], now: datetime) -> 
             keys.append(key)
             cur.execute(
                 """
-                INSERT INTO episode_beat
+                INSERT INTO analysis_episode_beat
                     (episode_id, cut_start, cut_end, hook_type, appeal_point, intensity,
-                     stable_key, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     stable_key, run_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (episode_id, stable_key)
                 DO UPDATE SET cut_start = EXCLUDED.cut_start, cut_end = EXCLUDED.cut_end,
                               hook_type = EXCLUDED.hook_type, appeal_point = EXCLUDED.appeal_point,
-                              intensity = EXCLUDED.intensity, updated_at = EXCLUDED.updated_at
+                              intensity = EXCLUDED.intensity, run_id = EXCLUDED.run_id,
+                              updated_at = EXCLUDED.updated_at
                 """,
                 (webtoon_episode_id, cs, ce, hook, b.get("appeal_point") or "",
-                 b.get("intensity"), key, now, now),
+                 b.get("intensity"), key, run_id, now, now),
             )
         # 이번 결과에 없는 stale 비트 제거 → 비트 집합이 result의 순수 함수(멱등).
         if keys:
             cur.execute(
-                "DELETE FROM episode_beat WHERE episode_id = %s AND stable_key <> ALL(%s)",
+                "DELETE FROM analysis_episode_beat WHERE episode_id = %s AND stable_key <> ALL(%s)",
                 (webtoon_episode_id, keys),
             )
         else:
-            cur.execute("DELETE FROM episode_beat WHERE episode_id = %s", (webtoon_episode_id,))
+            cur.execute("DELETE FROM analysis_episode_beat WHERE episode_id = %s", (webtoon_episode_id,))
     return len(keys)
 
 
 def _commit_episode_report(
     webtoon_episode_id: int, episode: dict, character_timeline: list[dict], now: datetime,
+    run_id: Optional[int] = None,
 ) -> None:
-    """EpisodeReport OneToOne upsert(episode_id 충돌) — summary/appeal/cliffhanger/foreshadowing/타임라인."""
+    """EpisodeReport OneToOne upsert — summary/**teaser**/appeal/cliffhanger/foreshadowing/타임라인."""
     ep = episode or {}
     with db_cursor() as cur:
         cur.execute(
             """
-            INSERT INTO episode_report
-                (episode_id, summary, appeal_point, cliffhanger, foreshadowing,
-                 character_timeline, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO analysis_episode_report
+                (episode_id, summary, teaser, appeal_point, cliffhanger, foreshadowing,
+                 character_timeline, run_id, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (episode_id)
-            DO UPDATE SET summary = EXCLUDED.summary, appeal_point = EXCLUDED.appeal_point,
+            DO UPDATE SET summary = EXCLUDED.summary, teaser = EXCLUDED.teaser,
+                          appeal_point = EXCLUDED.appeal_point,
                           cliffhanger = EXCLUDED.cliffhanger,
                           foreshadowing = EXCLUDED.foreshadowing,
                           character_timeline = EXCLUDED.character_timeline,
+                          run_id = EXCLUDED.run_id,
                           updated_at = EXCLUDED.updated_at
             """,
-            (webtoon_episode_id, ep.get("summary") or "", ep.get("appeal_point") or "",
+            (webtoon_episode_id, ep.get("summary") or "", ep.get("teaser") or "",
+             ep.get("appeal_point") or "",
              ep.get("cliffhanger") or "", Json(ep.get("foreshadowing") or []),
-             Json(character_timeline), now, now),
+             Json(character_timeline), run_id, now, now),
         )
 
 
@@ -2095,6 +2528,7 @@ def _commit_threads(
     no_id_map: dict[int, int],
     threads: list[dict],
     now: datetime,
+    run_id: Optional[int] = None,
 ) -> int:
     """NarrativeThread 커밋(webtoon 글로벌, plant→payoff). 멱등 전략:
 
@@ -2110,7 +2544,7 @@ def _commit_threads(
     inserted = 0
     with db_cursor() as cur:
         cur.execute(
-            "DELETE FROM narrative_thread WHERE webtoon_id = %s AND planted_episode_id = %s",
+            "DELETE FROM analysis_narrative_thread WHERE webtoon_id = %s AND planted_episode_id = %s",
             (webtoon_id, this_ep_id),
         )
         for t in threads or []:
@@ -2134,7 +2568,7 @@ def _commit_threads(
                     continue
                 cur.execute(
                     """
-                    SELECT id FROM narrative_thread
+                    SELECT id FROM analysis_narrative_thread
                     WHERE webtoon_id = %s AND lower(btrim(description)) = lower(btrim(%s))
                     ORDER BY id ASC LIMIT 1
                     """,
@@ -2144,7 +2578,7 @@ def _commit_threads(
                 if m:
                     cur.execute(
                         """
-                        UPDATE narrative_thread
+                        UPDATE analysis_narrative_thread
                         SET status = 'resolved', resolved_episode_id = %s, resolved_cut = %s,
                             confidence = COALESCE(%s, confidence), updated_at = %s
                         WHERE id = %s
@@ -2156,52 +2590,30 @@ def _commit_threads(
                 planted_id = no_id_map.get(planted_no) if planted_no is not None else None
                 cur.execute(
                     """
-                    INSERT INTO narrative_thread
+                    INSERT INTO analysis_narrative_thread
                         (webtoon_id, description, type, status, planted_episode_id, planted_cut,
-                         resolved_episode_id, resolved_cut, confidence, created_at, updated_at)
-                    VALUES (%s, %s, %s, 'resolved', %s, %s, %s, %s, %s, %s, %s)
+                         resolved_episode_id, resolved_cut, confidence, run_id, created_at, updated_at)
+                    VALUES (%s, %s, %s, 'resolved', %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (webtoon_id, desc, ttype, planted_id, planted_cut,
-                     resolved_id or this_ep_id, resolved_cut, conf, now, now),
+                     resolved_id or this_ep_id, resolved_cut, conf, run_id, now, now),
                 )
                 inserted += 1
             else:
                 # 이번 화에 심은 떡밥(open 또는 동일 화 내 resolved) → 재적재.
                 cur.execute(
                     """
-                    INSERT INTO narrative_thread
+                    INSERT INTO analysis_narrative_thread
                         (webtoon_id, description, type, status, planted_episode_id, planted_cut,
-                         resolved_episode_id, resolved_cut, confidence, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         resolved_episode_id, resolved_cut, confidence, run_id, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (webtoon_id, desc, ttype, status, this_ep_id, planted_cut,
                      resolved_id if status == "resolved" else None,
-                     resolved_cut if status == "resolved" else None, conf, now, now),
+                     resolved_cut if status == "resolved" else None, conf, run_id, now, now),
                 )
                 inserted += 1
     return inserted
-
-
-def _normalize_threads_for_fold(threads: list[dict], this_ep_no: int) -> list[dict]:
-    """`narrative_context.fold` 입력용 threads를 `_commit_threads`가 실제 커밋한 값과 일치시킨다.
-
-    `_commit_threads`는 status='resolved'이면서 이번 화에 심긴 게 아닌 경우를 제외하면(주로
-    이번 화에 새로 심긴 open 떡밥), LLM이 뭐라 답했든 `planted_episode_id`를 **항상 이번 화**로
-    저장한다(위 함수의 else 분기). 이 정규화 없이 `result.threads`(LLM 원본)를 그대로 fold에
-    넘기면, DB(narrative_thread)와 캐시(webtoon_narrative_state.open_threads)의 planted_episode가
-    서로 어긋나 다음 화 프롬프트에 잘못된 값이 그대로 흘러간다(예: 최초 처리 화에서 LLM이
-    `planted_episode=1`을 반환했는데 실제로는 2화였던 경우).
-    """
-    normalized = []
-    for t in threads or []:
-        t = dict(t)
-        planted_no = t.get("planted_episode")
-        status = t.get("status") or "open"
-        planted_here = planted_no is None or planted_no == this_ep_no
-        if not (status == "resolved" and not planted_here):
-            t["planted_episode"] = this_ep_no
-        normalized.append(t)
-    return normalized
 
 
 def _commit_claims(
@@ -2210,6 +2622,7 @@ def _commit_claims(
     deceptions: list[dict],
     valid_ids: set[int],
     now: datetime,
+    run_id: Optional[int] = None,
 ) -> int:
     """CharacterClaim 커밋(deceptions) — 이 에피소드 컷 스코프 clear-and-reinsert로 멱등.
 
@@ -2221,7 +2634,7 @@ def _commit_claims(
     with db_cursor() as cur:
         cur.execute(
             """
-            DELETE FROM character_claim
+            DELETE FROM analysis_character_claim
             WHERE cut_id IN (SELECT id FROM webtoon_cut WHERE episode_id = %s)
             """,
             (webtoon_episode_id,),
@@ -2235,41 +2648,46 @@ def _commit_claims(
                 cid = None
             cur.execute(
                 """
-                INSERT INTO character_claim
+                INSERT INTO analysis_character_claim
                     (cut_id, character_id, claim, contradicts, is_deception, confidence,
-                     created_at, updated_at)
-                VALUES (%s, %s, %s, %s, true, %s, %s, %s)
+                     run_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, true, %s, %s, %s, %s)
                 """,
                 (cut_id, cid, d.get("claim") or "", d.get("contradicts") or "",
-                 d.get("confidence"), now, now),
+                 d.get("confidence"), run_id, now, now),
             )
             inserted += 1
     return inserted
 
 
 def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
-                     webtoon_id: Optional[int] = None) -> dict:
-    """Pass-2a `ResolveResult`를 에피소드 전체 DB에 결정론적으로 투영·커밋한다(step3c, **LLM 없음**).
+                     webtoon_id: Optional[int] = None,
+                     run_id: Optional[int] = None,
+                     refresh_suggestions: bool = True) -> dict:
+    """R+N `ResolveResult`를 에피소드 전체 DB에 결정론적으로 투영·커밋한다(step3c, **LLM 없음**).
 
-    소급 전파(Req 5.2)·멱등(Req 5.3)·동결(Req 5.4/3.4)을 보장한다. 커밋 대상:
-      1) characters → Character.name/significance(+extra⇒is_match_excluded) 투영 + 잔여 이름 후보는
-         NameDiscoverySuggestion. 이름은 Character 1행에만 저장되고 speaker_id FK 조인으로 전 컷에
-         **소급** 반영된다(별도 per-cut 이름 쓰기 없음). merge_suggestion(병합 후보)은 **자동 수행하지
-         않고**(Req 10.4) character_timeline에 실어 human 검토용으로만 영속한다.
+    `refresh_suggestions=False`는 reapply(LLM 없는 재투영) 전용 — suggestion 큐를 건드리지
+    않는다. 큐 원료 일부(name 후보 confidence, face_reassignments)는 스냅샷에 비영속이라
+    재투영 시 delete-reinsert하면 직전 run의 pending 제안이 유실되기 때문.
+
+    소급 전파(Req 5.2)·멱등(Req 5.3)·동결(Req 5.4/3.4)을 보장한다. 커밋 대상(v4.0 §17.4):
+      1) characters → 명명·승격(kind=character)/significance 투영 + 잔여 이름 후보/병합/충돌은
+         통합 suggestion 큐로. 이름은 Character 1행에만 저장되고 speaker_id FK 조인으로 전 컷에
+         **소급** 반영된다. 자동 병합/자동 얼굴 재배정은 하지 않는다(제안만 — Req 10.4).
       2) speaker_resolution → TextAnnotation.speaker_id + resolution_status='resolved'(임계값 이상),
-         화자없는 블록(narration/system/other)은 speaker 없이 resolved.
-      3) beats → EpisodeBeat(stable_key upsert), 4) episode → EpisodeReport(OneToOne upsert),
-      5) threads → NarrativeThread(plant/resolve), 6) deceptions → CharacterClaim.
+         provisional 화자 승격 안전망, 화자없는 블록(narration/system/other) resolved.
+      3) beats → EpisodeBeat, 4) episode → EpisodeReport(summary+teaser),
+      5) threads → NarrativeThread, 6) deceptions → CharacterClaim,
+      7) profiles → CharacterProfile llm 행 병합(human 행 불가침).
+    모든 산출물에 run_id를 귀속시킨다(§17.1 — 서빙/폐기 단위).
 
     동결: source='human' 주석과 is_confirmed=true Character는 절대 변경하지 않는다(Property 4).
-    멱등: 모든 쓰기는 upsert/안정키/스코프 delete-reinsert(Property 3).
+    진행/stale 마킹은 하지 않는다 — run 원장에서 도출(§17.1).
 
     `ep`는 step3a 산출 `ExtractResult` 또는 webtoon_episode_id 정수. `result.error`가 있으면(해소
     실패) 아무것도 커밋하지 않고 빈 meta를 반환한다.
 
-    Returns: `narrative_context.fold` 입력으로 쓴 **episode_meta** dict. 본 함수는 모든 커밋 후
-    `narrative_context.fold`로 누적 서사 상태(WebtoonNarrativeState)를 갱신하고 `persist_state`로
-    캐시에 영속화한다(Req 11.4). `result.error`로 스킵된 에피소드는 fold/persist하지 않는다.
+    Returns: 커밋 통계 episode_meta dict(액티비티 반환/run stats용).
     """
     if isinstance(ep, ExtractResult):
         webtoon_episode_id = ep.webtoon_episode_id
@@ -2283,7 +2701,7 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
 
-    # 해소 실패(빈 결과) → 커밋 없이 fold용 빈 meta 반환(run 유지 — Req 7.4).
+    # 해소 실패(빈 결과) → 커밋 없이 빈 meta 반환(run 유지 — Req 7.4).
     if result is None or getattr(result, "error", None):
         logger.warning(
             "[step3.apply] episode %s — ResolveResult error/none, 커밋 스킵: %s",
@@ -2292,7 +2710,6 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
         return {
             "webtoon_id": webtoon_id, "episode_no": episode_no,
             "episode_id": webtoon_episode_id,
-            "characters": [], "threads": [], "episode": {},
             "stats": {"skipped": True},
         }
 
@@ -2302,23 +2719,32 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
     region_map = _episode_region_map(webtoon_episode_id)
     no_id_map = _episode_no_id_map(webtoon_id)
 
-    # 1) 이름 테이블 투영(소급) + 잔여 제안 적재.
-    suggestions = _project_characters(webtoon_id, result.characters, valid_ids, now)
-    _commit_name_suggestions(webtoon_id, webtoon_episode_id, suggestions, now)
+    # 1) 이름·승격 투영(소급) + 통합 suggestion 큐 적재(name/merge/label_conflict/face_reassign).
+    #    refresh_suggestions=False(reapply)면 큐를 건드리지 않는다 — 재투영은 LLM 산출이 아니므로
+    #    직전 run이 만든 pending 제안(특히 name/face_reassign — 스냅샷에 비영속)을 지우면 안 된다.
+    name_suggestions = _project_characters(webtoon_id, result.characters, valid_ids, now)
+    if refresh_suggestions:
+        face_map = (
+            _episode_face_detection_map(webtoon_episode_id)
+            if result.face_reassignments else {}
+        )
+        n_suggestions = _commit_suggestions(
+            webtoon_id, webtoon_episode_id, name_suggestions, result.characters, now, run_id,
+            face_reassignments=result.face_reassignments,
+            face_map=face_map, valid_ids=valid_ids,
+        )
+    else:
+        n_suggestions = 0
 
-    # 2) 화자 해소 커밋 + 화자없는 블록 resolved.
+    # 2) 화자 해소 커밋 + provisional 승격 + 화자없는 블록 resolved.
     n_speakers = _commit_speaker_resolution(
         webtoon_episode_id, region_map, result.speaker_resolution, valid_ids, now,
     )
 
     # 3) 비트.
-    n_beats = _commit_beats(webtoon_episode_id, result.beats, now)
+    n_beats = _commit_beats(webtoon_episode_id, result.beats, now, run_id)
 
-    # 4) 회차 리포트(인물 타임라인 = characters 요약).
-    # Req 10.4 — 자동 병합은 **절대 수행하지 않는다**. merge_suggestion(같은 인물로 보이는 다른
-    # character_id 후보)은 label_conflict와 동일 범주의 **advisory 식별 신호**이므로, 자동 Character
-    # 병합 대신 character_timeline에 그대로 실어 human이 검토·확정하게 한다(제안만). 어디에서도
-    # Character 행을 병합/삭제하지 않는다. EpisodeReport는 OneToOne 덮어쓰기라 재적용에도 멱등.
+    # 4) 회차 리포트(인물 타임라인 = characters 요약 — 검토 UI/재적용 재구성용 스냅샷).
     character_timeline = [
         {"character_id": c.get("character_id"), "name": c.get("name"),
          "significance": c.get("significance"), "evidence": c.get("evidence") or "",
@@ -2326,263 +2752,41 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
          "merge_suggestion": c.get("merge_suggestion") or []}
         for c in (result.characters or []) if c.get("character_id") is not None
     ]
-    _commit_episode_report(webtoon_episode_id, result.episode, character_timeline, now)
+    _commit_episode_report(webtoon_episode_id, result.episode, character_timeline, now, run_id)
 
     # 5) 떡밥(threads).
     n_threads = _commit_threads(
-        webtoon_id, webtoon_episode_id, episode_no, no_id_map, result.threads, now,
+        webtoon_id, webtoon_episode_id, episode_no, no_id_map, result.threads, now, run_id,
     )
 
     # 6) 거짓/책략(deceptions → claims).
-    n_claims = _commit_claims(webtoon_episode_id, cut_map, result.deceptions, valid_ids, now)
+    n_claims = _commit_claims(webtoon_episode_id, cut_map, result.deceptions, valid_ids, now, run_id)
 
-    logger.info(
-        "[step3.apply] episode %s — speakers=%s beats=%s suggestions=%s threads=%s claims=%s",
-        webtoon_episode_id, n_speakers, n_beats, len(suggestions), n_threads, n_claims,
-    )
+    # 7) 인물도감 프로필(llm 행 병합 — human 불가침).
+    n_profiles = _commit_profiles(webtoon_id, result.profiles, valid_ids, now, run_id)
 
-    # fold 입력 episode_meta(= 영속 projection). 커밋이 모두 끝난 뒤 누적 서사 상태 갱신에 사용.
-    episode_meta = {
+    stats = {
+        "speakers_resolved": n_speakers,
+        "beats": n_beats,
+        "suggestions": n_suggestions,
+        "threads": n_threads,
+        "claims": n_claims,
+        "profiles": n_profiles,
+    }
+    logger.info("[step3.apply] episode %s — %s", webtoon_episode_id, stats)
+
+    return {
         "webtoon_id": webtoon_id,
         "episode_no": episode_no,
         "episode_id": webtoon_episode_id,
-        "characters": result.characters,
-        "threads": _normalize_threads_for_fold(result.threads, episode_no),
-        "episode": result.episode,
-        "stats": {
-            "speakers_resolved": n_speakers,
-            "beats": n_beats,
-            "name_suggestions": len(suggestions),
-            "threads": n_threads,
-            "claims": n_claims,
-        },
+        "stats": stats,
     }
 
-    # task 8.2 — apply 후 누적 서사 상태(WebtoonNarrativeState) 갱신(Req 11.4).
-    # 현재 캐시 상태 로드 → fold(PURE, DB I/O 없음)로 state(N) 산출 → persist_state로 캐시 upsert.
-    # last_resolved_episode_id는 webtoon_episode.id(episode_meta['episode_id'])로 FK 설정.
-    # 이 경로는 result.error/None 조기반환 이후에만 도달하므로 스킵된 에피소드는 fold하지 않는다.
-    prior_state = narrative_context.NarrativeState.from_dict(
-        narrative_context._load_narrative_state(webtoon_id), webtoon_id=webtoon_id,
-    )
-    new_state = narrative_context.fold(prior_state, episode_meta)
-    narrative_context.persist_state(
-        webtoon_id, new_state, last_resolved_episode_id=webtoon_episode_id,
-    )
 
-    return episode_meta
-
-
-# ── 진입점 ────────────────────────────────────────────────────────────────────
-
-def analyze_cut_scene(
-    source: str, title_id: str, episode_no: int, webtoon_episode_id: int,
-    cut_number: int, prev_context: str,
-) -> str:
-    """컷 N을 LLM으로 분석·저장하고 다음 컷용 prev_context를 반환."""
-    cut_id = _cut_id(webtoon_episode_id, cut_number)
-    if cut_id is None:
-        return prev_context
-
-    webtoon_id = _get_webtoon_id(webtoon_episode_id)
-    ctx = resolve_llm_model(webtoon_id)
-
-    regions = _load_regions(cut_id)
-    faces = _load_faces(cut_id)
-
-    cur_img = fetch_cut_image(source, title_id, episode_no, cut_number)
-    if cur_img is None:
-        return prev_context
-    images: list[bytes] = []
-    for n in (cut_number - 2, cut_number - 1):
-        if n >= 1:
-            img = fetch_cut_image(source, title_id, episode_no, n)
-            if img is not None:
-                images.append(img)
-    images.append(cur_img)
-    images.append(overlay_faces(cur_img, faces))  # 오버레이된 현재 컷
-
-    user_text = json.dumps({
-        "prev_context": prev_context,
-        "identified_faces": [{"id": f["id"], "name": f["name"], "bbox": f["bbox"]} for f in faces],
-        "ocr_blocks": [{"index": r["index"], "text": r["text"], "bbox_2d": r["bbox"]} for r in regions],
-    }, ensure_ascii=False)
-
-    call = call_llm_json(ctx, _SYSTEM_PROMPT, user_text, images)
-    result = call.result
-
-    # 저장
-    region_by_index = {r["index"]: r["region_id"] for r in regions}
-    matched_idx = set()
-    for block in result.get("blocks", []):
-        idx = block.get("index")
-        rid = region_by_index.get(idx)
-        if rid is not None:
-            speaker_id = _resolve_speaker_id(webtoon_id, faces, block.get("speaker"))
-            _upsert_llm_annotation(rid, block, ctx["name"], speaker_id)
-            matched_idx.add(idx)
-    missing = [r["index"] for r in regions if r["index"] not in matched_idx]
-    if missing:
-        logger.warning(
-            "[step3] %s/%s ep=%s cut=%s — LLM이 분류 누락한 region index=%s (prompt 1:1 미준수)",
-            source, title_id, episode_no, cut_number, missing,
-        )
-    scene_meta = result.get("scene_meta") or {}
-    _upsert_scene_meta(cut_id, scene_meta)
-    _apply_name_discoveries(webtoon_id, faces, result.get("name_discoveries"))
-    _mark_cut_analyzed(cut_id, ctx.get("id"))
-
-    logger.info("[step3] %s/%s ep=%s cut=%s — blocks=%s discoveries=%s",
-                source, title_id, episode_no, cut_number,
-                len(result.get("blocks", [])), len(result.get("name_discoveries", [])))
-
-    return scene_meta.get("action_summary", "") or prev_context
-
-
-def analyze_episode_scenes(webtoon_episode_id: int, heartbeat_cb=None) -> dict:
-    """에피소드의 모든 컷을 순차 LLM 분석(슬라이딩 윈도우). 단독 실행/백필용.
-
-    DB의 webtoon_cut(=Step1 산출) 순서대로 돌며 prev_context를 이어 전달한다.
-    Temporal EpisodeSceneWorkflow와 동일 로직의 비-워크플로 버전(테스트/재실행에 사용).
-    phase3_enabled 게이트는 적용하지 않는다(호출 자체가 명시적 실행).
-
-    heartbeat_cb: 컷 하나를 분석할 때마다 누적 처리 컷 수로 호출(Temporal 액티비티
-    하트비트 연결용). LLM 호출이 길어 액티비티 타임아웃에 가까워질 때 타이머를 갱신한다.
-    """
-    info = _episode_info(webtoon_episode_id)
-    prepare_episode_scene(webtoon_episode_id)
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT cut_number FROM webtoon_cut WHERE episode_id = %s ORDER BY cut_number",
-            (webtoon_episode_id,),
-        )
-        cut_numbers = [r[0] for r in cur.fetchall()]
-
-    prev = ""
-    analyzed = 0
-    for cn in cut_numbers:
-        prev = analyze_cut_scene(
-            info["source"], info["title_id"], info["episode_no"],
-            webtoon_episode_id, cn, prev,
-        )
-        analyzed += 1
-        if heartbeat_cb:
-            heartbeat_cb(analyzed)
-    logger.info("[step3] episode %s — %s컷 분석 완료", webtoon_episode_id, analyzed)
-    return {"cuts_analyzed": analyzed}
-
-
-def analyze_episode_scenes_by(source: str, title_id: str, episode_no: int) -> dict:
-    """(source, title_id, 회차번호)로 에피소드 Step3 단독 실행. 내부에서 episode id 해석."""
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT we.id
-            FROM webtoon_episode we JOIN webtoon w ON we.webtoon_id = w.id
-            WHERE w.source = %s AND w.title_id = %s AND we.no = %s AND we.deleted_at IS NULL
-            """,
-            (source, title_id, episode_no),
-        )
-        row = cur.fetchone()
-    if not row:
-        raise ValueError(f"episode not found: {source}/{title_id} no={episode_no}")
-    return analyze_episode_scenes(row[0])
-
-
-# ── 재처리 / Human-in-the-loop (Req 10.1, 10.2) ──────────────────────────────
-# 재해소 단위 = **에피소드**(전역 해소 특성상 컷 단위 재해소는 불가 — Req 10.1). human이 컷을
-# 수정하면 그 컷을 is_stale=true로 표시(HITL 트리거)하고, 에피소드 단위로 step3b(resolve)→
-# step3c(apply)를 재실행한다(`reresolve_episode`). 이름 테이블만 바뀐 경우(human이 Character 이름
-# 수락/수정)는 LLM 없이 step3c(Pass-2b)만 재적용한다(`reapply_episode`, Req 10.2).
-#
-# 핵심 설계 결정:
-#   1) **Pass-1 레코드는 비-영속(전이)** 이다(ExtractResult는 DB에 저장되지 않음). 비전(step3a)
-#      결과가 여전히 유효한 일반적 재해소에서는 비전을 재실행하지 않고(Req 10.1), 영속된 provisional
-#      어노테이션(text_annotation source='llm') + faces + cut_scene_meta로 Pass-1 레코드를
-#      **재구성**(`_load_pass1_records_from_db`)해 step3b에 넘긴다. 비전 콜이 0회 → 비용/시간 절감.
-#      재구성 손실(비-영속이라 복원 불가): provisional 화자 후보의 confidence/basis/tail_hint,
-#      characters.prominence/emotion, name_evidence. 이들은 Pass-2a가 트랜스크립트·faces(identity)·
-#      prior로 **재도출**하므로 전역 해소 품질에 본질적 손실이 없다. 보존되는 핵심 신호:
-#      corrected_text / type / faces(character_id+이름) / cut_summary.
-#   2) **이름 소급은 조인으로 자동**(task 8.1): 확정 이름은 Character 행 1곳에만 저장되고 모든 컷의
-#      TextAnnotation은 speaker_id(=character_id) FK로 그 행을 가리킨다. 따라서 Character.name이
-#      바뀌면 해소 주석의 화자 이름은 조인으로 즉시 전 컷에 반영되어 **주석 레이어에는 추가 쓰기가
-#      필요 없다**. `reapply_episode`가 하는 일은 조인으로 갱신되지 않는 **비정규화 스냅샷**
-#      (EpisodeReport.character_timeline의 이름, WebtoonNarrativeState 로스터 이름)과 significance/
-#      is_match_excluded 투영을 **현재 Character 상태에 맞춰** 결정론적으로 다시 투영하는 것이다.
-#      이를 위해 영속된 Pass-2a 산출을 ResolveResult로 재구성(`_load_resolve_result_from_db`)하되
-#      이름/중요도는 **현재 Character 테이블(라이브 진실)** 에서 끌어와 멱등 apply_resolution을
-#      LLM 없이 재실행한다. (apply_resolution의 모든 쓰기는 upsert/안정키/스코프 delete-reinsert라
-#      멱등 — Property 3. beats/threads/claims도 빠짐없이 재구성해 스코프 delete가 데이터를 지우지
-#      않게 한다.)
-
-
-def mark_cut_stale(
-    webtoon_episode_id: int, cut_number: int, *, human_modified: bool = True,
-) -> bool:
-    """HITL 트리거 — 컷 1개를 is_stale=true로 표시(재해소 필요). human 수정이면 human_modified_at도 기록.
-
-    재해소 단위는 에피소드지만(Req 10.1), staleness는 컷 플래그(`webtoon_cut.is_stale`)로 추적한다.
-    이 함수로 표시된 컷이 있는 에피소드는 `episode_is_stale`가 True가 되어 재해소 대상이 된다.
-    `human_modified=False`면 is_stale만 세운다(admin 강제 재분석 등 — 컷 내용 수정이 아닌 경우).
-
-    Returns: 실제로 갱신된 컷이 있으면 True(없으면 False).
-    """
-    now = datetime.now(timezone.utc)
-    with db_cursor() as cur:
-        if human_modified:
-            cur.execute(
-                "UPDATE webtoon_cut SET is_stale=true, human_modified_at=%s, updated_at=%s "
-                "WHERE episode_id=%s AND cut_number=%s",
-                (now, now, webtoon_episode_id, cut_number),
-            )
-        else:
-            cur.execute(
-                "UPDATE webtoon_cut SET is_stale=true, updated_at=%s "
-                "WHERE episode_id=%s AND cut_number=%s",
-                (now, webtoon_episode_id, cut_number),
-            )
-        return (cur.rowcount or 0) > 0
-
-
-def mark_episode_stale(webtoon_episode_id: int) -> int:
-    """에피소드 전체 컷을 is_stale=true로 표시(에피소드 단위 재해소 필요 표시).
-
-    Returns: 표시된 컷 수.
-    """
-    now = datetime.now(timezone.utc)
-    with db_cursor() as cur:
-        cur.execute(
-            "UPDATE webtoon_cut SET is_stale=true, updated_at=%s WHERE episode_id=%s",
-            (now, webtoon_episode_id),
-        )
-        return cur.rowcount or 0
-
-
-def episode_is_stale(webtoon_episode_id: int) -> bool:
-    """에피소드에 is_stale 컷이 하나라도 있으면 True(재해소 대상 — Req 10.1)."""
-    with db_cursor() as cur:
-        cur.execute(
-            "SELECT EXISTS(SELECT 1 FROM webtoon_cut WHERE episode_id=%s AND is_stale=true)",
-            (webtoon_episode_id,),
-        )
-        return bool(cur.fetchone()[0])
-
-
-def _clear_episode_stale(webtoon_episode_id: int) -> int:
-    """재해소/재적용 성공 후 에피소드 컷의 is_stale을 클리어(=false). Returns: 클리어된 컷 수.
-
-    human_modified_at은 감사 추적용으로 보존한다(staleness 해제만 수행).
-    """
-    now = datetime.now(timezone.utc)
-    with db_cursor() as cur:
-        cur.execute(
-            "UPDATE webtoon_cut SET is_stale=false, updated_at=%s "
-            "WHERE episode_id=%s AND is_stale=true",
-            (now, webtoon_episode_id),
-        )
-        return cur.rowcount or 0
-
+# ── 재처리 / Human-in-the-loop (v4.0 §17.1) ──────────────────────────────────
+# staleness는 저장하지 않는다: human 수정 API(service)가 webtoon_cut.human_modified_at을 찍고,
+# "재해소 필요"는 runs.episode_needs_reresolve(human_modified_at > 최신 succeeded resolve run)로
+# 도출한다. 재해소 실행은 reresolve_episode(아래) / src.tools.reresolve CLI.
 
 # ── Pass-1 레코드 DB 재구성 (비전 재실행 없는 재해소용) ────────────────────────
 
@@ -2590,7 +2794,7 @@ def _load_scene_meta(cut_id: int) -> dict:
     """cut_scene_meta(action_summary, key_objects) 로드 — Pass-1 cut_summary/key_objects 재구성용."""
     with db_cursor() as cur:
         cur.execute(
-            "SELECT action_summary, key_objects FROM cut_scene_meta WHERE cut_id=%s",
+            "SELECT action_summary, key_objects FROM analysis_cut_scene_meta WHERE cut_id=%s",
             (cut_id,),
         )
         row = cur.fetchone()
@@ -2605,16 +2809,16 @@ def _load_scene_meta(cut_id: int) -> dict:
 def _load_provisional_blocks(cut_id: int) -> list[dict]:
     """영속된 provisional 어노테이션(source='llm')으로 Pass-1 blocks 재구성(index 순, 1:1 유지).
 
-    corrected_text(text)와 type은 보존되어 복원된다. provisional 화자 후보(face_label/name/
-    confidence/basis/tail_hint)는 비-영속이라 복원 불가 → null shape로 둔다(Pass-2a가 맥락으로
-    재해소). type_confidence도 비-영속 → 0.0.
+    corrected_text(text)/type/화자 후보(speaker_id, 2026-07-05부터 영속)는 복원된다 —
+    speaker.character_id로 실어 Pass-2a 페이로드의 `spk_cid`가 된다. face_label/basis/tail_hint/
+    type_confidence는 비-영속이라 null shape(Pass-2a가 맥락으로 재해소).
     """
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT tr.index, ta.type, ta.text
-            FROM text_region tr
-            JOIN text_annotation ta ON ta.region_id = tr.id AND ta.source = 'llm'
+            SELECT tr.index, ta.type, ta.text, ta.speaker_id
+            FROM analysis_text_region tr
+            JOIN analysis_text_annotation ta ON ta.region_id = tr.id AND ta.source = 'llm'
             WHERE tr.cut_id = %s AND tr.is_excluded = false
             ORDER BY tr.index
             """,
@@ -2622,7 +2826,7 @@ def _load_provisional_blocks(cut_id: int) -> list[dict]:
         )
         rows = cur.fetchall()
     blocks: list[dict] = []
-    for idx, btype, text in rows:
+    for idx, btype, text, speaker_id in rows:
         if btype not in _BLOCK_TYPES:
             btype = None
         blocks.append({
@@ -2630,8 +2834,8 @@ def _load_provisional_blocks(cut_id: int) -> list[dict]:
             "type": btype,
             "type_confidence": 0.0,
             "corrected_text": text or "",
-            "speaker": {"face_label": None, "name": None, "confidence": 0.0,
-                        "basis": "none", "tail_hint": "none"},
+            "speaker": {"face_label": None, "name": None, "character_id": speaker_id,
+                        "confidence": 0.0, "basis": "none", "tail_hint": "none"},
         })
     return blocks
 
@@ -2697,16 +2901,17 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
         # EpisodeReport — episode 메타 + character_timeline(스냅샷).
         cur.execute(
             """
-            SELECT summary, appeal_point, cliffhanger, foreshadowing, character_timeline
-            FROM episode_report WHERE episode_id=%s
+            SELECT summary, teaser, appeal_point, cliffhanger, foreshadowing, character_timeline
+            FROM analysis_episode_report WHERE episode_id=%s
             """,
             (webtoon_episode_id,),
         )
         rep = cur.fetchone()
         if rep:
-            summary, appeal_point, cliffhanger, foreshadowing, timeline = rep
+            summary, teaser, appeal_point, cliffhanger, foreshadowing, timeline = rep
             episode = {
                 "summary": summary or "",
+                "teaser": teaser or "",
                 "appeal_point": appeal_point or "",
                 "cliffhanger": cliffhanger or "",
                 "foreshadowing": foreshadowing if isinstance(foreshadowing, list) else [],
@@ -2720,7 +2925,7 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
         cur.execute(
             """
             SELECT cut_start, cut_end, hook_type, appeal_point, intensity
-            FROM episode_beat WHERE episode_id=%s ORDER BY cut_start, cut_end
+            FROM analysis_episode_beat WHERE episode_id=%s ORDER BY cut_start, cut_end
             """,
             (webtoon_episode_id,),
         )
@@ -2736,7 +2941,7 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
             """
             SELECT nt.description, nt.type, nt.status, pe.no, nt.planted_cut,
                    re.no, nt.resolved_cut, nt.confidence
-            FROM narrative_thread nt
+            FROM analysis_narrative_thread nt
             LEFT JOIN webtoon_episode pe ON nt.planted_episode_id = pe.id
             LEFT JOIN webtoon_episode re ON nt.resolved_episode_id = re.id
             WHERE nt.webtoon_id=%s AND nt.planted_episode_id=%s AND nt.deleted_at IS NULL
@@ -2755,7 +2960,7 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
         cur.execute(
             """
             SELECT wc.cut_number, cc.character_id, cc.claim, cc.contradicts, cc.confidence
-            FROM character_claim cc
+            FROM analysis_character_claim cc
             JOIN webtoon_cut wc ON cc.cut_id = wc.id
             WHERE wc.episode_id=%s AND cc.is_deception = true
             ORDER BY wc.cut_number
@@ -2773,8 +2978,8 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
         cur.execute(
             """
             SELECT wc.cut_number, tr.index, ta.speaker_id
-            FROM text_annotation ta
-            JOIN text_region tr ON ta.region_id = tr.id
+            FROM analysis_text_annotation ta
+            JOIN analysis_text_region tr ON ta.region_id = tr.id
             JOIN webtoon_cut wc ON tr.cut_id = wc.id
             WHERE wc.episode_id=%s AND ta.source='llm'
               AND ta.resolution_status='resolved' AND ta.speaker_id IS NOT NULL
@@ -2794,25 +2999,25 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
         current: dict = {}
         if cids:
             cur.execute(
-                "SELECT id, name, significance FROM character "
+                "SELECT id, name, kind, significance FROM analysis_character "
                 "WHERE id = ANY(%s) AND deleted_at IS NULL",
                 (cids,),
             )
-            for cid, name, sig in cur.fetchall():
-                current[cid] = (name, sig)
+            for cid, name, kind, sig in cur.fetchall():
+                current[cid] = (name, kind, sig)
 
     characters: list[dict] = []
     for e in timeline:
         cid = e.get("character_id")
         if cid is None:
             continue
-        cur_name, cur_sig = current.get(cid, (None, None))
-        live_name = cur_name if (cur_name and not cur_name.startswith("NEW_CHAR_")) else None
+        cur_name, cur_kind, cur_sig = current.get(cid, (None, None, None))
+        live_name = cur_name if (cur_name and cur_kind == "character") else None
         characters.append({
             "character_id": cid,
             "name": live_name,
-            # 현재 Character 확정 이름 — NEW_CHAR placeholder 소급 전파는 허용되고, 이미 명명된
-            # 이름은 _project_characters의 frozen/placeholder 규칙으로 보존된다(과한 rename 없음).
+            # 현재 명명 인물(kind=character)의 이름만 소급 전파 — 클러스터는 미명명 유지.
+            # 이미 명명된 이름은 _project_characters의 frozen/cluster 규칙으로 보존된다.
             "name_confidence": 1.0,
             "significance": cur_sig if cur_sig in _SIGNIFICANCE else e.get("significance"),
             "evidence": e.get("evidence") or "",
@@ -2842,117 +3047,123 @@ def reresolve_episode(
     heartbeat_cb=None,
     webtoon_id: Optional[int] = None,
 ) -> dict:
-    """에피소드 단위 재해소(Req 10.1) — human 컷 수정 후 step3b(resolve)→step3c(apply) 재실행.
+    """에피소드 단위 재해소(Req 10.1) — human 수정 후 R→N→apply를 새 run으로 재실행(v4.0).
 
     재해소 단위는 **에피소드**다(컷 아님 — 전역 해소 특성상 한 컷만 다시 푸는 건 불가능).
-    HITL 흐름: human이 컷을 수정 → `mark_cut_stale`(에피소드 is_stale) → 이 함수로 재해소 →
-    성공 시 `_clear_episode_stale`로 is_stale 클리어.
+    HITL 흐름: human이 수정(service가 human_modified_at 마킹) → `runs.episode_needs_reresolve`가
+    True → 이 함수(또는 src.tools.reresolve CLI)로 재해소. 새 resolve run(성공 시 succeeded)이
+    생기면 human_modified_at < run.finished_at이 되어 stale 도출이 자연히 해소된다 — 플래그 클리어
+    불필요(§17.1).
 
-    rerun_extract=False(기본): 비전(step3a)을 재실행하지 **않고** 영속 provisional 레코드를
-        `_load_pass1_records_from_db`로 재구성해 step3b부터 재해소한다(Pass-1 비전 결과가 여전히
-        유효한 일반 경로 — 비용/시간 절감). 이 경로는 provisional 어노테이션을 읽은 뒤 해소하므로
-        `prepare_episode_scene`(어노테이션 삭제)을 호출하지 않는다.
-    rerun_extract=True: 비전까지 재실행(step3a, prepare=True)한다 — OCR/얼굴 입력 자체가 바뀐 경우.
+    rerun_extract=False(기본): 비전(Stage V)을 재실행하지 **않고** 영속 provisional 레코드를
+        `_load_pass1_records_from_db`로 재구성해 R부터 재해소한다(비용/시간 절감).
+    rerun_extract=True: 비전까지 재실행(새 vision run) — OCR/얼굴 입력 자체가 바뀐 경우
+        (**human이 얼굴↔캐릭터 매칭을 고친 경우 필수** — identified_faces 입력이 바뀜).
 
-    prior_context 미지정 시 `narrative_context.load_prior(webtoon_id, episode_no)`로 직전 화까지의
-    누적 서사 컨텍스트를 조립한다(Req 4.1/11.3). step3b는 `resolve_episode_windowed`(토큰 예산
-    적응형), step3c는 `apply_resolution`(결정론 커밋 + WebtoonNarrativeState fold)을 그대로 쓴다.
-
-    Returns: 재해소 요약 dict(records 수, 해소 에러 여부, 클리어된 stale 컷 수, episode_meta).
+    Returns: 재해소 요약 dict(records 수, 해소 에러 여부, run_id, episode_meta).
     """
+    from src.core import runs
+
     info = _episode_info(webtoon_episode_id)
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    ctx = resolve_llm_model(webtoon_id)
+    llm_model_id = ctx.get("id")
 
+    vision_run_id = None
     if rerun_extract:
-        ext = extract_episode(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True)
+        vision_run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_VISION,
+                                       llm_model_id=llm_model_id)
+        ext = extract_episode(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True,
+                              run_id=vision_run_id)
+        runs.finish_run(vision_run_id, stats={
+            "cuts_total": ext.cuts_total, "cuts_analyzed": ext.cuts_analyzed,
+            "cuts_skipped": ext.cuts_skipped, "usage": ext.usage_total,
+        })
         records = ext.records
     else:
+        vision_run_id = runs.latest_succeeded_run_id(webtoon_episode_id, runs.KIND_VISION)
         records = _load_pass1_records_from_db(webtoon_episode_id)
 
     if prior_context is None:
         prior_context = narrative_context.load_prior(webtoon_id, info["episode_no"])
 
-    result = resolve_episode_windowed(
+    run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_RESOLVE,
+                            llm_model_id=llm_model_id, vision_run_id=vision_run_id)
+    result = resolve_and_narrate(
         webtoon_episode_id, prior_context,
-        records=records, webtoon_id=webtoon_id, token_budget=token_budget,
+        records=records, webtoon_id=webtoon_id, ctx=ctx,
+        token_budget=token_budget, run_id=run_id,
     )
-    episode_meta = apply_resolution(webtoon_episode_id, result, webtoon_id=webtoon_id)
-
-    cleared = _clear_episode_stale(webtoon_episode_id) if not result.error else 0
+    episode_meta = apply_resolution(webtoon_episode_id, result, webtoon_id=webtoon_id,
+                                    run_id=run_id)
+    if result.error:
+        runs.finish_run(run_id, status="failed", error=result.error)
+    else:
+        runs.finish_run(run_id, stats=episode_meta.get("stats") or {})
 
     logger.info(
-        "[step3.reresolve] episode %s — rerun_extract=%s records=%s error=%s stale_cleared=%s",
-        webtoon_episode_id, rerun_extract, len(records), result.error, cleared,
+        "[step3.reresolve] episode %s — rerun_extract=%s records=%s error=%s run=%s",
+        webtoon_episode_id, rerun_extract, len(records), result.error, run_id,
     )
     return {
         "webtoon_episode_id": webtoon_episode_id,
         "rerun_extract": rerun_extract,
         "records": len(records),
         "resolve_error": result.error,
-        "cuts_cleared_stale": cleared,
+        "run_id": run_id,
         "episode_meta": episode_meta,
     }
 
 
 def reapply_episode(webtoon_episode_id: int, *, webtoon_id: Optional[int] = None) -> dict:
-    """이름 테이블만 변경된 경우의 부분 재처리(Req 10.2) — **LLM 없이 step3c(Pass-2b)만 재적용**.
+    """이름 테이블만 변경된 경우의 부분 재처리(Req 10.2) — **LLM 없이 apply만 재실행**.
 
-    근거(소급은 조인으로 자동, task 8.1): 확정 이름은 Character 행 1곳에만 저장되고 TextAnnotation은
-    speaker_id(=character_id) FK로 그 행을 가리킨다. 따라서 Character.name이 (human 수락/수정으로)
-    바뀌면 해소 주석의 화자 이름은 조인으로 즉시 전 컷에 반영되어 **주석 레이어에는 추가 쓰기가 필요
-    없다**. 다만 조인으로 갱신되지 않는 비정규화 스냅샷(EpisodeReport.character_timeline의 이름,
-    WebtoonNarrativeState 로스터 이름)과 significance/is_match_excluded 투영은 갱신이 필요하다.
+    근거(소급은 조인으로 자동): 확정 이름은 Character 행 1곳에만 저장되고 TextAnnotation은
+    speaker_id FK로 그 행을 가리키므로, human 이름 수락/수정은 조인으로 즉시 전 컷에 반영된다.
+    조인으로 갱신되지 않는 비정규화 스냅샷(EpisodeReport.character_timeline의 이름)과
+    significance/is_match_excluded 투영만 재적용이 필요하다. LLM 콜 0회 — run은 만들지 않는다
+    (LLM 산출이 아니라 기존 run 산출의 재투영이므로).
 
-    구현: 영속된 Pass-2a 산출을 `_load_resolve_result_from_db`로 ResolveResult로 재구성하되
-    이름/중요도는 **현재 Character 테이블**에서 끌어와, 멱등 `apply_resolution`(LLM 없음)을 다시
-    실행한다. 이는 위 비정규화 파생물을 현재 이름 테이블에 맞춰 재투영하고 fold로 누적 상태를
-    갱신한다. beats/threads/claims도 빠짐없이 재구성하므로 스코프 delete-reinsert가 데이터를 지우지
-    않는다(멱등 무손실 — Property 3). 비전/텍스트 LLM 콜은 0회.
-
-    경계: EpisodeReport가 없으면(= 아직 한 번도 step3b/3c가 돈 적 없는 에피소드) 재적용할 이름
-    투영 산출이 없으므로 stale만 클리어하고 종료한다. 그 경우는 `reresolve_episode`로 최초 해소를
-    수행해야 한다.
-
-    Returns: 재적용 요약 dict(클리어된 stale 컷 수, episode_meta 또는 no_resolution 사유).
+    경계: EpisodeReport가 없으면(한 번도 해소된 적 없음) 재적용할 산출이 없으므로 스킵한다.
     """
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
 
     with db_cursor() as cur:
         cur.execute(
-            "SELECT EXISTS(SELECT 1 FROM episode_report WHERE episode_id=%s)",
+            "SELECT EXISTS(SELECT 1 FROM analysis_episode_report WHERE episode_id=%s)",
             (webtoon_episode_id,),
         )
         has_report = bool(cur.fetchone()[0])
 
     if not has_report:
-        cleared = _clear_episode_stale(webtoon_episode_id)
         logger.info(
             "[step3.reapply] episode %s — 영속 해소 산출 없음(EpisodeReport 부재), 재적용 스킵 "
-            "(최초 해소는 reresolve_episode 필요). stale_cleared=%s",
-            webtoon_episode_id, cleared,
+            "(최초 해소는 reresolve_episode 필요).",
+            webtoon_episode_id,
         )
         return {
             "webtoon_episode_id": webtoon_episode_id,
             "reapplied": False,
             "reason": "no_resolution",
-            "cuts_cleared_stale": cleared,
         }
 
+    from src.core import runs
+
+    run_id = runs.latest_succeeded_run_id(webtoon_episode_id, runs.KIND_RESOLVE)
     result = _load_resolve_result_from_db(webtoon_episode_id, webtoon_id)
-    episode_meta = apply_resolution(webtoon_episode_id, result, webtoon_id=webtoon_id)
-    cleared = _clear_episode_stale(webtoon_episode_id)
+    # refresh_suggestions=False — 재투영은 제안 큐를 재생성하지 않는다(직전 run의 pending 보존).
+    episode_meta = apply_resolution(webtoon_episode_id, result, webtoon_id=webtoon_id,
+                                    run_id=run_id, refresh_suggestions=False)
 
     logger.info(
-        "[step3.reapply] episode %s — step3c-only 재적용(LLM 없음) chars=%s beats=%s "
-        "threads=%s claims=%s stale_cleared=%s",
+        "[step3.reapply] episode %s — apply-only 재적용(LLM 없음) chars=%s beats=%s threads=%s claims=%s",
         webtoon_episode_id, len(result.characters), len(result.beats),
-        len(result.threads), len(result.deceptions), cleared,
+        len(result.threads), len(result.deceptions),
     )
     return {
         "webtoon_episode_id": webtoon_episode_id,
         "reapplied": True,
-        "cuts_cleared_stale": cleared,
         "episode_meta": episode_meta,
     }

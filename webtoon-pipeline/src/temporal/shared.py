@@ -25,6 +25,8 @@ TASK_QUEUE = ORCH_QUEUE
 # step 이름 → phase 번호 / 전용 큐.
 STEP1, STEP2, STEP3 = "step1", "step2", "step3"
 STEP_PHASE = {STEP1: 1, STEP2: 2, STEP3: 3}
+# v4.0(§17.1): 진행도는 analysis_run으로 도출 — step→run kind 매핑(step3의 결과 정본은 resolve run).
+STEP_RUN_KIND = {STEP1: "step1", STEP2: "step2", STEP3: "resolve"}
 STEP_QUEUE = {STEP1: STEP1_QUEUE, STEP2: STEP2_QUEUE, STEP3: STEP3_QUEUE}
 
 # EpisodeSceneWorkflow(레거시)가 처리하던 컷 배치 단위 — step3가 에피소드 단위 액티비티로

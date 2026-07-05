@@ -48,8 +48,8 @@ def resolve_llm_model(webtoon_id: int) -> dict:
             cur.execute(
                 """
                 SELECT lm.id, lm.name, lm.provider, lm.model_id, lm.params, lm.supports_vision
-                FROM webtoon_llm_setting wls
-                JOIN llm_model lm ON wls.llm_model_id = lm.id
+                FROM config_webtoon_llm_setting wls
+                JOIN config_llm_model lm ON wls.llm_model_id = lm.id
                 WHERE wls.webtoon_id = %s
                   AND wls.is_enabled = true
                   AND wls.deleted_at IS NULL
@@ -64,7 +64,7 @@ def resolve_llm_model(webtoon_id: int) -> dict:
                 cur.execute(
                     """
                     SELECT id, name, provider, model_id, params, supports_vision
-                    FROM llm_model
+                    FROM config_llm_model
                     WHERE is_default = true AND is_active = true AND deleted_at IS NULL
                     ORDER BY id ASC
                     LIMIT 1

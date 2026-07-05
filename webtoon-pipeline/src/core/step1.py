@@ -3,7 +3,7 @@
 Temporal 액티비티가 호출한다. OCR과 YOLO는 **통합 단일 다운로드 스트리밍 경로**로 처리된다:
 - process_episode_step1 : 에피소드 컷을 한 번만 점진 다운로드 → 스트리밍 슬라이딩 윈도우
   (`_iter_episode_segments`)로 콘텐츠 세그먼트를 방출 → 세그먼트마다 OCR과 YOLO를 모두
-  실행하여 text_region/annotation + face_record(+crop S3 업로드)를 저장.
+  실행하여 text_region/annotation + face_detection(+crop S3 업로드)를 저장.
 
 핵심 컴포넌트:
 - `_scan_common_width` : 컷 바이트 헤더만 선스캔하여 Common_Width(W = min(폭))와 총 컷 수를
@@ -144,8 +144,8 @@ def ensure_cut(webtoon_episode_id: int, cut_number: int) -> int:
         cur.execute(
             """
             INSERT INTO webtoon_cut
-                (episode_id, cut_number, processed_at, is_stale, created_at, updated_at)
-            VALUES (%s, %s, %s, false, %s, %s)
+                (episode_id, cut_number, processed_at, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_webtoon_cut_episode_no DO UPDATE
                 SET processed_at = EXCLUDED.processed_at,
                     updated_at   = EXCLUDED.updated_at
@@ -175,21 +175,21 @@ def prepare_episode_ocr(webtoon_episode_id: int) -> None:
         cut_ids = [r[0] for r in cur.fetchall()]
         for cut_id in cut_ids:
             cur.execute(
-                "DELETE FROM text_annotation WHERE region_id IN "
-                "(SELECT id FROM text_region WHERE cut_id = %s)",
+                "DELETE FROM analysis_text_annotation WHERE region_id IN "
+                "(SELECT id FROM analysis_text_region WHERE cut_id = %s)",
                 (cut_id,),
             )
-            cur.execute("DELETE FROM text_region WHERE cut_id = %s", (cut_id,))
+            cur.execute("DELETE FROM analysis_text_region WHERE cut_id = %s", (cut_id,))
 
 
 def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
-    """컷의 face_record + S3 crop + Chroma + face_embedding 제거."""
+    """컷의 face_detection + S3 crop + Chroma + face_embedding 제거."""
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT fr.id, fe.embedding_model, fe.chroma_doc_id
-            FROM face_record fr
-            LEFT JOIN face_embedding fe ON fe.face_record_id = fr.id
+            FROM analysis_face_detection fr
+            LEFT JOIN analysis_face_embedding fe ON fe.detection_id = fr.id
             WHERE fr.cut_id = %s
             """,
             (cut_id,),
@@ -223,8 +223,8 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
 
     if face_ids:
         with db_cursor() as cur:
-            cur.execute("DELETE FROM face_embedding WHERE face_record_id = ANY(%s)", (list(face_ids),))
-            cur.execute("DELETE FROM face_record WHERE id = ANY(%s)", (list(face_ids),))
+            cur.execute("DELETE FROM analysis_face_embedding WHERE detection_id = ANY(%s)", (list(face_ids),))
+            cur.execute("DELETE FROM analysis_face_detection WHERE id = ANY(%s)", (list(face_ids),))
 
 
 def prepare_episode_yolo(webtoon_episode_id: int, source: str, title_id: str) -> None:
@@ -590,7 +590,7 @@ def _ensure_segment(cur, episode_id: int, index: int, y0: int, y1: int, width: i
     now = datetime.now(timezone.utc)
     cur.execute(
         """
-        INSERT INTO episode_segment
+        INSERT INTO analysis_episode_segment
             (episode_id, index, strip_y1, strip_y2, width, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT ON CONSTRAINT uniq_episode_segment_episode_index DO UPDATE
@@ -658,7 +658,7 @@ def _assign_line_groups(
 
 
 def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[int, int], dict[int, list]]:
-    """이미 커밋된 text_region/face_record로부터 region_index/face_index/used_bboxes 복원.
+    """이미 커밋된 text_region/face_detection으로부터 region_index/face_index/used_bboxes 복원.
 
     재시도(attempt) 시 이전 attempt에서 이미 커밋된 세그먼트를 건너뛰더라도, 그 세그먼트가
     속한 컷의 다음 index/face_idx 카운터와 YOLO 전역 dedup용 승인 bbox를 DB 상태로부터
@@ -672,7 +672,7 @@ def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[in
         cur.execute(
             """
             SELECT tr.cut_id, MAX(tr.index)
-            FROM text_region tr JOIN webtoon_cut wc ON wc.id = tr.cut_id
+            FROM analysis_text_region tr JOIN webtoon_cut wc ON wc.id = tr.cut_id
             WHERE wc.episode_id = %s
             GROUP BY tr.cut_id
             """,
@@ -684,7 +684,7 @@ def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[in
         cur.execute(
             """
             SELECT fr.cut_id, MAX(fr.face_idx)
-            FROM face_record fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
+            FROM analysis_face_detection fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
             WHERE wc.episode_id = %s
             GROUP BY fr.cut_id
             """,
@@ -696,7 +696,7 @@ def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[in
         cur.execute(
             """
             SELECT fr.cut_id, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2
-            FROM face_record fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
+            FROM analysis_face_detection fr JOIN webtoon_cut wc ON wc.id = fr.cut_id
             WHERE wc.episode_id = %s AND fr.is_used = true
             """,
             (webtoon_episode_id,),
@@ -710,7 +710,7 @@ def _load_resume_state(webtoon_episode_id: int) -> tuple[dict[int, int], dict[in
 def prepare_episode_segments(webtoon_episode_id: int) -> None:
     """에피소드의 episode_segment 행 제거(재처리 멱등). 검출은 prepare_episode_ocr/yolo가 먼저 정리."""
     with db_cursor() as cur:
-        cur.execute("DELETE FROM episode_segment WHERE episode_id = %s", (webtoon_episode_id,))
+        cur.execute("DELETE FROM analysis_episode_segment WHERE episode_id = %s", (webtoon_episode_id,))
 
 
 # ── 통합 처리기 (Step1_Processor) ─────────────────────────────────────────────
@@ -783,7 +783,7 @@ def _process_segment_ocr(
         # human 리뷰 필드를 덮어쓰지 않도록 DO UPDATE가 아니라 DO NOTHING을 쓴다.
         cur.execute(
             """
-            INSERT INTO text_region
+            INSERT INTO analysis_text_region
                 (cut_id, segment_id, index, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
                  score, line_group, is_used, is_excluded, created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
@@ -804,7 +804,7 @@ def _process_segment_ocr(
         region_id = res[0]
         cur.execute(
             """
-            INSERT INTO text_annotation
+            INSERT INTO analysis_text_annotation
                 (region_id, source, text, confidence, resolution_status, created_at, updated_at)
             VALUES (%s, 'paddle', %s, %s, 'unresolved', %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_text_annotation_region_source DO NOTHING
@@ -868,10 +868,10 @@ def _process_segment_yolo(
         face_index[cut_id] = fidx + 1
         cur.execute(
             """
-            INSERT INTO face_record
+            INSERT INTO analysis_face_detection
                 (cut_id, segment_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                 conf, is_used, is_duplicate, is_confirmed, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
+                 conf, is_used, is_duplicate, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_face_record_cut_idx DO NOTHING
             RETURNING id
             """,
@@ -882,7 +882,7 @@ def _process_segment_yolo(
         if not res:
             # 이미 커밋된 (cut_id, face_idx) — 재시도/경합 안전망으로 스킵.
             logger.warning(
-                "[step1] face_record 중복 스킵(안전망) cut_id=%s face_idx=%s segment_id=%s",
+                "[step1] face_detection 중복 스킵(안전망) cut_id=%s face_idx=%s segment_id=%s",
                 cut_id, fidx, segment_id,
             )
             continue
@@ -914,7 +914,7 @@ def process_episode_step1(
                         그룹 → _merge_group → text_region/text_annotation 기록(전역 y로 컷
                         귀속, Cut_Local_Coords 클램핑 없음, 컷별 region_index 유지).
       [YOLO — Task 5.2]   같은 seg.image_bytes로 run_yolo → 에피소드 전역 used_bboxes
-                        IOU dedup(is_duplicate/is_used 표시) → face_record + is_used 얼굴 크롭
+                        IOU dedup(is_duplicate/is_used 표시) → face_detection + is_used 얼굴 크롭
                         업로드. 컷별 face_index 유지.
       [공유/하트비트 — Task 5.3]  세그먼트당 _ensure_segment 1회 호출로 얻은 segment_id를
                         OCR/YOLO가 공유(방출 Content_Segment당 episode_segment 1행 — Req 6.6),

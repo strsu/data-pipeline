@@ -19,7 +19,7 @@ import logging
 
 from temporalio import activity
 
-from src.temporal.shared import STEP_PHASE, ChainInput, EpisodeInput
+from src.temporal.shared import STEP_RUN_KIND, ChainInput, EpisodeInput
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def next_chain_episode(inp: ChainInput) -> int | None:
       (admin 범위 실행 — 비어 있는 회차는 워크플로가 작업 없이 통과한다.)
     - 자동(unbounded) 모드(max_ep == 0): 진입 step(steps[0])이 아직 종료되지 않은,
       cur_ep 보다 큰 다음 다운로드 회차를 찾는다. 없으면 None(체인 종료).
-      진입 step의 종료 여부는 episode_pipeline_progress(phase, status in completed/error)로 판정.
+      진입 step의 종료 여부는 analysis_run(kind, status in succeeded/failed)로 판정한다(v4.0 §17.1).
     """
     if inp.max_ep and inp.max_ep > 0:
         nxt = inp.cur_ep + 1
@@ -73,7 +73,7 @@ def next_chain_episode(inp: ChainInput) -> int | None:
     from src.config.db import db_cursor
 
     entry_step = inp.steps[0] if inp.steps else "step1"
-    phase = STEP_PHASE.get(entry_step, 1)
+    kind = STEP_RUN_KIND.get(entry_step, "step1")
     with db_cursor() as cur:
         cur.execute(
             """
@@ -83,14 +83,14 @@ def next_chain_episode(inp: ChainInput) -> int | None:
             WHERE w.source = %s AND w.title_id = %s AND we.no > %s
               AND we.is_downloaded = true AND we.deleted_at IS NULL
               AND NOT EXISTS (
-                SELECT 1 FROM episode_pipeline_progress p
-                WHERE p.episode_id = we.id AND p.phase = %s
-                  AND p.status IN ('completed', 'error')
+                SELECT 1 FROM analysis_run ar
+                WHERE ar.episode_id = we.id AND ar.kind = %s
+                  AND ar.status IN ('succeeded', 'failed')
               )
             ORDER BY we.no
             LIMIT 1
             """,
-            (inp.source, inp.title_id, inp.cur_ep, phase),
+            (inp.source, inp.title_id, inp.cur_ep, kind),
         )
         row = cur.fetchone()
     return row[0] if row else None
@@ -98,27 +98,24 @@ def next_chain_episode(inp: ChainInput) -> int | None:
 
 @activity.defn
 def mark_phase_complete(ep: EpisodeInput, phase: int) -> None:
-    """에피소드의 특정 phase 완료를 episode_pipeline_progress에 멱등 기록.
+    """step1/step2 완료를 analysis_run 원장에 기록한다(v4.0 §17.1 — 구 episode_pipeline_progress 대체).
 
-    (episode, phase) 1행 — 자동 모드 다음-ep 판정(`next_chain_episode`)이 이 행으로
-    진입 step 종료 여부를 본다. 컷/얼굴 데이터 정리는 step별 prepare가 따로 수행한다.
+    자동 모드 다음-ep 판정(`next_chain_episode`)이 이 run 존재로 진입 step 종료 여부를 본다.
+    step3는 step3b/c가 자체 resolve run을 관리하므로 여기로 오지 않는다(workflows 참조).
     """
-    from datetime import datetime, timezone
     from src.config.db import db_cursor
+    from src.core import runs
 
-    now = datetime.now(timezone.utc)
+    kind = {1: runs.KIND_STEP1, 2: runs.KIND_STEP2}.get(phase)
+    if kind is None:
+        logger.warning("[mark_phase_complete] phase=%s는 run 매핑 없음(무시)", phase)
+        return
     with db_cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO episode_pipeline_progress
-                (episode_id, phase, status, completed_at, created_at, updated_at)
-            VALUES (%s, %s, 'completed', %s, %s, %s)
-            ON CONFLICT (episode_id, phase)
-            DO UPDATE SET status = 'completed', completed_at = EXCLUDED.completed_at,
-                          updated_at = EXCLUDED.updated_at
-            """,
-            (ep.webtoon_episode_id, phase, now, now, now),
+            "SELECT webtoon_id FROM webtoon_episode WHERE id=%s", (ep.webtoon_episode_id,),
         )
+        webtoon_id = cur.fetchone()[0]
+    runs.record_completed_run(webtoon_id, ep.webtoon_episode_id, kind)
 
 
 @activity.defn
@@ -130,7 +127,7 @@ def is_phase3_enabled(webtoon_episode_id: int) -> bool:
             """
             SELECT COALESCE(wps.phase3_enabled, false)
             FROM webtoon_episode we
-            JOIN webtoon_pipeline_state wps ON wps.webtoon_id = we.webtoon_id
+            JOIN config_webtoon_pipeline_state wps ON wps.webtoon_id = we.webtoon_id
             WHERE we.id = %s
             """,
             (webtoon_episode_id,),
@@ -202,23 +199,6 @@ def face_identify_episode(ep: EpisodeInput) -> dict:
     )
 
 
-@activity.defn
-def step3_episode(ep: EpisodeInput) -> dict:
-    """에피소드의 모든 컷을 순차 LLM 분석(Step3). 반환: {"cuts_analyzed": n}.
-
-    기존 컷별 분석을 에피소드 단위 1개 액티비티로 흡수한다(컷마다 continue-as-new 불필요).
-    prev_context 연속성은 코어 analyze_episode_scenes가 컷을 순차로 돌며 유지하고, 컷마다
-    heartbeat를 보내 긴 LLM 처리에서도 타임아웃 타이머를 갱신한다. 기존 'llm' 어노테이션
-    정리는 코어가 내부에서 수행한다(재실행 완전 교체).
-    """
-    from src.core import step3
-
-    def _hb(done: int) -> None:
-        activity.heartbeat(done)
-
-    return step3.analyze_episode_scenes(ep.webtoon_episode_id, heartbeat_cb=_hb)
-
-
 # ── step3 2-pass (step3a 추출 → step3b 해소 → step3c 커밋) ─────────────────────
 #
 # 에피소드 단위 2-pass 재구성(Req 9.1). LLM 스테이지는 2개로 한정한다:
@@ -245,13 +225,28 @@ def step3a_extract(ep: EpisodeInput) -> dict:
     넘긴다(Req 9.3). per-call LLMUsage 적재는 코어가 내부에서 수행한다(Req 6.7).
     """
     from dataclasses import asdict
-    from src.core import step3
+    from src.core import runs, step3
+    from src.operators.llm_resolver import resolve_llm_model
 
     def _hb(done: int) -> None:
         activity.heartbeat(done)
 
-    result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb)
-    return asdict(result)
+    webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
+    ctx = resolve_llm_model(webtoon_id)
+    run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_VISION,
+                            llm_model_id=ctx.get("id"))
+    try:
+        result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb, run_id=run_id)
+    except Exception as e:
+        runs.finish_run(run_id, status="failed", error=str(e))
+        raise
+    runs.finish_run(run_id, stats={
+        "cuts_total": result.cuts_total, "cuts_analyzed": result.cuts_analyzed,
+        "cuts_skipped": result.cuts_skipped, "usage": result.usage_total,
+    })
+    out = asdict(result)
+    out["run_id"] = run_id
+    return out
 
 
 @activity.defn
@@ -271,6 +266,8 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     from src.core.step3 import ExtractResult, Pass1Record
     from src.operators.narrative_context import load_prior
 
+    from src.core import runs
+
     # 긴 텍스트 해소 콜 전 하트비트(윈도우 경로는 콜백 없음 — 최소 1회 갱신).
     activity.heartbeat("resolve:start")
 
@@ -278,6 +275,7 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     prior = load_prior(webtoon_id, ep.episode_no)
 
     # ExtractResult 재구성(records는 Pass1Record 데이터클래스로 복원 — windowed 경로가 속성 접근).
+    vision_run_id = extract.get("run_id")
     records = [Pass1Record(**r) for r in extract.get("records", [])]
     extract_obj = ExtractResult(
         webtoon_episode_id=extract.get("webtoon_episode_id", ep.webtoon_episode_id),
@@ -289,23 +287,42 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
         usage_total=extract.get("usage_total", {}),
     )
 
-    result = step3.resolve_episode_windowed(extract_obj, prior, webtoon_id=webtoon_id)
-    return asdict(result)
+    # resolve run 시작(R+N+apply가 공유; apply 성공 시 step3c가 succeeded 전이).
+    from src.operators.llm_resolver import resolve_llm_model
+    ctx = resolve_llm_model(webtoon_id)
+    run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_RESOLVE,
+                            llm_model_id=ctx.get("id"), vision_run_id=vision_run_id)
+    try:
+        result = step3.resolve_and_narrate(extract_obj, prior, webtoon_id=webtoon_id,
+                                           ctx=ctx, run_id=run_id)
+    except Exception as e:
+        runs.finish_run(run_id, status="failed", error=str(e))
+        raise
+    out = asdict(result)
+    out["run_id"] = run_id
+    return out
 
 
 @activity.defn
 def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
     """Pass-2b 결정론 커밋(step3c) — **LLM 없음**. `ResolveResult`를 에피소드 전체 DB에 투영. 반환: episode_meta.
 
-    `resolution`은 step3b_resolve가 반환한 `ResolveResult` 직렬화 dict다. 함수 내부에서 `ResolveResult`로
-    복원해 `step3.apply_resolution`에 넘긴다(소급 전파·멱등·동결 보장 — Req 5). 결정론 단계라 빠르지만,
-    안전하게 시작 시 하트비트를 1회 보낸다. apply_resolution은 커밋 후 `narrative_context.fold`로 누적
-    서사 상태를 갱신하고 fold 입력으로 쓴 episode_meta dict를 반환한다(Req 11.4).
+    `resolution`은 step3b_resolve가 반환한 `ResolveResult` 직렬화 dict(+run_id)다. 함수 내부에서
+    `ResolveResult`로 복원해 `step3.apply_resolution`에 넘긴다(소급 전파·멱등·동결 보장 — Req 5).
+    커밋 성공 시 resolve run을 succeeded로 전이한다 — 이 순간이 "에피소드 step3 완료"의 정본이다
+    (§17.1: 진행도 도출, stale 도출 기준 시각).
     """
-    from src.core import step3
+    from src.core import runs, step3
     from src.core.step3 import ResolveResult
 
     activity.heartbeat("apply:start")
 
+    run_id = resolution.pop("run_id", None)
     result = ResolveResult(**resolution)
-    return step3.apply_resolution(ep.webtoon_episode_id, result)
+    meta = step3.apply_resolution(ep.webtoon_episode_id, result, run_id=run_id)
+    if run_id is not None:
+        if result.error:
+            runs.finish_run(run_id, status="failed", error=str(result.error))
+        else:
+            runs.finish_run(run_id, stats=meta.get("stats") or {})
+    return meta
