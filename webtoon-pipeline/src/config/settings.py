@@ -19,6 +19,12 @@ S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
 S3_REGION_NAME = os.getenv("S3_REGION_NAME", "us-east-1")
 S3_LOCATION = os.getenv("S3_LOCATION", "media")
 
+# R2 (얼굴 crop 전용 Cloudflare R2 버킷. 다른 이미지는 계속 위 S3에 남는다)
+R2_ENDPOINT_URL = os.getenv("R2_HOST", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "face")
+
 # source → S3 media path 매핑 (service 레포 imageBaseForSource 패턴과 동일)
 SOURCE_MEDIA_PATH: dict[str, str] = {
     "kakao": "kakao_webtoon",

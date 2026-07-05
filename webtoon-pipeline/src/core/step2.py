@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
-from src.config.s3 import fetch_face_crop
+from src.config.r2 import fetch_face_crop
 from src.operators.embedding import embed_for
 from src.operators.matching import find_match, load_ccip_anchors
 from src.operators.model_resolver import resolve_embedding_model

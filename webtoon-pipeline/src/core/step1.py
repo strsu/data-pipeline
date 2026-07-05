@@ -35,7 +35,8 @@ from PIL import Image
 
 from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
-from src.config.s3 import delete_face_crop, fetch_cut_image, upload_face_crop
+from src.config.r2 import delete_face_crop, upload_face_crop
+from src.config.s3 import fetch_cut_image
 from src.operators.cut_merger import _content_intervals
 from src.operators.ocr_yolo_client import run_ocr, run_yolo
 
