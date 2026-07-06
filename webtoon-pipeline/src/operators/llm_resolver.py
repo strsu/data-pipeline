@@ -60,6 +60,25 @@ def _row_to_ctx(row) -> dict:
     }
 
 
+def _resolve_fallback(cur, fallback_id) -> Optional[dict]:
+    """fallback self-FK → 폴백 모델 ctx(1홉, 자기 폴백은 미포함 — 순환 방지). B1.5 런타임 전환용.
+
+    비활성/삭제 폴백은 무시(None). ctx["fallback"]로 실려 call_llm_json이 primary 소진 시 사용.
+    """
+    if not fallback_id:
+        return None
+    cur.execute(
+        """
+        SELECT id, name, provider, model_id, params, supports_vision
+        FROM config_llm_model
+        WHERE id = %s AND is_active = true AND deleted_at IS NULL
+        """,
+        (fallback_id,),
+    )
+    frow = cur.fetchone()
+    return _row_to_ctx(frow) if frow else None
+
+
 def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
     """스테이지 role("vision"|"text")의 LLM 모델을 해석한다.
 
@@ -80,7 +99,7 @@ def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
             # 1) role 기본 모델(도출): is_default·is_active·supports_vision 일치.
             cur.execute(
                 """
-                SELECT id, name, provider, model_id, params, supports_vision
+                SELECT id, name, provider, model_id, params, supports_vision, fallback_id
                 FROM config_llm_model
                 WHERE is_default = true AND is_active = true
                   AND supports_vision = %s AND deleted_at IS NULL
@@ -94,7 +113,7 @@ def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
                 # 2) 강등: modality 무관 아무 활성 기본(시드 전/롤백 경로 — 오늘 동작 유지).
                 cur.execute(
                     """
-                    SELECT id, name, provider, model_id, params, supports_vision
+                    SELECT id, name, provider, model_id, params, supports_vision, fallback_id
                     FROM config_llm_model
                     WHERE is_default = true AND is_active = true AND deleted_at IS NULL
                     ORDER BY id ASC
@@ -106,6 +125,7 @@ def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
                     print(f"[llm_resolver] role={role} 전용 기본 없음 — 전역 default로 강등: {row[1]}")
             if row is not None:
                 result = _row_to_ctx(row)
+                result["fallback"] = _resolve_fallback(cur, row[6])  # 런타임 폴백(B1.5)
     except Exception as e:
         print(f"[llm_resolver] resolve 실패 webtoon_id={webtoon_id} role={role}, 폴백 사용: {e}")
 

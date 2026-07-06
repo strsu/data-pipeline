@@ -126,7 +126,38 @@ def call_llm_json(
     ctx: resolve_llm_model() 결과. images: 순서대로 전달할 이미지 바이트 목록.
     반환 `.result`는 파싱된 JSON dict, `.usage`는 LLMUsage 적재용
     {prompt_tokens, completion_tokens, total_tokens, finish_reason} (Req 6.7).
+
+    런타임 폴백(B1.5): ctx["fallback"](resolve_llm_model이 self-FK로 해석)이 있으면 primary가
+    재시도를 모두 소진(장애/4xx)한 뒤 폴백 모델로 1회전 더 시도한다(예: glm-5.2 → qwen-vl).
     """
+    chain: list[dict] = [ctx]
+    fb = ctx.get("fallback")
+    if isinstance(fb, dict) and fb.get("model_id"):
+        chain.append(fb)
+
+    last_exc: Exception = RuntimeError("unreachable")
+    for idx, c in enumerate(chain):
+        try:
+            return _call_model_with_retries(c, system_prompt, user_text, images, is_fallback=idx > 0)
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            last_exc = e
+            nxt = chain[idx + 1] if idx + 1 < len(chain) else None
+            if nxt is not None:
+                _logger.warning(
+                    "[llm] 모델 %s 소진 — 폴백 %s로 전환: %s",
+                    c.get("model_id"), nxt.get("model_id"), e,
+                )
+    raise last_exc
+
+
+def _call_model_with_retries(
+    ctx: dict,
+    system_prompt: str,
+    user_text: str,
+    images: list[bytes],
+    is_fallback: bool = False,
+) -> LLMCallResult:
+    """단일 모델(ctx) 대상 스트리밍 호출 + 재시도(10회 지수 백오프, 4xx 즉시 실패)."""
     params = ctx.get("params") or {}
     endpoint = _resolve_endpoint(ctx)
     if not endpoint:
@@ -153,6 +184,7 @@ def call_llm_json(
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
 
+    tag = ("fallback " if is_fallback else "") + str(ctx.get("model_id"))
     last_exc: Exception = RuntimeError("unreachable")
     for attempt in range(1, _LLM_MAX_ATTEMPTS + 1):
         try:
@@ -162,19 +194,19 @@ def call_llm_json(
                 return _stream_llm_once(endpoint, body, headers)
         except (httpx.HTTPStatusError, httpx.TransportError) as e:
             if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
-                _logger.error("[llm] %s 4xx 실패(재시도 안 함) — %s", endpoint, e)
+                _logger.error("[llm] %s(%s) 4xx 실패(재시도 안 함) — %s", endpoint, tag, e)
                 raise
             last_exc = e
             if attempt == _LLM_MAX_ATTEMPTS:
                 _logger.error(
-                    "[llm] %s 최종 실패(%d/%d회 모두 실패) — %s",
-                    endpoint, attempt, _LLM_MAX_ATTEMPTS, e,
+                    "[llm] %s(%s) 최종 실패(%d/%d회 모두 실패) — %s",
+                    endpoint, tag, attempt, _LLM_MAX_ATTEMPTS, e,
                 )
                 break
             delay = min(_LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1)), _LLM_RETRY_MAX_DELAY)
             _logger.warning(
-                "[llm] %s 실패(attempt %d/%d) — %s — %.1fs 후 재시도",
-                endpoint, attempt, _LLM_MAX_ATTEMPTS, e, delay,
+                "[llm] %s(%s) 실패(attempt %d/%d) — %s — %.1fs 후 재시도",
+                endpoint, tag, attempt, _LLM_MAX_ATTEMPTS, e, delay,
             )
             time.sleep(delay)
     raise last_exc
@@ -264,13 +296,20 @@ def extract_message_text(message: dict) -> str:
 # 강건 JSON 파싱용 디코더 — raw_decode로 첫 객체만 떼어내 뒤 잡텍스트("Extra data")를 무시한다.
 _DECODER = json.JSONDecoder()
 
+# json-repair 폴백(B2/§5.5) — glm-4.6v가 finish='stop'인데 살짝 깨진 JSON(콤마 누락 등)을
+# 뱉어 컷이 통째 드롭되던 것을 복구한다. 라이브러리 부재 시 폴백만 비활성(strict 파싱은 유지).
+try:
+    from json_repair import repair_json as _repair_json
+except Exception:  # pragma: no cover - 의존성 부재 방어
+    _repair_json = None
+
 
 def _parse_json_content(text: str) -> dict:
     """모델 응답에서 첫 JSON 객체만 강건하게 추출(코드펜스/여분 텍스트 방어).
 
-    raw_decode 기반: 코드펜스(```json ... ```)를 벗기고, 첫 '{' 위치부터 한 개의
-    JSON 객체만 디코드한다. 객체 뒤에 잡텍스트가 따라와도(JSONDecoder.raw_decode가
-    Extra data를 던지지 않으므로) 무시하고 첫 객체만 반환한다.
+    1) raw_decode: 코드펜스(```json ... ```)를 벗기고 첫 '{'부터 한 객체만 디코드(뒤 잡텍스트 무시).
+    2) 실패 시 json-repair 폴백: 콤마/괄호 누락 등 경미한 손상을 보정해 재파싱한다(B2).
+       'Expecting ',' delimiter'류(finish='stop'인데 깨진 JSON)를 살려 컷 드롭을 줄인다.
     """
     s = (text or "").strip()
     if s.startswith("```"):
@@ -281,5 +320,15 @@ def _parse_json_content(text: str) -> dict:
     i = s.find("{")
     if i == -1:
         raise ValueError("no json object")
-    obj, _ = _DECODER.raw_decode(s[i:])  # 첫 객체만, 뒤 잡텍스트 무시
-    return obj
+    frag = s[i:]
+    try:
+        obj, _ = _DECODER.raw_decode(frag)  # 첫 객체만, 뒤 잡텍스트 무시
+        return obj
+    except json.JSONDecodeError:
+        if _repair_json is None:
+            raise
+        repaired = _repair_json(frag, return_objects=True)  # 경미한 손상 보정
+        if isinstance(repaired, dict) and repaired:
+            _logger.warning("[llm] JSON 손상 — json-repair 폴백으로 복구(%d자)", len(frag))
+            return repaired
+        raise  # 복구 실패(빈 객체/비-dict) → 원래 JSONDecodeError 전파

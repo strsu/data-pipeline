@@ -59,7 +59,7 @@ _PENDING_SPEAKER_MAX_CONFIDENCE = 0.5
 _PASS1_STAGE = "vision"  # LLMUsage.stage — Stage V 컷 비전 콜(step3a).
 # LLMUsage.stage 허용값(service `LLMStage` enum과 일치) — usage 적재의 단일 진실원천.
 # vision=컷 비전(V), resolve=정체·화자 해소(R), narrative=서사 분석(N), arc=아크 종합(A).
-_USAGE_STAGES = ("vision", "resolve", "narrative", "arc")
+_USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc")
 
 # ── Pass-1 (컷별 provisional 추출) ────────────────────────────────────────────
 # 정본: qwen-vl/_pass1.py SYS 프롬프트를 그대로 이관(분류 먼저→화자 나중, strict JSON,
@@ -325,22 +325,41 @@ def _downscale(image_bytes: bytes, max_dim: int = _PASS1_MAX_DIM) -> bytes:
     return bio.getvalue()
 
 
-def _pass1_ctx(ctx: dict) -> dict:
-    """추출 콜 전용 ctx 사본 — max_tokens>=4096(Req 7.2), temperature<=0.2(Req 7.5) 강제."""
-    params = dict(ctx.get("params") or {})
+def _clamp_call_params(params, max_temp: float, min_max_tokens: int) -> dict:
+    """호출용 params 보정: temperature<=max_temp(상한), max_tokens>=min_max_tokens(하한)."""
+    p = dict(params or {})
     try:
-        temp = float(params.get("temperature", _PASS1_MAX_TEMPERATURE))
+        temp = float(p.get("temperature", max_temp))
     except (TypeError, ValueError):
-        temp = _PASS1_MAX_TEMPERATURE
-    params["temperature"] = max(0.0, min(_PASS1_MAX_TEMPERATURE, temp))
+        temp = max_temp
+    p["temperature"] = max(0.0, min(max_temp, temp))
     try:
-        mt = int(params.get("max_tokens") or 0)
+        mt = int(p.get("max_tokens") or 0)
     except (TypeError, ValueError):
         mt = 0
-    params["max_tokens"] = max(mt, _PASS1_MIN_MAX_TOKENS)
+    p["max_tokens"] = max(mt, min_max_tokens)
+    return p
+
+
+def _stage_ctx(ctx: dict, max_temp: float, min_max_tokens: int) -> dict:
+    """스테이지 전용 ctx 사본 — primary params 보정 + 폴백(ctx['fallback']) params도 동일 보정(B1.5).
+
+    폴백 ctx도 같은 스테이지 제약으로 clamp해둬야 call_llm_json이 전환 시 스테이지에 맞는
+    max_tokens/temperature로 호출한다.
+    """
     out = dict(ctx)
-    out["params"] = params
+    out["params"] = _clamp_call_params(ctx.get("params"), max_temp, min_max_tokens)
+    fb = ctx.get("fallback")
+    if isinstance(fb, dict):
+        fb2 = dict(fb)
+        fb2["params"] = _clamp_call_params(fb.get("params"), max_temp, min_max_tokens)
+        out["fallback"] = fb2
     return out
+
+
+def _pass1_ctx(ctx: dict) -> dict:
+    """추출 콜 전용 ctx — max_tokens>=16384(Req 7.2), temperature<=0.2(Req 7.5) 강제(+폴백 동일)."""
+    return _stage_ctx(ctx, _PASS1_MAX_TEMPERATURE, _PASS1_MIN_MAX_TOKENS)
 
 
 def _sanitize_speaker(raw, btype) -> dict:
@@ -944,6 +963,47 @@ _NARRATIVE_SYSTEM_PROMPT = (
     "없는 정보는 지어내지 말 것(null). **자연어는 반드시 한국어.**"
 )
 
+# ── Stage 로스터(who-is-who) — R 앞 텍스트 콜, 에피소드 전역 인물 로스터 추출(§5.2/B3) ──
+# 목적: 추론 스테이지(R/N)에 '권위 있는 서사 로스터'를 주입해 who-is-who 혼동(현재 미등장/사망
+# 인물을 화면 인물로 오지목)을 없앤다. 손-로스터 주입 실험에서 who 혼동 0/6으로 검증됨.
+_ROSTER_STAGE = "roster"  # LLMUsage.stage — Stage 로스터 추출 콜(step3b, R 앞).
+
+_ROSTER_SYSTEM_PROMPT = (
+    "당신은 웹툰 에피소드 트랜스크립트를 읽고 **이 화의 권위 있는 인물 로스터**를 만드는 분석기입니다. "
+    "⚠️ **모든 자연어 출력은 반드시 한국어로 작성한다.** "
+    "입력은 컷별 cut_summary/blocks(대사·독백·나레이션)/name_evidence/faces + 이전 화까지의 "
+    "confirmed_roster_prior다. 아래 규칙으로 인물 로스터를 산출하라.\n"
+    "규칙:\n"
+    "- **언급≠등장**: 이름이 불리거나 회상·과거에만 나오는 인물은 present_now=false. "
+    "현재 시점 컷에서 **실제로 행동하거나 발화**하는 인물만 present_now=true.\n"
+    "- **반어·욕설 오독 금지**: '얼어 죽을 X', '너 X 아냐?!' 같은 표현을 그 인물의 실제 등장/정체/생사로 "
+    "단정하지 말 것.\n"
+    "- **회상/현재 분리**: 회상(과거) 컷의 인물은 현재 시점에 별도로 등장하지 않으면 present_now=false.\n"
+    "- **환생/빙의**: 주인공이 다른 몸으로 환생/빙의하면 원래 이름과 현재 몸의 이름을 **한 인물**로 "
+    "묶어라(aliases). 그 정체를 알려주는 조연(정보 전달자)과 혼동하지 말 것.\n"
+    "- **사망/부재**: 죽었거나 이 화에 없는 인물은 present_now=false, status에 근거와 함께 명시.\n"
+    "**JSON만** 출력: {\"roster\": [{"
+    "\"name\": \"대표 이름 또는 지시어\", "
+    "\"aliases\": [\"같은 인물의 다른 이름들(환생 몸 이름/별칭)\"], "
+    "\"present_now\": true/false, "
+    "\"status\": \"생존|사망|불명 + 근거 한 줄\", "
+    "\"role\": \"서사 역할 한 줄\", "
+    "\"evidence\": \"판단 근거(컷·원문)\"}]}. "
+    "없는 정보는 지어내지 말 것. **자연어는 반드시 한국어.**"
+)
+
+# R/N 프롬프트에 공통 주입할 로스터 사용 지침 — episode_roster를 권위 기준으로 삼게 한다.
+_ROSTER_GUIDANCE = (
+    "\n\n【확정 인물 로스터(episode_roster)】 입력의 `episode_roster`는 이 에피소드의 권위 있는 인물 "
+    "목록이다(present_now=현재 시점 실제 등장 여부, status=생사, aliases=동일인의 다른 이름). "
+    "**present_now=false 인 인물(언급·호명·회상·사망 등 현재 미등장)을 현재 화면의 인물로 지목하거나 "
+    "화자로 지정하지 말라.** status가 사망/부재인 인물을 살아있는 현재 인물처럼 다루지 말라. "
+    "aliases로 묶인 이름들은 동일 인물이다. (episode_roster가 비어 있으면 이 지침은 무시.)"
+)
+
+_RESOLVE_SYSTEM_PROMPT = _RESOLVE_SYSTEM_PROMPT + _ROSTER_GUIDANCE
+_NARRATIVE_SYSTEM_PROMPT = _NARRATIVE_SYSTEM_PROMPT + _ROSTER_GUIDANCE
+
 
 @dataclass
 class ResolveResult:
@@ -973,6 +1033,7 @@ class ResolveResult:
     deceptions: list[dict] = field(default_factory=list)
     threads: list[dict] = field(default_factory=list)
     profiles: list[dict] = field(default_factory=list)  # Stage N 산출 — 인물 메타 delta(v4.0)
+    roster: list[dict] = field(default_factory=list)  # who-is-who 로스터(B3, 관찰용 — apply 미커밋)
     usage: dict = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -1018,7 +1079,8 @@ def _prior_to_dict(prior) -> dict:
     return {"confirmed_roster_prior": []}
 
 
-def _build_pass2_user_payload(records: list["Pass1Record"], prior) -> dict:
+def _build_pass2_user_payload(records: list["Pass1Record"], prior,
+                              episode_roster: Optional[list[dict]] = None) -> dict:
     """Pass-1 레코드(읽기순) + prior → Pass-2a user payload(텍스트 트랜스크립트).
 
     `_pass2.py`의 build_transcript 정본을 Pass1Record로 이관: 컷별 cut_summary, blocks
@@ -1081,31 +1143,19 @@ def _build_pass2_user_payload(records: list["Pass1Record"], prior) -> dict:
     payload = dict(_prior_to_dict(prior))  # confirmed_roster_prior(+open_threads/running_summary)
     payload.setdefault("confirmed_roster_prior", [])
     payload["character_roster"] = roster_list
+    if episode_roster:  # who-is-who 로스터(B3) — 있을 때만 주입(빈 값은 프롬프트 지침이 무시).
+        payload["episode_roster"] = episode_roster
     payload["cuts"] = transcript
     return payload
 
 
 def _pass2_ctx(ctx: dict) -> dict:
-    """텍스트 해소 콜 전용 ctx 사본 — max_tokens 넉넉히, temperature<=0.2 강제.
+    """텍스트 해소 콜 전용 ctx — max_tokens 넉넉히, temperature<=0.2 강제(+폴백 동일).
 
-    현 `resolve_llm_model`은 stage(비전/텍스트)별 해석을 지원하지 않으므로 호출부가 해석한 기본
-    ctx를 그대로 받아 파라미터만 보정한다(코드에 모델명 하드코딩 없음 — Req 7.1). 텍스트 모델
-    분리 해석은 후속(llm_resolver stage 인자) 과제다.
+    role(비전/텍스트) 모델 해석은 호출부(`resolve_llm_model(webtoon_id, TEXT)`)가 담당하고,
+    여기서는 스테이지 파라미터만 보정한다(코드에 모델명 하드코딩 없음 — Req 7.1).
     """
-    params = dict(ctx.get("params") or {})
-    try:
-        temp = float(params.get("temperature", _PASS2_MAX_TEMPERATURE))
-    except (TypeError, ValueError):
-        temp = _PASS2_MAX_TEMPERATURE
-    params["temperature"] = max(0.0, min(_PASS2_MAX_TEMPERATURE, temp))
-    try:
-        mt = int(params.get("max_tokens") or 0)
-    except (TypeError, ValueError):
-        mt = 0
-    params["max_tokens"] = max(mt, _PASS2_MIN_MAX_TOKENS)
-    out = dict(ctx)
-    out["params"] = params
-    return out
+    return _stage_ctx(ctx, _PASS2_MAX_TEMPERATURE, _PASS2_MIN_MAX_TOKENS)
 
 
 def _sanitize_profile(raw) -> dict:
@@ -1342,6 +1392,87 @@ def _sanitize_narrative(result: dict) -> dict:
     }
 
 
+def _sanitize_roster(raw) -> list[dict]:
+    """로스터 추출 산출 정규화 → [{name, aliases[], present_now(bool), status, role, evidence}]."""
+    items = raw.get("roster") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = _str_or_empty(it.get("name")).strip()
+        if not name:
+            continue
+        aliases = [a.strip() for a in (it.get("aliases") or [])
+                   if isinstance(a, str) and a.strip()]
+        out.append({
+            "name": name,
+            "aliases": aliases,
+            "present_now": bool(it.get("present_now")),
+            "status": _str_or_empty(it.get("status")).strip(),
+            "role": _str_or_empty(it.get("role")).strip(),
+            "evidence": _str_or_empty(it.get("evidence")).strip(),
+        })
+    return out
+
+
+def extract_roster(
+    webtoon_episode_id: int,
+    records: list["Pass1Record"],
+    prior_context=None,
+    *,
+    webtoon_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    persist_usage: bool = True,
+    run_id: Optional[int] = None,
+) -> dict:
+    """Stage 로스터(who-is-who) — 에피소드 전체 트랜스크립트로 권위 인물 로스터 1콜 추출(B3, §5.2).
+
+    R 앞에서 1회만 호출한다(윈도우와 무관 — 에피소드 전역 시야). 산출 로스터(present_now/status/
+    aliases)를 R·N 프롬프트에 주입해 현재 미등장·사망 인물을 화면 인물로 오지목하는 who-is-who
+    혼동을 없앤다(손-로스터 주입 실험서 who 혼동 0/6). 실패 시 빈 로스터(+error 로그)로 격리 —
+    R/N은 로스터 없이 진행한다(품질 저하지만 중단 없음).
+    반환: {"roster": [...], "usage": {...}, "error": str|None}.
+    """
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    if ctx is None:
+        ctx = resolve_llm_model(webtoon_id, TEXT)
+    call_ctx = _pass2_ctx(ctx)
+
+    payload = _build_pass2_user_payload(records, prior_context)  # 전체 트랜스크립트 + prior
+    user_text = json.dumps(payload, ensure_ascii=False)
+
+    raw_result: dict = {}
+    usage: dict = {}
+    err: Optional[str] = None
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, _ROSTER_SYSTEM_PROMPT, user_text, [])
+            raw_result = call.result if isinstance(call.result, dict) else {}
+            usage = call.usage or {}
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001 — 스테이지 격리(run 중단 금지)
+            err = str(e)
+            raw_result = {}
+
+    if err is not None:
+        logger.warning("[step3.roster] episode %s — 로스터 추출 실패(로스터 없이 진행): %s",
+                       webtoon_episode_id, err)
+        return {"roster": [], "usage": usage, "error": err}
+
+    roster = _sanitize_roster(raw_result)
+    if persist_usage:
+        _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
+                          stage=_ROSTER_STAGE, image_count=None, run_id=run_id)
+    present = sum(1 for r in roster if r.get("present_now"))
+    logger.info("[step3.roster] episode %s — 로스터=%s (present_now=%s) tokens=%s",
+                webtoon_episode_id, len(roster), present, (usage or {}).get("total_tokens"))
+    return {"roster": roster, "usage": usage, "error": None}
+
+
 def resolve_episode(
     ep: "ExtractResult | int",
     prior_context=None,
@@ -1351,6 +1482,7 @@ def resolve_episode(
     ctx: Optional[dict] = None,
     persist_usage: bool = True,
     run_id: Optional[int] = None,
+    episode_roster: Optional[list[dict]] = None,
 ) -> ResolveResult:
     """에피소드 전체 Pass-1 레코드를 텍스트 LLM 1콜로 전역 해소한다(step3b, Pass-2a).
 
@@ -1390,7 +1522,7 @@ def resolve_episode(
         ctx = resolve_llm_model(webtoon_id, TEXT)
     call_ctx = _pass2_ctx(ctx)
 
-    payload = _build_pass2_user_payload(records, prior_context)
+    payload = _build_pass2_user_payload(records, prior_context, episode_roster)
     user_text = json.dumps(payload, ensure_ascii=False)
 
     # Req 7.4 — 1회 재시도(총 2회). 모두 실패하면 빈 결과(+error)로 스킵. 텍스트 콜이므로 images=[].
@@ -1756,6 +1888,7 @@ def resolve_episode_windowed(
     ctx: Optional[dict] = None,
     persist_usage: bool = True,
     run_id: Optional[int] = None,
+    episode_roster: Optional[list[dict]] = None,
 ) -> ResolveResult:
     """컨텍스트 적응형 Stage R 해소 — 토큰 예산에 따라 단일콜/다중윈도우 자동 선택.
 
@@ -1806,7 +1939,7 @@ def resolve_episode_windowed(
         return resolve_episode(
             webtoon_episode_id, prior_context,
             records=records, webtoon_id=webtoon_id, ctx=ctx, persist_usage=persist_usage,
-            run_id=run_id,
+            run_id=run_id, episode_roster=episode_roster,
         )
 
     # 예산 초과 → 읽기순 윈도우 분할 + belief 캐리오버.
@@ -1824,7 +1957,7 @@ def resolve_episode_windowed(
         res = resolve_episode(
             webtoon_episode_id, win_prior,
             records=win, webtoon_id=webtoon_id, ctx=ctx, persist_usage=persist_usage,
-            run_id=run_id,
+            run_id=run_id, episode_roster=episode_roster,
         )
         window_results.append(res)
         carried = _accumulate_carried(carried, res)  # 다음 윈도우로 belief 캐리오버
@@ -1841,7 +1974,7 @@ def resolve_episode_windowed(
 
 def _build_narrative_payload(
     records: list["Pass1Record"], resolve_result: "ResolveResult", prior,
-    id_to_name: dict[int, str],
+    id_to_name: dict[int, str], episode_roster: Optional[list[dict]] = None,
 ) -> dict:
     """Stage N 입력 — Stage R로 화자·정체가 **정정된** 컷 트랜스크립트(v4.0 §17.4).
 
@@ -1881,6 +2014,8 @@ def _build_narrative_payload(
     payload["characters"] = [
         {"character_id": cid, "name": nm} for cid, nm in sorted(names.items()) if nm
     ]
+    if episode_roster:  # who-is-who 로스터(B3) — N도 present_now=false 인물을 현재로 오독하지 않게.
+        payload["episode_roster"] = episode_roster
     payload["cuts"] = cuts
     return payload
 
@@ -1895,6 +2030,7 @@ def narrate_episode(
     ctx: Optional[dict] = None,
     persist_usage: bool = True,
     run_id: Optional[int] = None,
+    episode_roster: Optional[list[dict]] = None,
 ) -> dict:
     """Stage N — 서사 분석 텍스트 1콜(beats/episode(summary+teaser)/deceptions/threads/profiles).
 
@@ -1909,7 +2045,8 @@ def narrate_episode(
     call_ctx = _pass2_ctx(ctx)
 
     id_to_name = _webtoon_character_names(webtoon_id)
-    payload = _build_narrative_payload(records, resolve_result, prior_context, id_to_name)
+    payload = _build_narrative_payload(records, resolve_result, prior_context, id_to_name,
+                                       episode_roster)
     user_text = json.dumps(payload, ensure_ascii=False)
 
     raw_result: dict = {}
@@ -1984,22 +2121,30 @@ def resolve_and_narrate(
     if ctx is None:
         ctx = resolve_llm_model(webtoon_id, TEXT)
 
+    # who-is-who 로스터(B3) — R 앞 1콜. 실패해도 빈 로스터로 R/N 진행(격리).
+    roster_res = extract_roster(
+        webtoon_episode_id, records or [], prior_context,
+        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+    )
+    episode_roster = roster_res.get("roster") or []
+
     r = resolve_episode_windowed(
         webtoon_episode_id, prior_context,
         records=records, webtoon_id=webtoon_id, ctx=ctx,
-        token_budget=token_budget, run_id=run_id,
+        token_budget=token_budget, run_id=run_id, episode_roster=episode_roster,
     )
     if r.error:
+        r.roster = episode_roster
         return r
 
     n = narrate_episode(
         webtoon_episode_id, records or [], r, prior_context,
-        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id, episode_roster=episode_roster,
     )
     usage = dict(r.usage or {})
-    n_usage = n.get("usage") or {}
-    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        usage[k] = int(usage.get(k, 0) or 0) + int(n_usage.get(k, 0) or 0)
+    for extra in (roster_res.get("usage") or {}, n.get("usage") or {}):
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            usage[k] = int(usage.get(k, 0) or 0) + int(extra.get(k, 0) or 0)
 
     return ResolveResult(
         webtoon_episode_id=webtoon_episode_id,
@@ -2011,6 +2156,7 @@ def resolve_and_narrate(
         deceptions=n.get("deceptions") or [],
         threads=n.get("threads") or [],
         profiles=n.get("profiles") or [],
+        roster=episode_roster,
         usage=usage,
     )
 
