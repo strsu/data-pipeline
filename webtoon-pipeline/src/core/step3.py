@@ -2295,7 +2295,8 @@ def _project_characters(
                     sets.append("kind = 'character'")
                     sets.append("is_name_auto_assigned = true")
                     claimed_names.add(name.lower())
-                else:
+                elif name != _cur_name:
+                    # 현재 이름과 동일하면 제안 생략 — 실질 변화 없는 중복 노이즈(회차마다 재생성 방지).
                     suggestions.append({
                         "character_id": cid, "name": name,
                         "confidence": conf, "evidence": evidence,
