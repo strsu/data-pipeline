@@ -84,6 +84,51 @@ _LLM_MAX_ATTEMPTS = 10
 _LLM_RETRY_BASE_DELAY = 1.0
 _LLM_RETRY_MAX_DELAY = 8.0
 
+# ── 동적 max_tokens(출력 상한) — 입력+출력 ≤ context_window 보장 ──────────────────
+# max_tokens는 '출력' 예약이라 고정값(예 100000)은 입력이 커지면 입력+출력이 context_window를
+# 넘겨 400(ContextWindowExceeded)을 낸다. 그래서 params.context_window(모델 총 컨텍스트)에서
+# 입력추정 + 마진을 빼 출력 상한을 콜마다 동적으로 정한다. DB엔 params.context_window를 넣는다
+# (모델별: glm-4.6v=32768, glm-5.2/qwen-vl=131072). params.max_tokens는 선택적 추가 상한.
+_INPUT_CHARS_PER_TOKEN = 1.6   # 입력 토큰 추정(한글+JSON). 실측(1101: chars≈120794 / input≈70k → 1.73)보다
+                               # 보수적으로 잡아 입력을 과대추정 → 출력 여유를 줄여 400을 예방한다.
+_IMAGE_TOKENS_EST = 1500       # 비전 이미지 1장당 대략 토큰(컷 오버레이 기준 보수치).
+_CONTEXT_SAFETY_MARGIN = 2048  # 추정 오차/특수토큰 대비 여유.
+_MIN_OUTPUT_TOKENS = 4096      # 최소 출력 보장(추론형 모델 여유). 입력이 과대하면 이 밑으로도 갈 수 있음(로그).
+
+
+def _estimate_input_tokens(system_prompt: str, user_text: str, images: list[bytes]) -> int:
+    """콜 입력 토큰 대략 추정(system+user 텍스트 + 이미지). 보수적(over-estimate)."""
+    chars = len(system_prompt or "") + len(user_text or "")
+    return int(chars / _INPUT_CHARS_PER_TOKEN) + len(images or []) * _IMAGE_TOKENS_EST
+
+
+def _resolve_max_tokens(
+    params: dict, system_prompt: str, user_text: str, images: list[bytes],
+) -> Optional[int]:
+    """출력 max_tokens 결정.
+
+    - params.context_window 있으면 **동적**: context_window − 입력추정 − 마진(입력+출력이 컨텍스트를
+      넘지 않게). params.max_tokens가 함께 있으면 추가 상한으로 더 낮춘다.
+    - context_window 없으면 레거시 params.max_tokens 그대로. 둘 다 없으면 None(서버 기본).
+    """
+    cw = params.get("context_window")
+    if cw:
+        input_est = _estimate_input_tokens(system_prompt, user_text, images)
+        avail = int(cw) - input_est - _CONTEXT_SAFETY_MARGIN
+        cap = params.get("max_tokens")
+        if cap:
+            avail = min(avail, int(cap))
+        if avail < _MIN_OUTPUT_TOKENS:
+            _logger.warning(
+                "[llm] 입력추정 %s + 마진이 context_window %s에 근접 — max_tokens=%s (입력 과대 시 "
+                "400 가능 — 윈도우 분할 필요)", input_est, cw, max(avail, _MIN_OUTPUT_TOKENS),
+            )
+        return max(_MIN_OUTPUT_TOKENS, avail)
+    if params.get("max_tokens"):
+        return int(params["max_tokens"])
+    return None
+
+
 _client: httpx.Client | None = None
 
 
@@ -176,8 +221,9 @@ def _call_model_with_retries(
         "temperature": params.get("temperature", 0.2),
         "response_format": {"type": "json_object"},
     }
-    if params.get("max_tokens"):
-        body["max_tokens"] = params["max_tokens"]
+    max_out = _resolve_max_tokens(params, system_prompt, user_text, images)
+    if max_out:
+        body["max_tokens"] = max_out
 
     headers = {"Authorization": f"Bearer {_resolve_api_key(ctx)}"}
     # 스트리밍으로 호출한다 — Cloudflare 터널 idle timeout 회피(토큰이 계속 흘러와 연결 유휴 없음).

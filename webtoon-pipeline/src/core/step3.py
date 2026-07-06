@@ -35,13 +35,8 @@ _NAME_AUTO_CONFIDENCE = 0.85
 
 # Pass-1(컷별 provisional 추출) 상수 — 비전 1콜 throughput/품질 가드.
 _PASS1_MAX_DIM = 1280          # 다운스케일 상한(긴 변, px)
-_PASS1_MIN_MAX_TOKENS = 16384  # Req 7.2 — 절단 방지(>=4096 → 8192 → 16384로 재상향).
-# glm-4.6v 등 추론형 모델은 답 이전에 reasoning_content로 사고과정을 먼저 소모하는데,
-# max_tokens는 reasoning+content 합산 예산이라 4096으로는 컷이 복잡하면(블록 많음 등)
-# 본문이 잘려 JSON 파싱이 깨진다(실사례: ep=11 cut=2 "Unterminated string" — 2026-07-04).
-# 8192로도 naver/820097 전 회차에서 finish_reason='length' 절단이 7건 잔존(2026-07-05 실측)
-# → 16384로 재상향. GLM-4.6v 비전 컨텍스트 32K 중 입력(이미지 ~1.3K + 프롬프트)이 작아 여유 있음.
-# DB(llm_model.params)에 명시적 max_tokens가 없어 이 floor가 그대로 적용되는 게 확인됨.
+# 출력 max_tokens는 llm_client가 params.context_window로 동적 산정(입력+출력 ≤ context_window).
+# 종전 고정 floor(16384)/고정값은 입력이 커지면 400(ContextWindowExceeded)을 유발해 폐기.
 _PASS1_MAX_TEMPERATURE = 0.2   # Req 7.5 — 추출 단계 저온도(0.0~0.2)
 _PASS1_RETRIES = 2             # Req 7.4 — 파싱/일시 오류 1회 재시도(총 2회 시도)
 # 컷 간 belief 의존성 없음(연속성은 Pass-2 담당 — Req 1.2) → extract_cut 호출 자체는 컷 간
@@ -325,41 +320,40 @@ def _downscale(image_bytes: bytes, max_dim: int = _PASS1_MAX_DIM) -> bytes:
     return bio.getvalue()
 
 
-def _clamp_call_params(params, max_temp: float, min_max_tokens: int) -> dict:
-    """호출용 params 보정: temperature<=max_temp(상한), max_tokens>=min_max_tokens(하한)."""
+def _clamp_call_params(params, max_temp: float) -> dict:
+    """호출용 params 보정: temperature<=max_temp(상한)만.
+
+    max_tokens(출력 상한)는 여기서 손대지 않는다 — llm_client가 params.context_window 기반으로
+    콜마다 동적 산정한다(입력+출력 ≤ context_window 보장). context_window/max_tokens는 params에
+    그대로 통과시킨다.
+    """
     p = dict(params or {})
     try:
         temp = float(p.get("temperature", max_temp))
     except (TypeError, ValueError):
         temp = max_temp
     p["temperature"] = max(0.0, min(max_temp, temp))
-    try:
-        mt = int(p.get("max_tokens") or 0)
-    except (TypeError, ValueError):
-        mt = 0
-    p["max_tokens"] = max(mt, min_max_tokens)
     return p
 
 
-def _stage_ctx(ctx: dict, max_temp: float, min_max_tokens: int) -> dict:
-    """스테이지 전용 ctx 사본 — primary params 보정 + 폴백(ctx['fallback']) params도 동일 보정(B1.5).
+def _stage_ctx(ctx: dict, max_temp: float) -> dict:
+    """스테이지 전용 ctx 사본 — primary + 폴백(ctx['fallback']) params의 temperature 보정(B1.5).
 
-    폴백 ctx도 같은 스테이지 제약으로 clamp해둬야 call_llm_json이 전환 시 스테이지에 맞는
-    max_tokens/temperature로 호출한다.
+    출력 max_tokens는 llm_client가 context_window로 동적 산정하므로 여기선 건드리지 않는다.
     """
     out = dict(ctx)
-    out["params"] = _clamp_call_params(ctx.get("params"), max_temp, min_max_tokens)
+    out["params"] = _clamp_call_params(ctx.get("params"), max_temp)
     fb = ctx.get("fallback")
     if isinstance(fb, dict):
         fb2 = dict(fb)
-        fb2["params"] = _clamp_call_params(fb.get("params"), max_temp, min_max_tokens)
+        fb2["params"] = _clamp_call_params(fb.get("params"), max_temp)
         out["fallback"] = fb2
     return out
 
 
 def _pass1_ctx(ctx: dict) -> dict:
-    """추출 콜 전용 ctx — max_tokens>=16384(Req 7.2), temperature<=0.2(Req 7.5) 강제(+폴백 동일)."""
-    return _stage_ctx(ctx, _PASS1_MAX_TEMPERATURE, _PASS1_MIN_MAX_TOKENS)
+    """추출 콜 전용 ctx — temperature<=0.2 강제(+폴백 동일). 출력 상한은 context_window로 동적."""
+    return _stage_ctx(ctx, _PASS1_MAX_TEMPERATURE)
 
 
 def _sanitize_speaker(raw, btype) -> dict:
@@ -887,9 +881,7 @@ def extract_episode(
 # 감싼다 — 본 태스크는 단일콜 경로만 구현한다.
 _PASS2_STAGE = "resolve"        # LLMUsage.stage — Stage R 정체·화자 해소 콜(step3b 1/2).
 _NARRATIVE_STAGE = "narrative"  # LLMUsage.stage — Stage N 서사 분석 콜(step3b 2/2).
-_PASS2_MIN_MAX_TOKENS = 16384    # 대용량 구조화 출력(characters/beats/...) 절단 방지(넉넉히).
-# speaker_resolution이 '불확실 블록만'에서 '모든 speech/monologue 전수 테이블'로 바뀌어(2026-07-05)
-# 출력량이 크게 늘었고, 추론형 모델의 reasoning 소모까지 감안해 16384로 상향.
+# 출력 max_tokens는 llm_client가 params.context_window로 동적 산정(입력+출력 ≤ context_window).
 _PASS2_MAX_TEMPERATURE = 0.2     # 해소는 결정론 지향(0.0~0.2).
 _PASS2_RETRIES = _PASS1_RETRIES  # 파싱/일시 오류 1회 재시도(총 2회 시도).
 _SIGNIFICANCE = ("main", "supporting", "minor_functional", "extra")  # Req 2.3
@@ -1155,7 +1147,7 @@ def _pass2_ctx(ctx: dict) -> dict:
     role(비전/텍스트) 모델 해석은 호출부(`resolve_llm_model(webtoon_id, TEXT)`)가 담당하고,
     여기서는 스테이지 파라미터만 보정한다(코드에 모델명 하드코딩 없음 — Req 7.1).
     """
-    return _stage_ctx(ctx, _PASS2_MAX_TEMPERATURE, _PASS2_MIN_MAX_TOKENS)
+    return _stage_ctx(ctx, _PASS2_MAX_TEMPERATURE)
 
 
 def _sanitize_profile(raw) -> dict:
