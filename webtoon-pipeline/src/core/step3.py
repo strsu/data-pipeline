@@ -26,7 +26,7 @@ from src.config.db import db_cursor
 from src.config.s3 import fetch_cut_image
 from src.operators import narrative_context
 from src.operators.llm_client import call_llm_json
-from src.operators.llm_resolver import resolve_llm_model
+from src.operators.llm_resolver import TEXT, VISION, resolve_llm_model
 from src.operators.overlay import overlay_faces
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,8 @@ _PASS1_SYSTEM_PROMPT = (
     "confirmed=false는 얼굴인식 추정값이라 이미지/대사와 어긋나 보이면 name_evidence로 이의만 남긴다.\n"
     "⚠️ **모든 자연어 출력(cut_summary/key_objects/name_evidence 등)은 반드시 한국어로 작성한다** "
     "(예외: corrected_text만 OCR 원문 언어 유지). 영어 등 다른 언어로 답하지 말 것.\n"
+    "⚠️ **cut_summary 등 서술형 텍스트 안에서 대사·문구를 인용할 때 큰따옴표(\")를 쓰지 마라** — "
+    "JSON 문자열 안의 큰따옴표는 파싱을 깨뜨린다. 인용이 필요하면 작은따옴표(')나 낫표(「」)를 쓴다.\n"
     "규칙:\n"
     "1) blocks는 ocr_blocks의 모든 index에 1:1(병합·분할·생략·재번호 금지), index 유지.\n"
     "2) **[1단계: 분류 먼저]** 모든 블록의 type을 먼저 정한다. type: speech|monologue|narration|system|other. "
@@ -555,7 +557,7 @@ def extract_cut(
 
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
-    call_ctx = _pass1_ctx(ctx or resolve_llm_model(webtoon_id))
+    call_ctx = _pass1_ctx(ctx or resolve_llm_model(webtoon_id, VISION))
 
     overlay_img = _downscale(overlay_faces(img, faces), _PASS1_MAX_DIM)
     user_text = json.dumps({
@@ -780,7 +782,7 @@ def extract_episode(
     """
     info = _episode_info(webtoon_episode_id)
     webtoon_id = _get_webtoon_id(webtoon_episode_id)
-    ctx = resolve_llm_model(webtoon_id)  # 에피소드당 1회 해석 → 컷마다 재사용
+    ctx = resolve_llm_model(webtoon_id, VISION)  # 에피소드당 1회 해석 → 컷마다 재사용
     llm_model_id = ctx.get("id")
 
     if prepare:
@@ -1385,7 +1387,7 @@ def resolve_episode(
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     if ctx is None:
-        ctx = resolve_llm_model(webtoon_id)
+        ctx = resolve_llm_model(webtoon_id, TEXT)
     call_ctx = _pass2_ctx(ctx)
 
     payload = _build_pass2_user_payload(records, prior_context)
@@ -1790,7 +1792,7 @@ def resolve_episode_windowed(
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     if ctx is None:
-        ctx = resolve_llm_model(webtoon_id)
+        ctx = resolve_llm_model(webtoon_id, TEXT)
 
     budget = _resolve_token_budget(ctx, token_budget)
     estimate = _estimate_payload_tokens(records, prior_context)
@@ -1903,7 +1905,7 @@ def narrate_episode(
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     if ctx is None:
-        ctx = resolve_llm_model(webtoon_id)
+        ctx = resolve_llm_model(webtoon_id, TEXT)
     call_ctx = _pass2_ctx(ctx)
 
     id_to_name = _webtoon_character_names(webtoon_id)
@@ -1980,7 +1982,7 @@ def resolve_and_narrate(
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     if ctx is None:
-        ctx = resolve_llm_model(webtoon_id)
+        ctx = resolve_llm_model(webtoon_id, TEXT)
 
     r = resolve_episode_windowed(
         webtoon_episode_id, prior_context,
@@ -3067,13 +3069,15 @@ def reresolve_episode(
     info = _episode_info(webtoon_episode_id)
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
-    ctx = resolve_llm_model(webtoon_id)
-    llm_model_id = ctx.get("id")
+    # 혼합 오케스트레이터: 비전 재추출은 vision 모델, R/N 재해소는 text 모델(role별 해석).
+    text_ctx = resolve_llm_model(webtoon_id, TEXT)
+    text_model_id = text_ctx.get("id")
+    vision_model_id = resolve_llm_model(webtoon_id, VISION).get("id")
 
     vision_run_id = None
     if rerun_extract:
         vision_run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_VISION,
-                                       llm_model_id=llm_model_id)
+                                       llm_model_id=vision_model_id)
         ext = extract_episode(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True,
                               run_id=vision_run_id)
         runs.finish_run(vision_run_id, stats={
@@ -3089,10 +3093,10 @@ def reresolve_episode(
         prior_context = narrative_context.load_prior(webtoon_id, info["episode_no"])
 
     run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_RESOLVE,
-                            llm_model_id=llm_model_id, vision_run_id=vision_run_id)
+                            llm_model_id=text_model_id, vision_run_id=vision_run_id)
     result = resolve_and_narrate(
         webtoon_episode_id, prior_context,
-        records=records, webtoon_id=webtoon_id, ctx=ctx,
+        records=records, webtoon_id=webtoon_id, ctx=text_ctx,
         token_budget=token_budget, run_id=run_id,
     )
     episode_meta = apply_resolution(webtoon_episode_id, result, webtoon_id=webtoon_id,

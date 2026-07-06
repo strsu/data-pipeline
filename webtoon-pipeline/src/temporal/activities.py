@@ -226,13 +226,13 @@ def step3a_extract(ep: EpisodeInput) -> dict:
     """
     from dataclasses import asdict
     from src.core import runs, step3
-    from src.operators.llm_resolver import resolve_llm_model
+    from src.operators.llm_resolver import VISION, resolve_llm_model
 
     def _hb(done: int) -> None:
         activity.heartbeat(done)
 
     webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
-    ctx = resolve_llm_model(webtoon_id)
+    ctx = resolve_llm_model(webtoon_id, VISION)
     run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_VISION,
                             llm_model_id=ctx.get("id"))
     try:
@@ -288,8 +288,9 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     )
 
     # resolve run 시작(R+N+apply가 공유; apply 성공 시 step3c가 succeeded 전이).
-    from src.operators.llm_resolver import resolve_llm_model
-    ctx = resolve_llm_model(webtoon_id)
+    # Stage R/N은 텍스트 전용 → text role 모델(예: glm-5.2)로 해석.
+    from src.operators.llm_resolver import TEXT, resolve_llm_model
+    ctx = resolve_llm_model(webtoon_id, TEXT)
     run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_RESOLVE,
                             llm_model_id=ctx.get("id"), vision_run_id=vision_run_id)
     try:

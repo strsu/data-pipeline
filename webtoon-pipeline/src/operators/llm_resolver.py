@@ -1,7 +1,16 @@
-"""웹툰별 LLM 모델 해석 (Step3) — 임베딩 model_resolver와 동일 패턴.
+"""스테이지 role별 LLM 모델 해석 (Step3) — 임베딩 model_resolver와 동일 패턴.
 
-규칙: WebtoonLLMSetting(is_enabled) > LLMModel(is_default).
-provider/model_id/endpoint 등은 전부 DB에서 읽는다(코드에 'glm' 하드코딩 없음 — LLM 추상, default=GLM).
+역할(role) 2값:
+  - "vision": 이미지 필요한 Stage V(컷 비전 추출). supports_vision=True 모델.
+  - "text"  : 이미지 없는 Stage R(정체·화자)/N(서사). supports_vision=False 모델(예: glm-5.2).
+
+규칙(전역 전용 — 웹툰별 override는 폐기, B1/§c): role의 기본 모델 =
+    config_llm_model WHERE is_default AND is_active AND supports_vision = (role=='vision').
+modality당 활성 기본은 DB 제약(uniq_active_default_llm_per_modality)으로 1개만 존재.
+role default가 없으면(시드 전/롤백) any is_default로 강등 → 최악이라도 오늘 동작(전역 default) 유지.
+provider/model_id/params 등은 전부 DB에서 읽는다(코드에 모델명 하드코딩 없음 — Req 7.1).
+
+`fallback`(런타임 모델 전환)은 B1.5 과제 — 이 resolver는 아직 읽지 않는다.
 """
 from __future__ import annotations
 
@@ -11,7 +20,11 @@ from typing import Optional
 
 from src.config.db import db_cursor
 
-# 시드 누락 대비 폴백 (현재 기본값과 동일: vllm 경유 비전 모델). endpoint 생략 → VLLM_API_HOST.
+VISION = "vision"
+TEXT = "text"
+
+# 시드/DB 완전 부재 시의 최후 안전망(빈 DB 방어). role=text여도 비전 모델로 강등되지만
+# 최종값은 동결/결정론으로 보존되므로 크래시보다 낫다. 정상 운영에선 도달하지 않는다.
 _FALLBACK = {
     "id": None,
     "name": "glm-4.6v",
@@ -21,7 +34,7 @@ _FALLBACK = {
     "supports_vision": True,
 }
 
-_cache: dict[int, dict] = {}
+_cache: dict[tuple[int, str], dict] = {}
 _lock = threading.Lock()
 
 
@@ -36,31 +49,49 @@ def _parse_params(raw) -> dict:
     return {}
 
 
-def resolve_llm_model(webtoon_id: int) -> dict:
-    """반환: {"id", "name", "provider", "model_id", "params"(dict), "supports_vision"}."""
-    cached = _cache.get(webtoon_id)
+def _row_to_ctx(row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "provider": row[2],
+        "model_id": row[3],
+        "params": _parse_params(row[4]),
+        "supports_vision": bool(row[5]),
+    }
+
+
+def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
+    """스테이지 role("vision"|"text")의 LLM 모델을 해석한다.
+
+    반환: {"id", "name", "provider", "model_id", "params"(dict), "supports_vision"}.
+    webtoon_id는 로깅/캐시 키 용도(전역 전용이라 조회엔 미사용 — 향후 per-webtoon 복원 대비 유지).
+    """
+    if role not in (VISION, TEXT):
+        role = VISION
+    key = (webtoon_id, role)
+    cached = _cache.get(key)
     if cached is not None:
         return cached
 
+    want_vision = role == VISION
     result: Optional[dict] = None
     try:
         with db_cursor() as cur:
+            # 1) role 기본 모델(도출): is_default·is_active·supports_vision 일치.
             cur.execute(
                 """
-                SELECT lm.id, lm.name, lm.provider, lm.model_id, lm.params, lm.supports_vision
-                FROM config_webtoon_llm_setting wls
-                JOIN config_llm_model lm ON wls.llm_model_id = lm.id
-                WHERE wls.webtoon_id = %s
-                  AND wls.is_enabled = true
-                  AND wls.deleted_at IS NULL
-                  AND lm.is_active = true
-                ORDER BY wls.id DESC
+                SELECT id, name, provider, model_id, params, supports_vision
+                FROM config_llm_model
+                WHERE is_default = true AND is_active = true
+                  AND supports_vision = %s AND deleted_at IS NULL
+                ORDER BY id ASC
                 LIMIT 1
                 """,
-                (webtoon_id,),
+                (want_vision,),
             )
             row = cur.fetchone()
             if row is None:
+                # 2) 강등: modality 무관 아무 활성 기본(시드 전/롤백 경로 — 오늘 동작 유지).
                 cur.execute(
                     """
                     SELECT id, name, provider, model_id, params, supports_vision
@@ -71,23 +102,18 @@ def resolve_llm_model(webtoon_id: int) -> dict:
                     """,
                 )
                 row = cur.fetchone()
+                if row is not None:
+                    print(f"[llm_resolver] role={role} 전용 기본 없음 — 전역 default로 강등: {row[1]}")
             if row is not None:
-                result = {
-                    "id": row[0],
-                    "name": row[1],
-                    "provider": row[2],
-                    "model_id": row[3],
-                    "params": _parse_params(row[4]),
-                    "supports_vision": bool(row[5]),
-                }
+                result = _row_to_ctx(row)
     except Exception as e:
-        print(f"[llm_resolver] resolve 실패 webtoon_id={webtoon_id}, 폴백 사용: {e}")
+        print(f"[llm_resolver] resolve 실패 webtoon_id={webtoon_id} role={role}, 폴백 사용: {e}")
 
     if result is None:
         result = dict(_FALLBACK)
 
     with _lock:
-        _cache[webtoon_id] = result
+        _cache[key] = result
     return result
 
 
@@ -96,4 +122,5 @@ def clear_cache(webtoon_id: Optional[int] = None) -> None:
         if webtoon_id is None:
             _cache.clear()
         else:
-            _cache.pop(webtoon_id, None)
+            for k in [k for k in _cache if k[0] == webtoon_id]:
+                _cache.pop(k, None)
