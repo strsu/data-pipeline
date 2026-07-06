@@ -24,6 +24,31 @@ from src.temporal.shared import STEP_RUN_KIND, ChainInput, EpisodeInput
 logger = logging.getLogger(__name__)
 
 
+def _run_with_heartbeat(fn, *, args=(), kwargs=None, detail: str = "working",
+                        interval: float = 30.0):
+    """긴 동기 작업(fn)을 서브스레드에서 실행하고 액티비티 본 스레드가 interval초마다 heartbeat.
+
+    LLM 콜 하나가 수 분~십수 분 걸려도(step3b의 roster/resolve/narrate: naver/769209 ep4 resolve가
+    ~14분) heartbeat_timeout을 넘기지 않게 한다. `activity.heartbeat()`는 Temporal 컨텍스트가 있는
+    액티비티 본 스레드에서만 호출 가능하므로, 실제 작업을 서브스레드로 보내고 본 스레드는 대기하며
+    주기적으로 heartbeat만 친다. fn의 반환값/예외는 그대로 전파한다.
+    """
+    import concurrent.futures
+
+    kwargs = kwargs or {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(fn, *args, **kwargs)
+        while True:
+            try:
+                return fut.result(timeout=interval)
+            except concurrent.futures.TimeoutError:
+                activity.heartbeat(detail)  # 아직 진행 중 — 살아있음 신호
+    finally:
+        # 취소/예외로 빠져나갈 때 이미 도는 서브스레드 완료를 기다려 블로킹하지 않는다.
+        ex.shutdown(wait=False)
+
+
 # ── 체인 메타/판정 (오케스트레이터 큐) ────────────────────────────────────────
 
 @activity.defn
@@ -258,8 +283,9 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     미해결 떡밥/running 요약 — Req 4.1, 11.3). webtoon_id는 `EpisodeInput`에 없으므로 코어 헬퍼
     `step3._get_webtoon_id(webtoon_episode_id)`로 해석한다(현재 코어에 공개 경로가 없어 private 헬퍼를
     사용 — 문서화). 해소 진입점은 컨텍스트 적응형 윈도우(`resolve_episode_windowed`)이며 토큰 예산에
-    따라 단일콜/다중윈도우를 자동 선택한다(Req 8). 윈도우 경로는 콜백 기반 하트비트가 없으므로 긴
-    텍스트 콜 전에 최소 1회 하트비트를 보낸다(Req 9.4).
+    따라 단일콜/다중윈도우를 자동 선택한다(Req 8). roster/resolve/narrate 각 텍스트 콜이 수 분~
+    십수 분 걸리므로 `_run_with_heartbeat`로 실제 해소를 서브스레드에서 돌리고 본 스레드가 주기적
+    하트비트를 보낸다(긴 콜 중 heartbeat_timeout 초과 → 재시도 루프 방지 — Req 9.4).
     """
     from dataclasses import asdict
     from src.core import step3
@@ -268,8 +294,7 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
 
     from src.core import runs
 
-    # 긴 텍스트 해소 콜 전 하트비트(윈도우 경로는 콜백 없음 — 최소 1회 갱신).
-    activity.heartbeat("resolve:start")
+    activity.heartbeat("resolve:start")  # 준비 단계(load_prior 등) 동안의 초기 갱신
 
     webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
     prior = load_prior(webtoon_id, ep.episode_no)
@@ -294,8 +319,12 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_RESOLVE,
                             llm_model_id=ctx.get("id"), vision_run_id=vision_run_id)
     try:
-        result = step3.resolve_and_narrate(extract_obj, prior, webtoon_id=webtoon_id,
-                                           ctx=ctx, run_id=run_id)
+        result = _run_with_heartbeat(
+            step3.resolve_and_narrate,
+            args=(extract_obj, prior),
+            kwargs=dict(webtoon_id=webtoon_id, ctx=ctx, run_id=run_id),
+            detail="resolve:working",
+        )
     except Exception as e:
         runs.finish_run(run_id, status="failed", error=str(e))
         raise
@@ -320,7 +349,14 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
 
     run_id = resolution.pop("run_id", None)
     result = ResolveResult(**resolution)
-    meta = step3.apply_resolution(ep.webtoon_episode_id, result, run_id=run_id)
+    # 결정론 커밋이지만 대용량 회차(수백 speaker/annotation)에서 DB 쓰기가 길어질 수 있어
+    # 서브스레드 + 주기 하트비트로 감싼다(step3c heartbeat_timeout 초과 방지).
+    meta = _run_with_heartbeat(
+        step3.apply_resolution,
+        args=(ep.webtoon_episode_id, result),
+        kwargs=dict(run_id=run_id),
+        detail="apply:working",
+    )
     if run_id is not None:
         if result.error:
             runs.finish_run(run_id, status="failed", error=str(result.error))
