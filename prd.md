@@ -1,52 +1,12 @@
 # 웹툰 분석 파이프라인 — 통합 PRD (마스터)
 
-> **상태**: v4.0-설계확정 · 갱신일: 2026-07-05
-> **⚠️ 진행 중 인수인계**: v4.0 구현이 §17.7의 1~2단계(+service API)까지 완료된 **미커밋** 상태다 — 작업 현황·남은 단계·배포 순서 주의사항은 **§17.9**를 먼저 읽을 것.
-> **⚠️ v4.0 재설계 확정(§17)**: 분석 도메인을 AnalysisRun 단위 쓰고-버리기 + character.kind 판별자 + 얼굴 레이어링(face_detection/face_identity) + character_profile(source 레이어링) + suggestion 통합 큐 + LLM 스테이지 V/R/N/apply(+주기 A)로 재설계. §7/§9의 현행 스키마·스테이지 서술은 **v4.0 구현 완료 시점까지의 현행(as-is)** 기록이다 — 신규 작업은 §17을 정본으로 본다.
-> **통합 출처**: 기존 `prd.md`(v2.0 마스터), `prd-renew.md`(v1.4), `prd_embedding.md` 3개 문서를 하나로 합치고 최신 결정을 반영. 원본은 `docs/archive/`에 보존.
+> **상태**: v4.1 · 갱신일: 2026-07-07
+> **정본 규칙**: 현행 설계·계약·백로그는 **본 문서가 정본**이다. 지난 버전들의 변경 경위·장애 대응 서사·세션 인수인계 로그는 **`prd-history.md`**(아카이브)로 이관했다(v3.x 헤더 불릿 전문 포함). v2.0 이전 원본 3개 문서는 `docs/archive/`. `prd-step3.md`·`prd-identity-roster.md`는 본 문서로 흡수 후 삭제됨(2026-07-07, 원문은 git 이력).
 > **범위**: `data-pipeline`(파이프라인·모델서빙) + `service`(Django 백엔드) + `webtoonmoa`(조회·라벨링 프론트) + `proxmox-configuration`(k3s GitOps) — **4개 레포**
-> **이번 v3.0 핵심 변경**:
-> 1. 스트림 처리 레이어 **Faust/Kafka → Temporal 워크플로**로 피벗 결정 (§4)
-> 2. model-api **OCR/YOLO 엔드포인트 분리** 적용 (`/ocr`, `/yolo`, 모드 `ocr`/`yolo`) (§6.1)
-> 3. **LLM(Step 3/4)를 1급 섹션으로 승격** — 현재 미구현, GLM-4.6v로 구현 예정 (§9)
-> 4. 70만 배치 백필은 **이번 범위에서 보류**(증분 경로 집중) (§5)
 >
-> **v3.1 변경 (2026-06-28)**:
-> - **`TextBlockType` 개편(A)**: 독백(Monologue) 신규 추가, 효과음(SFX) 타입 제거(→ OTHER + soft-exclude), "상황 서술"은 `TextBlockType`이 아니라 `CutSceneMeta`(장면 서술) 레이어로 분리 (§7, §9.4).
-> - (보류) 엑스트라/효과음 soft-exclude 정리 정책(Human/VL 판정)은 별도 개정에서 확정.
->
-> **v3.2 변경 (2026-07-01) — 실제 코드/배포 상태 반영**:
-> - **Faust→Temporal 전환 완료**: `service`는 이미 `config/temporal.py`만 사용(`config/kafka.py` 삭제됨), `proxmox-configuration`의 `pipeline_repo` configmap도 `TEMPORAL_ADDRESS`만 있고 Kafka 관련 설정 없음. 본 문서 곳곳의 "미구현/POC/목표 아키텍처" 표현은 과거 스냅샷이었음 — §2·§4·§13 갱신.
-> - **Step 3 구현 완료**: `webtoon-pipeline/src/core/step3.py`가 extract(pass1)→resolve(pass2a)→apply(pass2b, LLM 없는 결정론적 커밋) 2-pass로 동작 중. 상세 설계는 `prd-step3.md`(§9를 대체)로 이관.
-> - **레포 4개로 분리 명시**: 이전 버전은 `webtoonmoa`를 `service`(Django)에 묶어 표기했으나, 실제로는 별도 SvelteKit 프론트엔드 레포(`/Users/jj/github/webtoonmoa`)다. §2에 4번째 레포로 분리.
->
-> **v3.3 변경 (2026-07-01) — `prd-step3.md` 전면 흡수 + Step4 판단 정정**:
-> - **§9를 `prd-step3.md`의 최종 설계로 전면 교체**: 문제정의·목표·모델 토큰예산/윈도우 적응 설계·2-pass 아키텍처·Pass-1/2a/2b 계약·belief state·소구포인트(비트) 계층·캐릭터 중요도 티어링·mis-ID distrust/책략 탐지/교차에피소드 prior 신뢰성 규칙·정답 데이터 취급·Temporal 배선까지 전부 흡수. `prd-step3.md`는 실험 로그·인용 근거를 보존하는 이력 문서로 유지.
-> - **v3.2의 "Step4 미착수" 판단을 정정**: Step3+Step4는 하나의 에피소드 추론 단계로 통합됐고, Pass-2b(`apply_resolution`)가 매 에피소드 처리마다 `EpisodeReport`(summary/appeal_point/cliffhanger/foreshadowing/character_timeline)를 자동 커밋한다 — 즉 Step4는 이미 구현·운영 중이다. `episode-summary/main.py`는 이 통합 이전 시점의 요약 품질 비교용 레거시 실험 스크립트로 재확인.
-> - **DB 스키마 8종 추가 반영**(§7): `TextAnnotation.resolution_status`, `Character.significance`, `EpisodeReport`, `EpisodeBeat`, `NameDiscoverySuggestion`, `StoryArc`, `NarrativeThread`, `CharacterClaim`, `LLMUsage`, `WebtoonNarrativeState` — 전부 마이그레이션·코드 반영 완료.
-> - **골든 회귀 테스트 3종 작성·통과**: mis-ID distrust(ep2 천마→운암), 책략 탐지(ep3 청진, Property 10), 교차에피소드 정체성 prior(ep3 418=청명) — `webtoon-pipeline/tests/`. 부수적으로 `test_workflow_orchestration.py`의 stale 스텁(`step3_episode` 단일 액티비티 잔존) 버그를 step3a/b/c 3-스텁으로 갱신해 수정.
-> - **재처리(§11.2)를 에피소드 단위로 재설계**: 컷 단위 short-circuit → 에피소드 단위 `reresolve_episode`/`reapply_episode`.
->
-> **v3.4 변경 (2026-07-03) — 홈랩 배포 환경 신뢰성 장애 대응 세션**:
-> - **신규 §16**: 사용자의 실제 배포 환경(홈랩 k3s + Cloudflare Tunnel + 불안정 홈 네트워크)을 문서화하고, 이 환경에서 실제로 터진 3개 버그(Step1 `resolution_status` NOT NULL / Step1 재시도 비멱등성 / Step2·Chroma·DB 정합성 드리프트)의 원인·수정 내역·검증 상태를 기록. `data-pipeline`(`step1.py`/`step2.py`/`step3.py`/`activities.py`/`ocr_yolo_client.py`) + `service`(`tasks.py`/`chroma_client.py`/`views.py`) 양쪽 레포 수정.
-> - **model-api 구조적 리스크 발견(미수정)**: 전 라우터가 `async def` 안에서 동기 CPU-bound 추론을 직접 호출 — 부하 시 이벤트루프 블로킹으로 gunicorn WORKER TIMEOUT/SIGKILL 유발 가능(§16.2). 다음 세션 논의 필요.
->
-> **v3.6 변경 (2026-07-05) — 화자 매칭 구조 결함 수정 + 인물도감 profile + HITL stale 배선 + 캐시 슬림화**:
-> - **화자 매칭률 1~2% 구조 결함 발견·수정**: naver/820097 전 30회차 실측 — llm speech/monologue 블록의 speaker_id 부착률이 회차당 0~7%. 3중 원인: ① Pass-1이 얼굴 기반으로 확신한 화자 후보를 **DB에 저장 안 함**(speaker_id=NULL 강제), ② Pass-2a 프롬프트가 "provisional speaker가 null/불확실한 블록만" speaker_resolution으로 내라고 지시 → 확신 블록은 재출력 안 됨, ③ Pass-2b는 speaker_resolution만 커밋 → 확신 화자가 전부 유실. 수정: Pass-1 화자 후보(conf≥0.5)를 provisional speaker_id로 영속(`resolution_status='unresolved'` 유지), Pass-2a는 **전수 화자 테이블**(모든 speech/monologue, confirm-or-override) 출력으로 변경, Pass-2b에 provisional 화자 resolved 승격 안전망 추가(§9.4~9.6).
-> - **is_confirmed가 모델 입력에 실리지 않던 버그 수정**: 프롬프트는 "is_confirmed는 진실로 동결"을 지시하는데 `_load_faces`/페이로드에 그 플래그가 아예 없었음 — Pass-1 `identified_faces`와 Pass-2a `faces`에 `confirmed` 추가(human 얼굴 확정이 실제로 화자/정체 판단에 반영되는 경로 확보).
-> - **인물도감(범용 profile)**: Pass-2a characters에 `profile{gender, age_group, affiliation, role, personality[], traits{}}`(장르 특이값은 free-form traits) 추가 — `character.extra['llm_profile']`에 병합 커밋(스키마 변경 없음, is_confirmed 캐릭터 동결), `episode_report.character_timeline`에도 스냅샷 포함.
-> - **HITL stale 배선**: service 얼굴 확정/일괄 재배정/텍스트 어노테이션 API가 `webtoon_cut.is_stale`/`human_modified_at`을 마킹하도록 수정(종전엔 human이 고쳐도 파이프라인이 알 수 없었음). 2-pass가 `llm_analyzed_at`/`is_stale=false`를 전혀 안 찍던 것도 수정(apply_resolution에서 에피소드 컷 일괄 마킹). 재해소 실행용 CLI `python -m src.tools.reresolve <source> <title_id> <ep|stale> [--rerun-extract]` 추가(Temporal 자동 트리거는 후속 과제).
-> - **WebtoonNarrativeState 캐시 슬림화**: fold(순수·단조)는 유지하고 `persist_state` 쓰기 시점에 roster를 유의미 인물(실명 확정 또는 main/supporting)로 한정 + key_facts 인물당 12개 캡 + running_summary 최근 30화 줄로 캡(실측 ep30에 roster 69명 대부분 NEW_CHAR 엑스트라 — 무한 증가 구조였음). 정본은 row 단위 테이블(character/episode_report/narrative_thread)에 그대로.
-> - **max_tokens 재상향**: `_PASS1_MIN_MAX_TOKENS`/`_PASS2_MIN_MAX_TOKENS` 8192→16384 (8192에서도 pass1 finish_reason='length' 절단 7건 잔존 + Pass-2a 출력이 전수 화자 테이블로 커짐).
-> - **요약/책략 프롬프트 보정**: deception은 "다른 인물을 속이려는 의도가 있는 speech"만(monologue/자조/한탄 제외 — ep2에서 독백이 deception으로 오판된 실사례), summary/appeal_point는 narration·실제 사건 근거만(근거 없는 낙인·평가어 금지).
->
-> **v3.5 변경 (2026-07-04) — `naver/820097` end-to-end 검증 + Step2/Step3 회귀 버그 3건 추가 발견·수정 + Step3 신뢰성/품질 개선**:
-> - **§16.5 R2 종결**: `naver/820097` ep2를 실제로 재실행해 step1→step2→step3 전 구간 완료 확인(§16.6). 이후 ep10/ep11 등 추가 회차도 정상 진행 중.
-> - **Step2 자기-런 스냅샷 버그 발견·수정**(§16.6): 지난 세션에 추가한 드리프트 방어 로직(`valid_appearance_ids`)이 루프 시작 전 스냅샷이라, 같은 에피소드 처리 중 새로 생긴 캐릭터를 "유령"으로 오판해 42/42 얼굴이 전부 신규로 쪼개지는 회귀가 있었음 — 즉시 반영하도록 수정.
-> - **Step3 Temporal 워커 액티비티 미등록 버그 발견·수정**(§16.7): `worker.py`가 옛 단일 패스 `step3_episode`만 등록하고 있어 실제 워크플로가 호출하는 `step3a_extract`/`step3b_resolve`/`step3c_apply`가 `NotFoundError`로 전부 실패 — 2-pass 액티비티로 교체. `step3_episode`(+`step3.py`의 legacy `analyze_cut_scene`/`analyze_episode_scenes`)는 호출자 없는 죽은 코드로 확인(미삭제, 필요시 별도 정리).
-> - **`narrative_context.fold` 캐시 불일치 버그 발견·수정**(§16.8): `_commit_threads`가 DB에 실제로 커밋하는 `planted_episode`와, `apply_resolution`이 fold에 넘기는 캐시용 값이 서로 다른 계산 경로라 어긋날 수 있음(실사례: DB엔 정확히 ep2로 기록됐는데 캐시 JSON엔 LLM이 반환한 원본값 1로 남음) — 정규화 헬퍼로 일치시킴.
-> - **Step4(회차 요약) 별도 프로덕션 연결 불필요로 확정**: 사용자가 원래 계획했던 별도 Step4는 이미 §9.6(Pass-2b 흡수)로 대체돼 있음을 재확인, 이번 세션 논의로 계획 철회.
-> - **vllm(`vllm.prup.xyz`) 502/530 대응 + Pass-1 병렬화 + max_tokens 절단 버그 수정 + 프롬프트 한국어 강제**(§16.9): `llm_client.py`에 OCR/YOLO와 동일한 10회 지수 백오프 재시도 추가, `extract_episode`의 컷별 LLM 호출을 `ThreadPoolExecutor`로 병렬화(belief 누적 등 순서 의존 후처리는 완료 후 재정렬), `_PASS1_MIN_MAX_TOKENS` 4096→8192 상향(추론형 모델 glm-4.6v가 reasoning_content로 토큰 예산을 먼저 소모해 본문이 잘리는 문제), Pass-1/2a 시스템 프롬프트에 "반드시 한국어" 지시 강조, `LLM_MAX_CONCURRENCY`/`PASS1_WORKERS`를 `proxmox-configuration` configmap에 노출(이전엔 코드 defaults에 고정돼 배포 없이 못 바꿨음).
+> **v4.1 (2026-07-06~07) — 정체성·서사 로스터 + 신뢰성 (§18)**: 스테이지 role별 모델 배선(비전=glm-4.6v, 텍스트=glm-5.2, modality 2-슬롯), **에피소드 로스터 스테이지 신설**(V→roster→R→N→apply), max_tokens 기본 미전송 정책, 런타임 fallback(self-FK), json-repair 파싱 폴백, Temporal heartbeat, CCIP 매칭 앵커캡+마진. **커밋·prod 배포·가동 확인**(§18.7).
+> **v4.0 (2026-07-05) — 분석 도메인 재설계 (§17)**: AnalysisRun 단위 쓰고-버리기, character.kind 판별자, 얼굴 레이어링(face_detection/face_identity), character_profile(source 레이어링), suggestion 통합 큐, `analysis_`/`config_` 테이블 prefix. **마이그레이션 0022(wipe)~0026 prod 적용 완료, 전량 재분석 진행 중.**
+> 이전 변경(v3.0~v3.6)의 상세는 `prd-history.md` §H1, 한 줄 요약은 §15 결정 로그.
 
 ---
 
@@ -58,8 +18,8 @@
 |------|------|
 | 입력 | S3 컷 이미지 (`{S3_LOCATION}/{source_dir}/{title_id}/{ep}/{title_id}_{ep}_{cut}.jpg`) — boto3 직접 다운로드 |
 | 로컬 모델 | PaddleOCR(korean), [deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection)(YOLO), CLIP ViT-L/14, CCIP(deepghs) |
-| 원격 모델 | GLM-4.6v (z.ai API, 1차) / Qwen3-VL-32B(로컬, 폴백) — Step 3+4 통합 구현 완료(§9) |
-| 저장 | PostgreSQL(텍스트·얼굴·캐릭터 메타) + S3(face crop) + Chroma(얼굴 임베딩) |
+| 원격 모델 | 비전(Stage V)=glm-4.6v / 텍스트(roster·R·N)=glm-5.2 / fallback=qwen-vl — 전부 vllm 게이트웨이 경유, DB `config_llm_model`로 해석(§18.1) |
+| 저장 | PostgreSQL(텍스트·얼굴·캐릭터 메타) + S3(원본 컷) + R2(face crop, 2026-07-06 S3→R2 이전) + Chroma(얼굴 임베딩) |
 | 규모 | 웹툰 30+종, 누적 에피소드 ~6,000, 누적 컷 ~60만, 일 신규 ~10 ep(~1,000 컷) |
 | 처리 | **증분 스트리밍**(일 신규분) 중심. 배치 백필(70만)은 보류 |
 
@@ -68,8 +28,8 @@
 ```
 Step 1 ── 로컬 추출 (OCR + YOLO, 분리 병렬)      ← 모든 웹툰   ✅ 구현 (Temporal)
 Step 2 ── 인물 식별 (임베딩 + Chroma 매칭)        ← 모든 웹툰   ✅ 구현 (Temporal)
-Step 3 ── LLM 2-pass 장면/화자 분석(extract→resolve→apply) ← 활성 웹툰만 ✅ 구현 (GLM, §9)
-Step 4 ── 회차 종합 요약(EpisodeReport)          ← 활성 웹툰만 ✅ Step3 Pass-2b(apply)에 흡수되어 자동 산출(§9.6)
+Step 3 ── LLM 스테이지 V→roster→R→N→apply       ← 활성 웹툰만 ✅ 구현 (§17.4, §18.1)
+Step 4 ── 회차 종합 요약(EpisodeReport)          ← 활성 웹툰만 ✅ apply(결정론 커밋)에 흡수되어 자동 산출(§9.6)
 ```
 
 > **Step 1·2 전체 / Step 3·4 활성 웹툰만**: Step 1·2는 누적 백로그+신규 전체 처리해 face DB를 완성. Step 3·4는 비용·시간이 크므로 `phase3_enabled=True`인 활성 웹툰만 실행. Step 4는 별도 실행 단계가 아니라 Step3의 Pass-2b 커밋에서 매 에피소드 처리마다 자동으로 나온다 — `episode-summary/main.py`는 이 통합 이전 시점의 요약 품질 비교용 레거시 실험 스크립트로, 현재 프로덕션 경로가 아니다.
@@ -135,21 +95,23 @@ ArgoCD app-of-apps(`apps/`)로 전 워크로드를 선언적 배포.
 ## 3. 도메인 데이터 흐름 (4단계 상세)
 
 ```
-컷 N ─┬─ PaddleOCR ──→ TextRegion + TextAnnotation(paddle)        [Step1]
-      └─ YOLO ───────→ FaceRecord (+ face crop S3)                [Step1]
+컷 N ─┬─ PaddleOCR ──→ analysis_text_region + analysis_text_annotation(paddle)   [Step1]
+      └─ YOLO ───────→ analysis_face_detection (+ face crop R2)                  [Step1]
                           │
-                          ▼ 임베딩(CLIP/CCIP) + Chroma 매칭         [Step2]
-                   CharacterAppearance 매칭 or NEW_CHAR 발급
+                          ▼ 임베딩(CLIP/CCIP) + Chroma 매칭                        [Step2]
+                   analysis_face_identity(step2) — 기존 인물 매칭 or 신규 cluster
                           │
-                          ▼ step3a_extract(Pass-1, 컷별 비전)       [Step3]
-                   provisional TextAnnotation(llm) + CutSceneMeta
+                          ▼ step3a: Stage V(컷별 비전, vision run)                 [Step3]
+                   provisional text_annotation(llm) + cut_scene_meta
                           │
-                          ▼ step3b_resolve(Pass-2a, 에피소드 텍스트 전역해소, 이미지 없음)
-                   characters/speaker_resolution/beats/episode/deceptions/threads
+                          ▼ step3b: roster(에피소드 로스터 추출) → R(정체·화자) → N(서사)
+                            — 텍스트 전용 3콜, resolve run 공유 (§17.4, §18.1~18.2)
                           │
-                          ▼ step3c_apply(Pass-2b, LLM 없음, 결정론 커밋+소급전파) [Step3/4 통합]
-회차 전체 ─────────────────┴─→ TextAnnotation(resolved) + EpisodeBeat + EpisodeReport +
-                                NarrativeThread + CharacterClaim + WebtoonNarrativeState(fold)
+                          ▼ step3c: apply(LLM 없음, 결정론 커밋+소급전파) [Step3/4 통합]
+회차 전체 ─────────────────┴─→ text_annotation(resolved) + episode_report(+teaser) +
+                                episode_beat + narrative_thread + character_claim +
+                                suggestion(name/merge/face_reassign/label_conflict) +
+                                character_profile(llm)
 ```
 
 ### Step 1 — 로컬 추출 (모든 웹툰, ✅)
@@ -162,48 +124,29 @@ ArgoCD app-of-apps(`apps/`)로 전 워크로드를 선언적 배포.
 - 웹툰별 에피소드 순차(ep1 확정이 ep2 매칭에 반영). 임베딩+매칭 **1패스 통합**(이중 임베딩 제거 완료).
 - doc_id `{webtoon_id}_{episode}_{cut}_F{idx}` 고정 + `upsert` 멱등성.
 
-### Step 3 + 4 — LLM 2-pass 장면/화자/서사 분석 (활성 웹툰만, ✅ 구현) — 상세는 §9
-- `step3a_extract`(컷별 비전 추출, Pass-1) → `step3b_resolve`(에피소드 전역 화자/이름/서사 해소, Pass-2a, 이미지 없음) → `step3c_apply`(결정론적 커밋+소급전파, Pass-2b, **LLM 미사용**).
-- Step4(회차 요약)는 별도 단계가 아니라 Pass-2b 커밋에 흡수되어 `EpisodeReport`로 매 에피소드마다 자동 산출된다(§9.6).
+### Step 3 + 4 — LLM 장면/화자/서사 분석 (활성 웹툰만, ✅ 구현) — 설계 원칙 §9, 스테이지 §17.4, 모델·로스터 §18
+- `step3a_extract`(Stage V, 컷별 비전) → `step3b_resolve`(**roster**(에피소드 로스터 추출)→**R**(정체·화자)→**N**(서사), 텍스트 전용) → `step3c_apply`(결정론 커밋+소급전파, **LLM 미사용**).
+- Step4(회차 요약)는 별도 단계가 아니라 apply 커밋에 흡수되어 `analysis_episode_report`로 매 에피소드마다 자동 산출된다(§9.6).
 - 골든 회귀 테스트 3종으로 mis-ID distrust/책략 탐지/교차에피소드 정체성 prior 핵심 동작이 고정됨(§9.10).
 
 ---
 
-## 4. 아키텍처 결정 — 스트림 처리 Faust → Temporal 피벗 (완료)
+## 4. 아키텍처 — Temporal durable workflow (Faust/Kafka 피벗 완료)
 
-> 이 절은 결정 당시(v3.0) 기록을 그대로 두되, **현재는 마이그레이션이 완료된 상태**다(§13, v3.2 변경 참조). "Faust=현행/Temporal=목표"로 쓰인 표현은 결정 시점 기준이다.
+Kafka/Faust는 완전히 제거됐고 **Temporal이 유일한 오케스트레이션 경로**다(2026-07-01 운영 확인). Temporal 서버는 `proxmox-configuration/temporal_repo`로 배포(ES 없는 Postgres visibility 최소 구성 — §14-1), `pipeline_repo` configmap에는 `TEMPORAL_ADDRESS`만 있다.
 
-### 4.1 배경 (결정 당시)
-당시 현행은 Faust+Kafka. 이 워크로드의 본질은 "**엔티티(에피소드) 단위 다단계 durable workflow** + 웹툰당 순차/웹툰 간 병렬 + 중간 재개 + 단계별 재시도"이며, 일 ~1000컷으로 스트리밍 처리량 요구는 없다. Faust의 한계:
-- faust-streaming 생태계 유지보수 불안.
-- 컷/에피소드 진행을 **메시지 자가 재발행**으로 구현 → 암묵적 상태머신, 추적 난해.
-- OOM 재시작 시 **Kafka 오프셋 미커밋 → 컷1부터 재처리**(체크포인트 부재).
+- 웹툰 = 워크플로 인스턴스 1개(`workflow_id={source}_{title_id}`) → 웹툰당 순차/웹툰 간 병렬. 에피소드 체이닝은 워크플로 내부, `continue_as_new`로 history 관리.
+- 단계별 재시도는 activity `RetryPolicy`, 중간 재개는 workflow history + heartbeat_details(resume).
+- service 트리거: `config/temporal.py::send_phase1_trigger`가 웹툰당 1회 멱등 kick(`client.start_workflow`). Kafka + Faust + Celery beat 3개가 Temporal 하나로 통합됨.
 
-### 4.2 결정: Temporal durable workflow
-| 관심사 | Faust(현행) | Temporal(목표) |
-|---|---|---|
-| 웹툰당 순차 / 웹툰 간 병렬 | Kafka 파티션 키 | 웹툰=워크플로 인스턴스 1개(`workflow_id={source}_{title_id}`) |
-| 중간 재개 | 오프셋+자가 재발행 | 워크플로 history 영속(activity 완료 단위 재개) |
-| 단계별 재시도 | 수기 `retry_count` | activity `RetryPolicy` |
-| 트리거/스케줄 | Celery beat | Temporal Schedule / 멱등 start |
-| history 무한 증가 | 해당 없음 | `continue_as_new` (컷·에피소드 단위) |
-
-워크플로 계층(POC `temporal-pipeline/` 구현·검증 완료):
 ```
 WebtoonWorkflow (id="{source}_{title_id}")        # 웹툰당 1개 → 순차/병렬
   └─ EpisodeWorkflow (child)                       # 에피소드 순차
        └─ 컷 루프: ocr ∥ yolo (각자 추론+저장 독립)  # OCR/YOLO 분리 병렬
        └─ (컷 완료 후) face_identify → chroma_sync   # 얼굴식별 = 에피소드 단위
 ```
-- Kafka + Faust + Celery beat **3개를 Temporal 하나로 통합** 가능.
-- 배치 백필이 필요해지면 별도 재개형 스크립트(오케스트레이션 불필요)로 분리.
 
-### 4.3 service 트리거 전환 (완료)
-`config/kafka.py` 프로듀서 → Temporal 클라이언트로 **교체 완료**:
-- `send_phase1_trigger(...)`가 `client.start_workflow(WebtoonWorkflow.run, ..., id="{source}_{title_id}")` 호출(멱등 kick)로 동작 중. `backend/config/kafka.py`는 삭제되고 `config/temporal.py`만 남음.
-- 에피소드 체이닝은 워크플로 내부로 내려가 **service는 웹툰당 1회 kick**으로 단순화됨.
-
-> **상태**: Kafka/Faust는 완전히 제거됐고 Temporal이 유일한 오케스트레이션 경로다. `proxmox-configuration`에도 `temporal_repo`(Temporal 서버)가 배포돼 있고 `pipeline_repo` configmap에는 `TEMPORAL_ADDRESS`만 있다(Kafka 설정 없음).
+결정 배경(Faust 한계·비교표·트리거 전환 경위)은 `prd-history.md` §H2.
 
 ---
 
@@ -253,51 +196,40 @@ WebtoonWorkflow (id="{source}_{title_id}")        # 웹툰당 1개 → 순차/�
 
 ---
 
-## 7. DB 스키마 (PostgreSQL, service 관리)
+## 7. DB 스키마 (PostgreSQL, service 관리) — v4.0 현행
 
-Region(위치)과 Annotation(텍스트 해석) 분리 원칙. `apps/api/toon/models.py`.
+정의 정본은 service `apps/api/toon/models.py`. 설계 근거·레이어링 원칙은 §17.1~17.3. v4.0부터 분석 산출은 `analysis_`, 설정은 `config_` prefix(콘텐츠 도메인은 prefix 없음·불가침) — **마이그레이션 0022(wipe)~0026 prod 적용 완료(2026-07-05~06)**. Region(위치)과 Annotation(해석) 분리, source 레이어링(`human > llm/step2 > paddle`), human 레이어는 run 밖(불멸)이 관통 원칙. 구 v3.x 스키마 서술은 `prd-history.md` §H7.
 
-### 핵심 테이블
-- **Webtoon**(source, title_id) + **WebtoonEpisode**(webtoon FK, no) — Kakao/Naver 통합 모델.
-- **WebtoonCut**(episode FK, cut_number, processed_at, is_stale, `llm_analyzed_at`, human_modified_at, **`llm_model` FK**). `image_url` 없음 — S3 경로 재현.
-- **TextRegion**(cut FK, index, bbox, is_excluded) — bbox 불변. `is_excluded`=human이 분석 제외(간판/UI 등).
-- **TextAnnotation**(region FK, source `paddle|llm|human`, text, type, speaker, confidence, model_version, **`resolution_status`** `unresolved|resolved`) — 레이어 적재. 최종 우선순위 `human > llm > paddle`. `resolution_status`는 Step3 2-pass의 provisional(Pass-1 적재)→confirmed(Pass-2b 커밋) 표식(§9.6).
-  - **`type`(TextBlockType) — OCR 텍스트 영역 분류 (레이어 A, region 귀속)**:
+### 콘텐츠 도메인 (불가침, prefix 없음)
+- **webtoon**(source, title_id) / **webtoon_episode**(webtoon FK, no) / **webtoon_cut**(episode FK, cut_number, human_modified_at) — 컷 행은 Step1 산출. `image_url` 없음(S3 경로 재현). 진행도/stale 컬럼 없음(run 도출, §17.1).
+
+### 분석 도메인 (`analysis_`, run 단위 쓰고-버리기)
+- **analysis_run**(webtoon FK, episode FK NULL, kind `step1|step2|vision|resolve|arc`, llm_model FK, status `running|succeeded|failed`, vision_run FK, stats) — **진행도/stale의 정본**: "step3 됐나"=succeeded resolve run 존재, "stale"=human_modified_at>run.finished_at.
+- **analysis_character**(kind `cluster|character`, name, is_confirmed, significance, is_match_excluded) / **analysis_character_appearance** / **analysis_character_profile**(character FK, source `llm|human`, unique(character,source), gender/age_group/affiliation/role/personality/traits/key_facts) — 인물(클러스터→승격) + 도감. 서빙은 필드 단위 human 우선 병합.
+- **analysis_face_detection**(cut FK, face_idx, bbox, conf, is_used — Step1 산출, 불변) + **analysis_face_identity**(detection FK, source `step2|human`, appearance FK, score, run FK) — human>step2 레이어링. **analysis_face_embedding**(detection FK, embedding_model).
+- **analysis_text_region**(cut FK, index, bbox, is_excluded) + **analysis_text_annotation**(region FK, source `paddle|llm|human`, text, type, speaker_id, confidence, resolution_status `unresolved|resolved`).
+  - **`type`(TextBlockType)**:
 
     | 값 | 의미 | speaker |
     |---|---|---|
     | `speech` | 대사 — 입 밖으로 낸 말(일반 말풍선) | 있음 |
-    | `monologue` | **독백 — 속마음(구름/각진 말풍선). v3.1 신규** | 있음 |
-    | `narration` | 나레이션 — 세계관/상황 해설(사각 박스). 특정 화자 아님 | 없음(null) |
+    | `monologue` | 독백 — 속마음(구름/각진 말풍선) | 있음 |
+    | `narration` | 나레이션 — 세계관/상황 해설(사각 박스) | 없음(null) |
     | `system` | 시스템/캡션 — 상태창·서적 글귀·편지·연도 표시 등 | 없음 |
-    | `other` | 그 외(효과음 OCR 원문 등). RAG 제외 후보(`is_used=False`) | - |
+    | `other` | 그 외(효과음 OCR 원문 등). RAG 제외 후보 | - |
 
-    - **독백 분리 이유**: 독백(캐릭터 속마음)과 나레이션(화자 없는 해설)은 화자 유무가 본질적으로 달라 RAG의 의도/감정 추론에서 분리 필수. 독백은 `speaker` FK로 화자 귀속.
-    - **효과음(SFX) 제거**: 별도 type 없이 OCR 원문은 `other`로 두고 `is_used=False`로 RAG 제외. 효과음의 *의미*는 아래 "상황 서술"로 흡수.
-- **CutSceneMeta**(cut OneToOne, action_summary, key_objects) — **상황 서술 (레이어 B, OCR 텍스트 아님)**. 효과음·배경 묘사를 통합한 컷 단위 시각적 사건 요약("폭발이 일어남", "눈물을 흘림"). region에 귀속되지 않으므로 `TextBlockType`이 아니라 Step3 `scene_meta` 산출물로 저장.
-- **Character**(webtoon_id, name, aliases, age, skills, first_seen_*, is_confirmed, **is_name_auto_assigned**, **`significance`** `main|supporting|minor_functional|extra`, notes) — 논리 인물. `significance=extra`는 `is_match_excluded=true`를 동반해 Step2 매칭 후보에서 soft-exclude(하드 삭제 아님, 가역, human 동결 존중 — §9.5). **(v3.6 과도기)** 인물도감 메타(profile)는 현재 `extra['llm_profile']` jsonb에 병합 저장·`CharacterSerializer.profile`로 노출 중이나, **출처 구분(llm/human/human-edited)이 안 되는 구조라 별도 `CharacterProfile` 모델로 이행 예정**(§14-9, 설계 논의 중 — 마이그레이션 전까지만 임시).
-- **CharacterAppearance**(character FK, label, description, first_seen_*, is_canonical) — 시각 외형 단위(변장/이세계/성장 대응). Chroma는 character_id+appearance_id 함께 저장.
-- **FaceRecord**(cut FK, face_idx, appearance_id FK/NULL, bbox, conf, chroma_doc_id, match_score, is_confirmed). crop은 `crop_s3_key` property로 재현.
-- **WebtoonPipelineState**(webtoon OneToOne, phaseN_status, phase2_last_completed_episode, phase2_processable_max_episode, phase3_enabled, ...) — **웹툰 단위 오케스트레이션/설정**.
-- **EpisodePipelineProgress**(episode FK, phase 값1~4, status, completed_at, unique(episode,phase)) — per-episode 완료 추적(phase는 컬럼 아닌 값). 현재 phase1 채택, phase2~ 점진 흡수.
+    독백/나레이션 분리 이유: 화자 유무가 본질적으로 달라 의도/감정 추론에서 분리 필수. 효과음은 별도 type 없이 `other`, *의미*는 scene_meta로 흡수.
+- **analysis_cut_scene_meta**(cut, action_summary, key_objects, run FK) — 상황 서술 레이어(OCR 텍스트 아님).
+- **analysis_episode_report**(episode, summary, **teaser**, appeal_point, cliffhanger, foreshadowing, character_timeline, run FK) / **analysis_episode_beat**(hook_type free-form, appeal_point, intensity, stable_key) / **analysis_narrative_thread**(떡밥 심음/회수) / **analysis_character_claim**(deceptions 영속화, is_deception).
+- **analysis_suggestion**(webtoon FK, type `name|merge|face_reassign|label_conflict`, character/detection/episode/cut ref, payload, confidence, run FK, status `pending|accepted|rejected`) — AI 제안 통합 검토 큐.
+- **analysis_llm_usage**(webtoon/episode/cut FK, stage `vision|roster|resolve|narrative|arc`, llm_model FK, 토큰 3종, image_count, finish_reason, run FK) — 콜당 1행.
 
-### Step 3/4 스키마 (2-pass 서사 해소, `episode-scene-resolution` 스펙 — 전부 구현·마이그레이션 완료)
-- **EpisodeReport**(episode OneToOne, summary, appeal_point, cliffhanger, foreshadowing jsonb, character_timeline jsonb) — 옛 "Step4" 산출물. Pass-2b가 매 에피소드 처리마다 자동 upsert(§9.6).
-- **EpisodeBeat**(episode FK, cut_start, cut_end, hook_type **free-form 텍스트**(enum 아님), appeal_point, intensity, stable_key) — 비트 개수 제약 없음(에피소드 전체가 1비트일 수도). `stable_key`로 재처리 시 비트 식별 안정화.
-- **NameDiscoverySuggestion**(webtoon FK, character/appearance FK, name, confidence, evidence, source_episode FK, source_cut, status `pending|accepted|rejected`) — 다중 컷 이름 증거 누적(§9.5 name_evidence). 옛 `Character.extra.name_suggestions` json 적재 방식 폐기.
-- **StoryArc**(webtoon FK, level `arc|part`, parent FK NULL, ordinal, title, episode_start, episode_end, summary, appeal_point, is_confirmed) — 교차 에피소드(아크) 단위 소구포인트(§9.5 "단위 유연성").
-- **NarrativeThread**(webtoon FK, description, type, status `open|resolved`, planted_episode FK, planted_cut, resolved_episode FK NULL, resolved_cut NULL, confidence) — 떡밥 심음/회수 추적. `EpisodeReport.foreshadowing`(jsonb 요약)보다 구조화된 정식 테이블.
-- **CharacterClaim**(cut FK, character FK NULL, claim, contradicts, is_deception, confidence) — Pass-2a `deceptions` 산출물의 영속화(§9.7 텍스트 진실성 등급/책략 탐지).
-- **LLMUsage**(webtoon FK, episode FK NULL, cut FK NULL, stage, llm_model FK, prompt_tokens, completion_tokens, total_tokens, image_count NULL, finish_reason NULL, extra jsonb NULL) — LLM call당 1행, 웹툰/에피소드/컷 축 SUM 집계용.
-- **WebtoonNarrativeState**(webtoon OneToOne, last_resolved_episode FK, roster jsonb, open_threads jsonb, running_summary) — belief state의 웹툰 전역 영속(§9.5). `narrative_context.load_prior`/`fold`가 매 에피소드 처리 전후로 조회/갱신. **(v3.6) 캐시 슬림화**: 무한 누적 방지를 위해 `persist_state` 쓰기 시점에 roster는 실명 확정 또는 main/supporting 인물만(+key_facts 인물당 12개 캡), running_summary는 최근 30화 줄만 유지(실측: ep30에 roster 69명 — 대부분 NEW_CHAR 엑스트라). 정본은 row 단위 테이블(character/episode_report/narrative_thread)이므로 캐시 절삭에 정보 손실 없음. fold 자체의 단조성(Property 9)은 인메모리 체인에서 유지.
+### 설정 테이블 (`config_`)
+- **config_llm_model**(name, provider, model_id, params json, supports_vision, is_default, is_active, **fallback self-FK**) — modality당 활성 기본 1개 partial-unique(§18.1). params는 `context_window`만 권장(max_tokens 비움 — §18.3). 시드: glm-4.6v(vision default, cw=32768) / glm-5.2(text default, cw=131072) / qwen-vl(공용 fallback, cw=131072).
+- **config_embedding_model**(metric_type `cosine|ccip`, default_threshold, is_default) — 시드 `clip`(cosine,0.25), `CCIP`(ccip,0.16). / **config_webtoon_embedding_setting**(웹툰별 override).
+- **config_webtoon_pipeline_state**(phase3_enabled, processable_max_episode 등 설정성 필드만 — 진행 카운터는 폐기).
 
-### 설정 테이블 (모델 일반화)
-- **EmbeddingModel**(name unique, display_name, metric_type `cosine|ccip`, default_threshold, params json, is_default, is_active) — 시드 `clip`(cosine,0.25), `ccip`(ccip,0.16,is_active).
-- **WebtoonEmbeddingSetting**(webtoon FK, embedding_model FK, threshold null, is_enabled, unique(webtoon,model)) — 웹툰별 모델/threshold override.
-- **LLMModel**(name unique, provider, model_id, params json, supports_vision, is_default, is_active) — 시드 `glm-4.6v`(provider=zai, is_default).
-- **WebtoonLLMSetting**(webtoon FK, llm_model FK, is_enabled, unique(webtoon)) — 웹툰 단위 LLM 선택.
-
-> `glm→llm` 일반화 적용 완료: `TextAnnotationSource.LLM`, `WebtoonCut.llm_analyzed_at`, `PipelinePhase.SCENE_LLM`(값3).
+> `WebtoonLLMSetting`(웹툰별 LLM override)은 v4.1에서 폐기(전역 modality 2-슬롯만, §18.1). Chroma 컬렉션명은 파이프라인·reset 모두 DB `config_embedding_model.name`(=`CCIP`)을 사용해 일치.
 
 ---
 
@@ -330,7 +262,9 @@ Region(위치)과 Annotation(텍스트 해석) 분리 원칙. `apps/api/toon/mod
 
 ## 9. Step 3/4 — 에피소드 단위 2-pass 장면·화자·서사 분석 (구현 완료, Step4 흡수)
 
-> **v3.3 갱신 (2026-07-01)**: 이 섹션은 `prd-step3.md`(재설계 working draft, 2026-06-29~30, 프로토타입 실험 포함)의 최종 합의 내용을 **전면 흡수**한 것이다 — 원 문서는 실험 로그·모델 A/B·인용 근거를 그대로 보존하는 이력 문서로 남기고, 여기서부터가 최신 스펙이다. **Step3(장면/화자)와 Step4(회차 요약)는 별도 4번째 파이프라인 단계가 아니라 하나의 에피소드 추론 단계로 통합**됐고, 아래 설계 그대로 `webtoon-pipeline/src/core/step3.py`에 구현되어 Temporal에 배선·운영 중이며, 골든 회귀 테스트로 핵심 동작이 고정됐다(§9.10).
+> 이 섹션은 `prd-step3.md`(2026-06-29~30 재설계 draft)의 최종 합의를 v3.3에서 전면 흡수한 것으로, 2-pass 설계의 **원칙·계약**(전역 해소, provisional→confirmed, belief state, 비트 계층, 신뢰성 규칙, 정답 취급)의 정본이다. **Step3(장면/화자)와 Step4(회차 요약)는 하나의 에피소드 추론 단계로 통합**됐고 `webtoon-pipeline/src/core/step3.py`에 구현·운영 중이며, 골든 회귀 테스트로 핵심 동작이 고정됐다(§9.10). `prd-step3.md`는 삭제됨(2026-07-07, 원문 git 이력).
+>
+> **⚠️ v4.0/v4.1 갱신 주의 — 이후 재편으로 본문 일부가 대체됐다**: ① 스테이지 분할 — Pass-2a(단일 텍스트 콜)가 **roster→R→N 3콜**로 분리(§17.4, §18.1~18.2). ② 모델 — 텍스트 스테이지는 glm-5.2, 비전만 glm-4.6v(§18.1); §9.2의 모델 표와 §9.4의 `max_tokens>=16384` 고정 하한은 **max_tokens 기본 미전송 + context_window 정책**(§18.3)으로 대체. ③ 스키마 — 본문 속 `WebtoonNarrativeState`/`NameDiscoverySuggestion`/`FaceRecord`/`is_stale` 등은 구명칭(v4.0 폐기·대체 목록 §17.3; prior는 정본 테이블 조인으로 조립). 원칙은 유효하되 수치·모델명·테이블명은 §7/§17/§18이 정본.
 
 ### 9.0 왜 다시 설계했나
 최초 설계(§9 구버전, 컷 단위 즉시 확정 + N-2/N-1/N forward-only 슬라이딩 윈도우)는 구조적 한계가 있었다: 이미지가 한 방향만 보고, 컷마다 즉시 DB 확정(`speaker_id`, `name_discoveries` confidence≥0.85 즉시 rename)해 "그 컷만 보고 내린 판단"이 영구 기록되며, 소급 수정 경로가 없었다("컷 50에서 이름이 밝혀져도 컷 10을 고칠 길이 없다"). "다음/다다음 컷 때문에 비로소 누구 대사인지 알 수 있는" 상황을 구조적으로 못 잡는 **아키텍처 문제**였다. 근거: manga/영상 이해 선행연구(Tails Tell Tales, Zero-Shot Character ID 등)는 공통적으로 **챕터/영상 전체 단위 전역 해소**를 쓴다 — 컷 즉시 확정이 아니라 **에피소드 단위 전역 해소**가 정석이라는 결론.
@@ -354,7 +288,7 @@ Region(위치)과 Annotation(텍스트 해석) 분리 원칙. `apps/api/toon/mod
 - **이미지 토큰**: 컷 ~700×1600px 기준 컷당 ~1,300 비전 토큰. 단일 콜 멀티이미지는 여유(16K 로컬 ~8컷, 32K GLM-v ~20컷)지만, **에피소드 통째 이미지는 불가**(100~300컷×1.3k = 130k~390k ≫ 32k/16k) — 이미지 장수는 throughput/국소 시각맥락 레버일 뿐, **연속성 수단이 아니다**. 연속성은 이미지 없는 텍스트 Pass-2a가 담당(§9.3).
 - **설계 원칙 — 윈도우 크기 = 모델 토큰 예산의 함수**: 에피소드 전역 해소를 "에피소드 통째 1콜"로 고정 가정하지 않는다. GLM 텍스트 모드면 윈도우=에피소드 전체(사실상 1콜), 로컬 16K면 여러 윈도우로 자동 분할하고 윈도우 경계에서 belief state를 캐리오버(§9.5)한다 — 같은 로직이 16K든 131K든 1급 경로로 동작(`resolve_episode_windowed`, task 6.2 구현).
 - **양방향 전파를 16K에서도 보장하는 트릭**: 이름 확정(Pass-2a, LLM, 윈도우 전진)과 적용(Pass-2b, LLM 없음, 결정론)을 분리한다. 최종 이름 테이블이 확정되면 에피소드 전체 provisional 화자 참조를 단순 조인으로 일괄 재기록 — **소급(backward) 전파가 컨텍스트 한계와 무관한 공짜 결정론적 연산**이 된다.
-- **모델 역할**: 주력=**GLM**(무제한 플랜, 비용 비제약 → 병목은 rate-limit/지연), rate-limit·장애 시 폴백=**Qwen3-VL-32B 로컬**. 전환은 `LLMModel`/`WebtoonLLMSetting`(§7) config로 — 코드 변경 없이 모델 교체.
+- **모델 역할**: 주력=**GLM**(무제한 플랜, 비용 비제약 → 병목은 rate-limit/지연), rate-limit·장애 시 폴백=**Qwen3-VL-32B 로컬**. 전환은 DB config로 — 코드 변경 없이 모델 교체(현행 배선은 §18.1: modality 2-슬롯 + fallback self-FK).
 
 ### 9.3 아키텍처 — 2-pass 하이브리드 (채택안)
 비전과 연속성을 분리하는 것이 핵심 원칙이다: **비전=컷 단위**(기본 오버레이 1장, 압축 텍스트 레코드 산출), **연속성=텍스트 Pass-2a**(이미지 없이 에피소드 전체를 봄). **LLM 스테이지는 2개**(Pass-1 비전 / Pass-2a 텍스트)로 한정 — Pass-2b는 LLM이 아니며(결정론), Step4·비트·소구포인트는 Pass-2a에 흡수해 과분해(지연 통제 실패)를 피한다.
@@ -430,8 +364,8 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
   - `tests/test_step3_distrust_regression.py` — ep2 "천마→운암" mis-ID distrust(§9.7).
   - `tests/test_step3_deception_regression.py` — ep3 "청진 후손" 책략 탐지, Property 10(허구 아닌 실제 근거 참조).
   - `tests/test_step3_prior_identity_regression.py` — ep3 교차에피소드 정체성 prior(418=청명 유지 + 청진 분리).
-- **모델 A/B 결론**(`qwen-vl/_vltest.py`·`_pass1.py`·`_pass2.py` 하니스, naver 769209 실측): Pass-1 엔진은 **GLM-4.6v 우선**(OCR region 1:1 바인딩 엄수, Pass-2 입력 토큰 1/4, 40% 빠름). Qwen3-VL-32B는 1:1 바인딩을 깨고(예: 4블록→1병합) 4배 verbose하지만 JSON 에러 0 — **견고한 폴백**으로 채택. Pass-2a 다운스트림 품질(이름/아크/appeal/cliffhanger)은 두 엔진 동급.
-- 전체 실험 로그·인용 근거·결정 이력은 `prd-step3.md`에 그대로 보존(이 문서가 최신 스펙, `prd-step3.md`는 이력).
+- **모델 A/B 결론**(`qwen-vl/_vltest.py`·`_pass1.py`·`_pass2.py` 하니스, naver 769209 실측): Pass-1 엔진은 **GLM-4.6v 우선**(OCR region 1:1 바인딩 엄수, Pass-2 입력 토큰 1/4, 40% 빠름). Qwen3-VL-32B는 1:1 바인딩을 깨고(예: 4블록→1병합) 4배 verbose하지만 JSON 에러 0 — **견고한 폴백**으로 채택(v4.1에서 DB self-FK 기반 런타임 fallback으로 배선됨, §18.4). 텍스트 스테이지 모델 재판정(glm-5.2 채택)은 §18.1/`prd-history.md` §H6.
+- 당시 실험 로그·인용 근거 전문은 git 이력의 `prd-step3.md`(2026-07-07 삭제) 참조.
 
 ### 9.11 재처리 (에피소드 단위 재설계)
 전역 해소라 **재해소 단위는 컷이 아니라 에피소드**다 — human 수정 1건이 에피소드 전체 화자/소구포인트 해소를 바꿀 수 있다. 상세는 §11.2.
@@ -448,11 +382,11 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 
 ## 10. Chroma 벡터 DB
 
-- **웹툰별 독립 컬렉션** `character_faces_{webtoon_id}[_{model}]`, `hnsw:space=cosine`. 60만 규모에서 metadata 필터 후처리 성능 저하 회피 + 웹툰별 drop/재생성 가능.
+- **웹툰별 독립 컬렉션** `character_faces_{source}_{title_id}_{model.name}`(예: `character_faces_naver_769209_CCIP` — 모델명은 DB `config_embedding_model.name` 그대로, 대문자 포함), `hnsw:space=cosine`. 60만 규모에서 metadata 필터 후처리 성능 저하 회피 + 웹툰별 drop/재생성 가능. 파이프라인과 reset 태스크가 같은 규칙을 써서 정확히 일치.
 - doc_id `{webtoon_id}_{episode}_{cut}_F{face_idx}` 고정 + `upsert` 멱등.
 - 배포: `oci-croma.prup.xyz:8000`(운영, OCI 호스팅 — k3s 클러스터 밖) / docker-compose(개발). 토큰 인증. env `CHROMA_HOST/PORT/AUTH_TOKEN`.
 - metadata: webtoon_id, episode, cut, face_idx, character_id, appearance_id, appearance_label, character_name, is_confirmed, bbox, conf, created_at.
-- **⚠️ v1 REST API는 서버에서 완전히 제거됨(2026-07 실측 확인, `HTTP 410 "The v1 API is deprecated. Please use /v2 apis"`)**. `data-pipeline`은 공식 `chromadb==1.5.9` 클라이언트로 이미 v2(tenant/database 경로, `default_tenant`/`default_database`)를 쓰지만, `service` 쪽 수기 REST 호출은 v1을 쓰고 있었다가 이번에 v2로 이관(§16.4). **앞으로 Chroma REST를 직접 호출하는 코드를 새로 짤 때는 반드시 v2(`/api/v2/tenants/{tenant}/databases/{database}/collections/...`)를 쓸 것** — v1은 404가 아니라 410을 반환하므로 "존재 안 함"과 오인하기 쉽다.
+- **⚠️ v1 REST API는 서버에서 완전히 제거됨(2026-07 실측 확인, `HTTP 410 "The v1 API is deprecated. Please use /v2 apis"`)**. `data-pipeline`은 공식 `chromadb==1.5.9` 클라이언트로 이미 v2(tenant/database 경로, `default_tenant`/`default_database`)를 쓰지만, `service` 쪽 수기 REST 호출은 v1을 쓰고 있었다가 2026-07-03에 v2로 이관(`prd-history.md` §H4.3). **앞으로 Chroma REST를 직접 호출하는 코드를 새로 짤 때는 반드시 v2(`/api/v2/tenants/{tenant}/databases/{database}/collections/...`)를 쓸 것** — v1은 404가 아니라 410을 반환하므로 "존재 안 함"과 오인하기 쉽다.
 
 ---
 
@@ -462,10 +396,10 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 `WebtoonPipelineState.phase2_processable_max_episode`로 Step2 처리 범위를 ep 번호로 제어(`null`=전체, `10`=10화까지 후 idle). 도달 시 다음 이벤트 미발행 → 자연 대기. 검토 후 값 올려 resume. (Temporal에선 Schedule/signal 또는 워크플로 가드로 동일 구현.)
 
 ### 11.2 재처리 (Human Correction → 일괄 재분석, **에피소드 단위로 재설계됨 — §9.11**)
-- Step3가 컷 즉시확정에서 에피소드 전역 해소로 바뀌면서 **재해소 단위도 컷이 아니라 에피소드**다 — human 수정 1건이 에피소드 전체 화자/소구포인트 해소를 바꿀 수 있기 때문(구버전 §11.2의 "컷 단위 short-circuit"은 이 아키텍처와 맞지 않아 폐기).
-- human 컷 수정 → 해당 에피소드 `is_stale=True` → `reresolve_episode`(step3b+3c 재실행, `resolve_episode`/`apply_resolution` 재호출)로 에피소드 전체 재해소.
-- **(v3.6) stale 마킹 배선 완료**: service의 얼굴 단건 재배정(`FaceRecordReassignAPIView`)/일괄 재배정(`FaceRecordBulkReassignAPIView`)/텍스트 어노테이션(`TextRegionAnnotateAPIView`) API가 `webtoon_cut.is_stale=true`+`human_modified_at`을 마킹한다(종전엔 human이 고쳐도 파이프라인에 신호가 없었음). 실행은 `python -m src.tools.reresolve <source> <title_id> <ep_no|stale> [--rerun-extract]` CLI — **얼굴↔캐릭터 매칭을 고친 경우 `--rerun-extract` 필수**(identified_faces 입력 자체가 바뀜). Temporal 자동 트리거는 미구현(오픈).
-- **부분 재처리**: 이름 테이블만 바뀐 경우(예: NameDiscoverySuggestion 수락)는 Pass-2a(LLM)를 다시 돌리지 않고 `reapply_episode`(step3c만 재실행, `apply_resolution`)로 **LLM 없이 결정론적으로 일괄 재적용** 가능 — Pass-2b가 결정론적이라 값싸다(§9.6).
+- Step3가 컷 즉시확정에서 에피소드 전역 해소로 바뀌면서 **재해소 단위도 컷이 아니라 에피소드**다 — human 수정 1건이 에피소드 전체 화자/소구포인트 해소를 바꿀 수 있기 때문.
+- stale은 컬럼이 아니라 **도출**(v4.0, §17.1): human 수정 API가 `webtoon_cut.human_modified_at`을 마킹하고, "stale" = human_modified_at > 최신 succeeded resolve run.finished_at.
+- 재해소 실행: `python -m src.tools.reresolve <source> <title_id> <ep_no|stale> [--rerun-extract]` CLI — **얼굴↔캐릭터 매칭을 고친 경우 `--rerun-extract` 필수**(identified_faces 입력 자체가 바뀜). Temporal 자동 트리거는 미구현(오픈, §18.8).
+- **부분 재처리(reapply)**: 이름 테이블만 바뀐 경우(예: suggestion 수락)는 LLM 없이 `reapply_episode`(apply만 재실행)로 결정론적 재투영 — run을 새로 만들지 않고 최신 succeeded resolve run id를 스탬프하며, **suggestion 큐는 건드리지 않는다**(§17.6).
 - confidence 게이팅: 저신뢰 type/speaker/name은 provisional 유지. 자동 이름/중요도/병합은 제안만(자동 수행 금지), `human`/`is_confirmed`는 항상 동결.
 
 ### 11.3 이름 자동 확정
@@ -474,6 +408,8 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 ---
 
 ## 12. webtoonmoa 기능 요구사항
+
+> 표의 데이터 소스는 작성 당시(v3.x) 모델명 — v4.0 대응은 §17.2~17.3(FaceRecord→analysis_face_detection/identity, NameDiscoverySuggestion·label_conflict·face_reassign→**analysis_suggestion 통합 큐**, is_stale→run 도출, profile→analysis_character_profile). 검토 큐/도감/로스터 화면 신설이 다음 프론트 작업(§17.7-4). 인물 로스터·등장/미등장·근거 표시 UI 레퍼런스로 `roster-viewer.html`(레포 루트, 자족형 HTML — glm-5.2 vs qwen 5회차 비교 뷰어) 참고.
 
 | 기능 | 우선순위 | 데이터 소스 |
 |---|---|---|
@@ -497,30 +433,22 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 ## 13. 마이그레이션 / 롤맵
 
-### 완료 (✅)
-- Django 스키마, Step1(OCR/YOLO) + Step2(face_identify) 처리 로직, 에피소드 게이팅(EpisodePipelineProgress).
-- 이중 임베딩 제거(임베딩+매칭 1패스).
-- model-api 모드 분리(clip/ccip) + CCIP 엔드포인트 + OCR/YOLO 엔드포인트 분리(v3.0, 이후 별도 GPU 서버로 이전).
-- EmbeddingModel/WebtoonEmbeddingSetting + model_resolver/metric 분기(기본 CLIP 유지).
-- LLM 스키마 반영(rename + LLMModel/WebtoonLLMSetting/llm_model), CutSceneMeta 마이그레이션(0009/0010).
-- **Faust→Temporal 전면 이관(v3.0, v3.2 시점 운영 확인)**: Faust/Kafka 완전 제거(`service`의 `config/kafka.py` 삭제, `proxmox-configuration` configmap에 Kafka 설정 없음). `webtoon-pipeline`은 k3s에 Temporal 워커로 배포·운영 중, `proxmox-configuration/temporal_repo`에 Temporal 서버 배포됨. `service`는 `config/temporal.py`의 `send_phase1_trigger`로 웹툰당 1회 kick.
-- **Step3+4 재설계·구현 완료(v3.3, `episode-scene-resolution` 스펙 — 2026-07-01 확인)**: `prd-step3.md`의 에피소드 단위 2-pass(extract→resolve→apply)가 서비스 스키마(§7 신규 8개 테이블) + 코어(`core/step3.py`, `narrative_context.py`) + Temporal 배선(step3a/b/c)까지 전부 구현되어 운영 중. Step4(회차 요약)는 Pass-2b에 흡수돼 `EpisodeReport`로 자동 산출(§9.6). mis-ID distrust(12.1)/책략 탐지(12.2)/교차에피소드 prior(12.3) 골든 회귀 테스트 3종 작성·통과. 부수적으로 `tests/test_workflow_orchestration.py`가 옛 `step3_episode` 단일 액티비티 스텁에 멈춰 있어 깨져 있던 걸 step3a/b/c 3-스텁으로 갱신해 수정.
+완료 이력(스키마·Temporal 이관·Step3+4 구현·R2~R4 신뢰성 트랙·v4.0 적용)은 `prd-history.md` §H3. **남은 항목**:
 
-### 진행/예정
 | 단계 | 작업 | 상태 |
 |---|---|---|
+| V1 | v4.0 전량 재분석 완주 + 검증 지표 확인(§17.7-5: speaker 부착률, teaser 품질, suggestion 큐, profile 생성) | 🔄 재분석 진행 중 |
+| V2 | 트랙 C 재실행 검증 — 화산귀환 wipe→재실행으로 CCIP blob 재발 여부 확인(§18.5) | 🔲 절차 준비됨 |
+| A1 | Stage A(아크 종합) 신설 — story_arc 생산자, 트리거 주기 논의 후 구현(§17.7-3) | 🔲 미설계 |
+| L3 | webtoonmoa 관리 UI — suggestion 통합 검토 큐/도감/로스터 화면(§12, §17.7-4) | 🔲 |
 | T3 | chroma_sync/rematch/reembed → Temporal 워크플로/signal 패리티 (Faust 에이전트 삭제분 재구현) | 🔲 미확인 |
-| L3 | webtoonmoa 관리 UI(§12 신규 행: 소구포인트/mis-ID·책략 검토 큐/떡밥 추적 화면) | 🔲 |
-| E1 | CCIP opt-in 웹툰 검증(precision/recall), threshold 보정 | 🔲 |
-| S1 | Step3 오픈 리스크 실측(§9.12: GLM 토큰 예산 의미, 로컬 16K 품질 격차, belief state 압축, 비트 경계 안정성) | 🔲 |
+| S1 | Step3 오픈 리스크 실측(§9.12: 로컬 16K 품질 격차, belief state 압축, 비트 경계 안정성 — GLM 토큰 예산 항목은 §18.3으로 종결) | 🔲 |
 | B1 | (보류) operator 라이브러리화 마무리 + 70만 배치 백필 | ⏸ |
-| R1 | model-api 라우터(`ocr`/`yolo`/`ocr_yolo`/`embed`/`embed_ccip`) `async def` 안 동기 CPU-bound 추론 블로킹 이벤트루프 수정(`run_in_threadpool`/`asyncio.to_thread`) + `HF_HUB_OFFLINE=1` 추가(§16.2) | ✅ `run_in_threadpool` 수정 완료 / 🔲 `HF_HUB_OFFLINE=1` 미적용 |
-| R2 | `naver/820097` ep2 재실행 end-to-end 검증(§16.5) — 이번 세션 수정 사항이 실전에서 통하는지 확인 | ✅ 완료(§16.6) — ep2 step1→2→3 전 구간 정상 완료 확인, 이후 ep10/ep11도 진행 중 |
-| R3 | Step2 자기-런 스냅샷 버그(§16.6) / Step3 워커 액티비티 미등록 버그(§16.7) / narrative fold 캐시 불일치 버그(§16.8) | ✅ 완료 |
-| R4 | vllm 502/530 재시도, Pass-1 병렬화, max_tokens 절단 수정, 프롬프트 한국어 강제, LLM 동시성 config화(§16.9) | ✅ 완료 — 단, `LLM_MAX_CONCURRENCY`를 1보다 올려도 되는지(vllm 서버가 실제로 동시 요청을 받아줄 수 있는지)는 미실측 |
-| R5 | `step3_episode`(+`analyze_cut_scene`/`analyze_episode_scenes`/`analyze_episode_scenes_by`) 죽은 코드 정리 여부 결정(§16.7) | 🔲 발견만 됨, 삭제 여부 미결정 |
+| R1 | model-api `HF_HUB_OFFLINE=1` 추가(라우터 `run_in_threadpool` 수정은 완료 — §H4.1) | 🔲 |
+| R4' | `LLM_MAX_CONCURRENCY`를 1보다 올려도 되는지 vllm 동시호출 허용치 실측 | 🔲 |
+| R5 | `step3_episode`(+`analyze_cut_scene` 계열) 죽은 코드 정리 여부 결정 | 🔲 삭제 여부 미결정 |
 
-> Temporal 전환, Step3+4 통합 구현, 골든 회귀 테스트, `naver/820097` end-to-end 검증까지 핵심 라인은 이미 끝났다. 남은 T3/L3/E1/S1/R1(HF_HUB_OFFLINE)/R5는 모두 후순위 정리 작업.
+세부 백로그(검출 위생, character_claim, 로스터 영속 등)는 §18.8.
 
 ---
 
@@ -550,10 +478,12 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 | 날짜 | 결정 | 비고 |
 |------|------|------|
+| 2026-07-07 | **문서 재구성** — 변경 경위·세션 로그를 `prd-history.md`로 분리, `prd-step3.md`(v3.3에서 §9로 흡수 완료)·`prd-identity-roster.md`(§18로 흡수) 삭제, §7을 v4 현행 스키마로 갱신. litellm 요청 프롬프트는 UI 열람 가능·DB(SpendLogs.messages) 미영속 확인(응답 길이 절단은 수용) | 전반 |
+| 2026-07-06~07 | **v4.1 정체성·서사 로스터 + 신뢰성(§18)** — ①로스터=Stage R 흡수가 아닌 **별도 텍스트 콜**(에피소드당 텍스트 3콜: roster/R/N, §17.4 계약 개정) ②모델 배선=**modality 2-슬롯**(is_default+supports_vision 도출, per-webtoon override 폐기) ③fallback=`config_llm_model.fallback` self-FK 런타임 전환 ④max_tokens=**기본 미전송**(context_window는 명시 cap 안전장치로만 — 고정값 100k안 폐기, 400/조기절단 실전 결함) ⑤CCIP 과병합=매칭 magnet으로 진단(CCIP 정상), 앵커캡+마진 룰 채택 ⑥bleed 데이터 복구는 HITL 아닌 wipe→재실행 ⑦qwen-vl 로스터 비권장(불안정+느림), glm-5.2 채택 | §18 |
 | 2026-07-05 | **v4.0 설계 확정(§17)** — "분석 데이터는 전량 폐기·재생성 가능, human 노동분만 불멸" 전제(사용자 결정)로 분석 도메인 재설계: ①제자리 멱등 갱신 → **AnalysisRun 단위 쓰고 버리기**(진행도/stale 플래그는 저장 않고 도출), ②`character.kind(cluster\|character)` 판별자(NEW_CHAR 관습 폐기), ③얼굴 레이어링 `face_detection`+`face_identity`(human>step2), ④`character_profile`(source `llm\|human` 레이어링, 필드 단위 human 우선 병합), ⑤`suggestion` 통합 검토 큐, ⑥LLM 스테이지 **V→R→N→apply**(+주기 A로 story_arc 부활, 에피소드당 LLM 3콜 상한), ⑦summary/teaser 분리+데이터 기반 스포 차단, ⑧`webtoon_narrative_state`/진행도 3원화/`name_discovery_suggestion` 폐기. 앙상블·Graph DB는 보류. §14-9~11은 이 결정으로 종결 | §17 |
 | 2026-07-05 | **v3.6 — 화자 매칭 구조 결함 수정(Pass-1 화자 영속 + Pass-2a 전수 테이블 + Pass-2b 승격 안전망), confirmed 플래그 모델 입력 배선, 인물도감 profile(extra['llm_profile']), HITL stale 마킹(service 3개 API) + `src.tools.reresolve` CLI, narrative 캐시 슬림화, max_tokens 16384 재상향, deception/요약 프롬프트 보정** — naver/820097 전 30회차 화자 부착률 0~7% 실측이 계기 | §7,§9,§11,§16 헤더 v3.6 |
-| 2026-07-04 | **v3.5 — `naver/820097` end-to-end 검증 + 회귀 버그 3건(Step2 자기-런 스냅샷/Step3 워커 미등록/narrative fold 캐시 불일치) 발견·수정 + Step3 신뢰성·품질 개선**: ep2 재실행으로 §16.3/16.4 수정이 실제로 통함을 확인(R2 종결). 그 과정에서 새 버그 3건 발견·수정(§16.6~16.8). Step4 별도 구현 계획은 철회(이미 Pass-2b에 흡수됨을 재확인). vllm 502/530 재시도, Pass-1 병렬화, max_tokens 절단 수정(4096→8192), 프롬프트 한국어 강제, `LLM_MAX_CONCURRENCY`/`PASS1_WORKERS` config화(§16.9) | §9.4,§13,§16 |
-| 2026-07-03 | **v3.4 — 홈랩 배포 환경 신뢰성 장애 대응**: 신규 §16에 사용자 배포 환경(k3s 홈랩+Cloudflare Tunnel+불안정 홈 네트워크)과 실제 장애 3건(Step1 `resolution_status` NOT NULL, Step1 재시도 비멱등성, Step2/Chroma/DB 정합성 드리프트) 원인·수정·검증 상태 기록. `service`의 Chroma REST 호출이 서버에서 제거된 v1 API를 쓰고 있던 것 발견해 v2로 이관(§10, §16.4). model-api 라우터의 async/blocking 구조적 리스크는 **발견만 하고 미수정**(§16.2, R1) | §10,§13,§16 |
+| 2026-07-04 | **v3.5 — `naver/820097` end-to-end 검증 + 회귀 버그 3건(Step2 자기-런 스냅샷/Step3 워커 미등록/narrative fold 캐시 불일치) 발견·수정 + Step3 신뢰성·품질 개선**: ep2 재실행으로 신뢰성 수정이 실제로 통함을 확인(R2 종결). 그 과정에서 새 버그 3건 발견·수정. Step4 별도 구현 계획은 철회(이미 Pass-2b에 흡수됨을 재확인). vllm 502/530 재시도, Pass-1 병렬화, max_tokens 절단 수정(4096→8192), 프롬프트 한국어 강제, `LLM_MAX_CONCURRENCY`/`PASS1_WORKERS` config화 | 경위 §H4(prd-history) |
+| 2026-07-03 | **v3.4 — 홈랩 배포 환경 신뢰성 장애 대응**: 신규 §16에 사용자 배포 환경(k3s 홈랩+Cloudflare Tunnel+불안정 홈 네트워크)과 실제 장애 3건(Step1 `resolution_status` NOT NULL, Step1 재시도 비멱등성, Step2/Chroma/DB 정합성 드리프트) 원인·수정·검증 상태 기록. `service`의 Chroma REST v1→v2 이관(§10). model-api async/blocking 리스크 발견(후에 run_in_threadpool로 수정) | 경위 §H4(prd-history) |
 | 2026-07-01 | **v3.3 — `prd-step3.md` 전면 흡수 + v3.2 정정**: §9를 에피소드 단위 2-pass(Pass-1/2a/2b) 설계로 전면 교체. **v3.2에서 "Step4 미착수"라 적었던 것을 정정** — 실제로는 Step3+4가 하나로 통합돼 Pass-2b가 매 에피소드마다 `EpisodeReport`를 자동 산출하므로 Step4는 이미 구현·운영 중이다(`episode-summary/main.py`는 통합 이전 레거시 실험 스크립트). 신규 스키마 8종(§7) 반영, 골든 회귀 테스트 3종(mis-ID distrust/책략 탐지/교차에피소드 prior) 통과 확인, `test_workflow_orchestration.py`의 stale 스텁 버그 수정 | §7,§9,§11,§12,§13 |
 | 2026-06-29~30 | `prd-step3.md` 자체 결정 로그(발췌, 전문은 원 문서): 2-pass 하이브리드 채택(옵션 C) · 해소 윈도우=모델 토큰 예산의 함수 · 양방향 전파=Pass-2a(이름확정)+Pass-2b(결정론 소급) 분리 · 비전≠연속성(오버레이 1장 한정, 연속성은 텍스트 Pass-2a) · `hook_type` free-form + 비트 개수 제약 없음 · 효과음→scene_meta 흡수 · 캐릭터 중요도 티어링+extra soft-exclude · Pass-1 엔진 A/B(GLM 우선, Qwen 폴백) · mis-ID distrust/책략 탐지/교차에피소드 prior 프로토타입 검증 성공 | §9, `prd-step3.md` §12 |
 | 2026-07-01 | **v3.2 — 실제 코드/배포 상태로 정정**: 레포를 4개(webtoonmoa 분리)로 명시, Faust→Temporal 전환 완료 반영, Step3 구현 완료(설계는 `prd-step3.md` 우선) 반영 — **Step4 "미착수" 판단은 위 v3.3에서 정정됨** | §2,§4,§9,§13 |
@@ -566,13 +496,13 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 | 2026-05-28 | prd v2.0 — MATCH_THRESHOLD 0.25, Step2 멱등성, overlay 스타일, is_name_auto_assigned, 404 vs 5xx | (archive) |
 | ~2026-05-27 | prd v1.x — Faust/Kafka 아키텍처, Chroma 멀티테넌시, Human Checkpoint, name_discoveries | (archive) |
 
-> 상세 이력·코드 스니펫은 `docs/archive/`의 원본 3개 문서 참조.
+> 버전별 상세 경위는 `prd-history.md`, v2.0 이전 원본 3개 문서는 `docs/archive/` 참조.
 
 ---
 
-## 16. 인프라 환경 & 신뢰성(Reliability) — 홈랩 배포 특성과 2026-07-03 장애 대응
+## 16. 인프라 환경 & 신뢰성(Reliability)
 
-> 이 섹션은 세션 종료 후에도 새 세션/에이전트가 "왜 이런 재시도·멱등성 설계가 들어갔는지" 맥락을 잃지 않도록 남긴다. 코드 조각이 아니라 **배경(왜)과 현재 상태(뭐가 됐고 뭐가 안 됐는지)**에 집중.
+> 새 세션/에이전트가 "왜 이런 재시도·멱등성 설계가 들어갔는지" 맥락을 잃지 않도록 남긴다 — 16.1은 환경 전제, 16.2는 현행 규칙 요약. 규칙이 도출된 장애 경위(2026-07-03~04)는 `prd-history.md` §H4.
 
 ### 16.1 배포 환경 — 홈랩 특성 (신뢰성 설계 전제)
 - 전체 워크로드(§2.4 `proxmox-configuration`)가 **사용자의 홈랩 k3s 클러스터**에서 구동된다. 클라우드 매니지드 인프라가 아니다.
@@ -582,130 +512,31 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
   - GPU 서버(OCR/YOLO 추론): `gpgpu.prup.xyz` — 홈랩 밖(§5 배치 백필 노드와는 별개).
   - Chroma: `oci-croma.prup.xyz:8000` — **OCI(Oracle Cloud Infra)에 별도 호스팅, k3s 클러스터 밖**(§10).
   - 나머지(Temporal 서버, model-api clip/ccip, Django/Celery, Postgres 등)는 k3s 안(`proxmox-configuration`).
-- **PaddleOCR 주기적 재시작**: 사용자가 메모리 누수 완화를 위해 의도적으로 구성(model-api `--max-requests`/`--max-requests-jitter`, `model-api/Dockerfile:69-77`). 재시작 윈도우 동안 OCR 호출이 일시적으로 502를 반환하는 것은 **의도된 정상 동작**이지 버그가 아니다 — 다만 이게 Step1의 재시도 트리거가 되므로 재시도 경로 자체는 견고해야 한다(§16.3).
+- **PaddleOCR 주기적 재시작**: 사용자가 메모리 누수 완화를 위해 의도적으로 구성(model-api `--max-requests`/`--max-requests-jitter`, `model-api/Dockerfile:69-77`). 재시작 윈도우 동안 OCR 호출이 일시적으로 502를 반환하는 것은 **의도된 정상 동작**이지 버그가 아니다 — 다만 이게 Step1의 재시도 트리거가 되므로 재시도 경로 자체는 견고해야 한다(§16.2).
 - **결론**: 이 프로젝트의 재시도/타임아웃/멱등성 설계는 전부 "가끔 502/522/커넥션에러가 나는 게 정상"이라는 전제 위에 있다. 새로 짜는 외부 호출 코드는 기본적으로 재시도+백오프를 갖춰야 한다(예외: 진짜 버그를 감추면 안 되는 4xx).
 
-### 16.2 model-api 구조적 리스크 — 핵심 수정 완료, `HF_HUB_OFFLINE`만 남음 (§13 R1)
-- `model-api/src/routers/{ocr,yolo,ocr_yolo,embed,embed_ccip}.py` **전부** 라우터 핸들러가 `async def`인데, 그 안에서 동기(blocking) CPU-bound 모델 추론(`extract_ccip_feature`, PaddleOCR, YOLO 등)을 **`await`/스레드 오프로드 없이 직접 호출**한다. 예:
-  ```python
-  # model-api/src/routers/embed_ccip.py
-  @router.post("/embed-ccip")
-  async def embed_ccip(file: UploadFile):
-      image_bytes = await file.read()
-      feature = extract_ccip_feature(image_bytes)   # 동기 ONNX 추론 — 이벤트루프 블로킹
-      return {"feature": feature}
-  ```
-  `UvicornWorker`는 이벤트루프 기반이라 이 호출이 도는 동안 **그 워커 전체가 다른 요청도, gunicorn 마스터에 대한 생존 응답도 못 한다**.
-- **실측 사고(2026-07-03 01:34)**: embed-ccip 워커 2개(pid 7, 8)가 거의 동시에 `WORKER TIMEOUT`(gunicorn `--timeout=120`, `Dockerfile:74`) → `SIGKILL`/`SIGABRT`로 죽고 재시작. 직전 로그에 `step2`가 짧은 시간에 요청을 몰아 보낸 정황(`임베딩 진행 32/42`) — 부하가 몰리면 이벤트루프가 120초 넘게 막혀 재현 가능한 구조.
-- **의심되지만 미검증**: 이 세션 맨 처음 진단했던 OCR 502(`gpgpu.prup.xyz`)도 "PaddleOCR 주기 재시작"만이 아니라 이 구조적 블로킹 문제가 섞여 있을 가능성 — `ocr.py`/`yolo.py`/`ocr_yolo.py`도 동일 패턴이기 때문. 확인 안 됨.
-- **`HF_HUB_OFFLINE` 미설정**: CCIP 모델 가중치 자체는 Docker 이미지에 baked-in(`Dockerfile:24,45,56`, `HF_HOME=/project/hf_cache`)이라 **재다운로드는 안 되지만**, 워커 재시작마다 huggingface_hub가 캐시 최신 여부를 huggingface.co에 확인하는 네트워크 왕복(`GET .../api/...`, `HEAD .../model_feat.onnx`)이 매번 발생 — 불필요한 외부 의존/지연. `HF_HUB_OFFLINE=1` 추가로 제거 가능(미적용).
-- **수정 완료(2026-07-03)**: `model-api/src/routers/{ocr,yolo,ocr_yolo,embed,embed_ccip}.py` 전 라우터의 동기 CPU-bound 호출(`run_ocr`/`detect_faces`/`extract_embedding`/`extract_ccip_feature`/`compare_features`)을 `starlette.concurrency.run_in_threadpool`로 감싸 이벤트루프 블로킹 제거. 함께, 클라이언트 쪽 동시 요청 수도 서버 워커 수(gunicorn `--workers=2`)에 맞춰 제한 — `data-pipeline/webtoon-pipeline/src/core/step2.py::_EMBED_WORKERS`를 8→2로 축소(대기열이 쌓여 `--timeout=120`에 걸리는 상황 자체를 줄임). **미검증**: 실제 부하(step2 재실행)로 WORKER TIMEOUT 재발 여부 확인 안 됨 — §16.5/R2 재실행 시 같이 지켜볼 것.
-- **남은 항목**: `HF_HUB_OFFLINE` 미설정(위 항목)은 이번엔 손대지 않음. 라우터 수정으로 이벤트루프 블로킹은 해소됐지만, 그 자체가 워커 재시작 빈도를 낮추므로 불필요한 huggingface.co 왕복 빈도도 간접적으로는 줄어들 것 — 그래도 근본 해결은 아니므로 별도 작업으로 남겨둠.
+### 16.2 신뢰성 설계 현황 — 살아있는 규칙 요약
 
-### 16.3 Step1(OCR/YOLO) 신뢰성 강화 — 이번 세션에서 완료
-`webtoon-pipeline/src/core/step1.py` / `src/temporal/activities.py` / `src/operators/ocr_yolo_client.py`.
+> 아래 규칙들이 나온 장애별 원인·수정 경위(2026-07-03~04: Step1 비멱등성, Chroma v1/유령 벡터 드리프트, Step2 자기-런 스냅샷 회귀, Step3 워커 미등록, fold 캐시 불일치, model-api 이벤트루프 블로킹 등)는 `prd-history.md` §H4.
 
-**발견된 버그 2건(둘 다 수정 완료)**:
-1. **`text_annotation.resolution_status` NOT NULL 위반**: Step3 작업 때 `service` 마이그레이션 `0017_character_significance_and_more.py`로 이 컬럼이 추가됐는데(Django `default=`는 DB 레벨 기본값이 아님, `db_default` 아님 — 앱 레벨에서만 채워짐), Step1의 raw SQL INSERT(`_process_segment_ocr`)와 Step3의 레거시 단일-pass 경로(`_upsert_llm_annotation`, 현재 프로덕션 워크플로는 안 씀 — `step3a/b/c` 2-pass가 정식 경로, 이건 백필/단독실행용으로만 남아있는 액티비티)가 이 컬럼을 안 채워서 터짐. → 둘 다 명시적 값(`'unresolved'`/`'resolved'`) 지정하도록 수정.
-2. **`step1_episode` Temporal 액티비티 재시도 비멱등성**: 세그먼트 단위로 즉시 커밋(`with db_cursor()`)하고 재시도 시 처음부터 다시 도는데, `prepare_episode`(기존 데이터 정리)는 워크플로 시작 시 딱 1번만 실행됨 → 어떤 이유로든(§16.1의 502/522/커넥션에러, 또는 §16.2의 gunicorn WORKER TIMEOUT) 도중 실패해 Temporal이 재시도하면, 이미 커밋된 `text_region`을 다시 INSERT 시도 → `uniq_text_region_cut_index` UniqueViolation. 실제로 이 순서로 재현됨: attempt N이 §16.1/16.2 원인으로 중간 실패 → attempt N+1이 세그먼트 0부터 재시작 → 충돌.
-
-**수정 내역**:
-1. **이어하기(resume)**: `_load_resume_state(webtoon_episode_id)`가 이미 커밋된 `text_region`/`face_record`에서 `region_index`/`face_index`/`used_bboxes`를 복원 → `process_episode_step1(resume_from=...)`가 이미 끝난 세그먼트를 OCR/YOLO 재호출·재삽입 없이 스킵. `resume_from`은 `activity.info().heartbeat_details[0]`로 전달(`step2.py::identify_episode_faces`의 기존 resume 패턴과 동일 구조로 맞춤, `activities.py::step1_episode`).
-2. **HTTP 재시도+지수 백오프**: `ocr_yolo_client.py::_post_image` — `httpx.HTTPStatusError`(상태코드 `>=500`, Cloudflare 520~526 포함) + `httpx.TransportError`(커넥션/타임아웃, 애초에 응답을 못 받는 경우)만 최대 10회, 1s→8s 캡 지수 백오프. 4xx는 재시도 없이 즉시 전파(우리 쪽 요청 문제이므로 숨기면 안 됨). 백오프 총 소요시간(최악 ~55초/콜)은 `step1_episode`의 `heartbeat_timeout=5분`(`workflows.py:98`)보다 충분히 짧게 설계 — **이 5분 값은 그대로 유지하기로 결정**(사용자 판단: 정상 OCR/YOLO 호출은 10초 내 끝나므로 5분 초과는 진짜 이상 신호로 보는 게 맞음).
-3. **UPSERT 안전망**: `text_region`/`text_annotation` INSERT에 `ON CONFLICT DO NOTHING` 추가(`face_record`가 이미 쓰던 패턴과 동일) — `is_excluded` 등 human 리뷰 필드를 덮어쓰면 안 되므로 `DO UPDATE`가 아니라 `DO NOTHING`. resume 로직에 놓친 경우가 있어도 크래시 대신 스킵되는 마지막 방어선.
-4. **로깅 강화**: `step1.py` 전체를 `print()` → `logging` 모듈(`logger`)로 전환. 세그먼트 실패 시 `seg.index`/`g_y0,g_y1`/완료·스킵 개수/`resume_from`/누적 텍스트·얼굴 수·경과시간을 한 번에 남기고 재전파. 안전망(ON CONFLICT) 스킵 발생 시 경고 로그. `ocr_yolo_client.py`는 재시도/최종실패 로그에 `source/title_id/episode_no/cut` 컨텍스트 포함. `activities.py::step1_episode`는 시작 시 `attempt`/`resume_from`을 로그.
-
-### 16.4 Step2(인물식별) / Chroma·Postgres 정합성 드리프트 — 이번 세션에서 발견·수정
-`data-pipeline/webtoon-pipeline/src/core/step2.py` + `service/backend/apps/api/toon/{tasks.py,service/chroma_client.py,views.py}`.
-
-**증상**: `face_identify_episode` 액티비티가 `face_record.appearance_id`의 FK 위반(`character_appearance` id가 Postgres에 없음)으로 실패.
-
-**근본 원인 2건, 둘 다 curl로 실측 확인 후 수정 완료**:
-1. **`service`의 관리자 액션 "분석데이터 초기화하기"(`admin.py::reset_analysis_action` → `tasks.py::reset_webtoon_analysis`)가 DB/S3/Chroma 3단계를 독립 try/except로 처리**하는데, `_reset_chroma_collections`가 `webtoon.embedding_settings`(**웹툰별 명시적 오버라이드** `WebtoonEmbeddingSetting`)만 순회해서 지울 컬렉션 이름을 만들었다. 근데 `data-pipeline`의 `resolve_embedding_model`(`model_resolver.py`)은 오버라이드가 없으면 **전역 기본 모델**(`EmbeddingModel.is_default`)로 조용히 폴백해서 계속 임베딩한다. **사용자 확인: 대부분 웹툰이 명시적 오버라이드 없이 전역 기본 모델만 쓴다** — 즉 대부분의 웹툰에서 "초기화하기"를 눌러도 Chroma 컬렉션 삭제가 **통째로 스킵**됐다(DB는 하드 삭제되고 Chroma엔 유령 벡터만 남음). 로그 증거: `{'chroma': {'status': 'success', 'collections': {}}}` — 시도한 컬렉션이 0개.
-2. **Chroma 서버가 v1 REST API를 완전히 제거함**(2026-07 실측: `GET /api/v1/... → HTTP 410 "The v1 API is deprecated. Please use /v2 apis"`). `service`의 `chroma_client.py::delete_collection`과 `views.py::ChromaCollectionsAPIView`는 v1 경로(`/api/v1/collections/...`)를 썼고, `404`만 "이미 없음(정상)"으로 처리해서 `410`은 `resp.raise_for_status()`에서 예외로 터졌다 — **명시적 오버라이드가 있는 웹툰이라도 Chroma 삭제가 지금까지 실제로 성공한 적이 없었을 가능성이 높다.** 게다가 `reset_webtoon_analysis`의 상위 상태 집계가 컬렉션별 실패를 무시하고 항상 `chroma: {"status": "success"}`로 찍어서 이 문제가 안 보였다. (참고: `data-pipeline`은 공식 `chromadb==1.5.9` 클라이언트로 이미 v2를 쓰고 있었다 — §10.)
-3. **실제 오염 확인**: webtoon_id=60(naver/820097)의 `character_faces_naver_820097_CCIP` 컬렉션에 82개 문서, 그중 20개가 2026-06-29(에피소드 107)에 만들어진 `appearance_id=491`(`NEW_CHAR_005`, 이미 Postgres에서 하드 삭제됨) 유령 벡터였고, ep2 재처리 재시도가 **그 순간에도 같은 유령 id에 새 벡터를 계속 추가하고 있었다**(`created_at: 2026-07-03T01:42:49`, episode=2, cut=4).
-
-**수정 내역**:
-- `service/backend/apps/api/toon/service/chroma_client.py::delete_collection`: v1 → v2(`/api/v2/tenants/default_tenant/databases/default_database/collections/{name}`, 이름 기반 삭제도 v2에서 동작 확인됨)로 전환.
-- `service/backend/apps/api/toon/views.py::ChromaCollectionsAPIView`: 동일한 v1 버그를 발견해서 같이 v2로 전환(응답 포맷/집계 로직은 그대로 유지 — 별도 버그인 `suffix="_clip"` 대소문자 매칭 문제는 이번엔 안 건드림, 필요하면 별도로 다룰 것).
-- `service/backend/apps/api/toon/tasks.py::_reset_chroma_collections`: 순회 대상을 `webtoon.embedding_settings.all()` → `EmbeddingModel.raw_objects.all()`(soft-delete 포함 전체 모델)로 확장 — 실제 존재 안 하는 조합은 `delete_collection`이 이미 404→"absent"로 처리하므로 안전.
-- `reset_webtoon_analysis`: 컬렉션별 `"failed"`가 하나라도 있으면 chroma 단계 자체의 `status`도 `"failed"`로 집계하도록 수정(이전엔 컬렉션이 전부 실패해도 `overall: success`로 가려졌음).
-- **일회성 데이터 정리(2026-07-03)**: webtoon_id=60의 `character_faces_naver_820097_CCIP` 컬렉션을 v2 DELETE로 완전 제거 확인(삭제 후 GET 404 확인). Postgres/S3/원본 이미지 등은 건드리지 않음.
-- **재발 방지**(`data-pipeline/webtoon-pipeline/src/core/step2.py`): `_get_valid_appearance_ids(webtoon_id)`로 Postgres에 실제 존재하는 `character_appearance` id 집합을 조회해 (a) `ccip_anchors` 로드 직후 일괄 필터링(유령 anchor 제거 + 경고 로그), (b) 매칭 루프 안에서도 최종 방어선으로 재검증(cosine 경로는 사전 필터가 안 되므로 필요) — 유령 `appearance_id`에 매칭되면 크래시 대신 신규 캐릭터로 재할당하고, 같은 에피소드 내 재발을 막도록 제외 목록에 즉시 추가.
-- **남은 구조적 한계**: DB 리셋과 Chroma 리셋은 여전히 원자적이지 않다(부분 실패 자체는 여전히 가능한 설계). 이번 수정은 (1) 정리가 실제로 되게(v2 API + 전체 모델 순회) 만들고 (2) 그래도 놓치는 경우에 대비한 방어 로직(step2.py)을 추가한 것 — "리셋이 완벽히 원자적"이라고 가정하면 안 된다.
-
-### 16.5 검증 상태 (2026-07-03 기준)
-- §16.3/16.4의 코드 수정은 전부 `py_compile` 통과, Chroma API 동작(v1 410/v2 200, 이름 기반 GET/DELETE)은 curl로 실측 확인함.
-- §16.2(model-api async/blocking 구조, `HF_HUB_OFFLINE`)는 **발견만 하고 아직 미수정** — 우선순위/방향 논의 필요(§13 R1).
-- (2026-07-04 갱신) `naver/820097` ep2 재실행 결과는 §16.6 이하 참조 — end-to-end 검증 완료, 단 그 과정에서 새 회귀 버그 3건이 발견됨.
-
-### 16.6 `naver/820097` ep2 end-to-end 검증 + Step2 자기-런 스냅샷 회귀 버그 (2026-07-04)
-
-**검증 결과**: ep2(`webtoon_episode_id=11757`)를 재실행해 `episode_pipeline_progress`에 phase 1/2/3 전부 `completed` 확인. `text_region`(356)/`text_annotation`(paddle 356 + llm 356) 1:1 정합, `cut_scene_meta`(93, pass1 컷 수와 일치), `llm_usage`(pass1 93콜/pass2_resolve 1콜), `webtoon_narrative_state.last_resolved_episode_id=11757`, `narrative_thread` 3건 모두 크래시 없이 커밋됨 — §13 R2 종결.
-
-**회귀 버그 발견**: 재실행 로그가 "매칭 진행 42/42 (매칭=0, 신규=42)" — 얼굴 42개가 **전부** 신규 캐릭터로 쪼개졌다. 원인은 지난 세션(§16.4)에 추가한 드리프트 방어 로직 자체의 회귀:
-
-```python
-# step2.py::identify_episode_faces
-valid_appearance_ids = _get_valid_appearance_ids(webtoon_id)   # 루프 시작 전 딱 1회 스냅샷
-...
-for i, face in enumerate(pending):
-    ...
-    if match is not None and match["meta"]["appearance_id"] not in valid_appearance_ids:
-        ...  # "유령"으로 오판 → 신규 캐릭터로 강제 재할당
-```
-
-`valid_appearance_ids`는 루프 시작 **전** Postgres 스냅샷인데, 같은 에피소드 처리 중 `_allocate_character`가 만든 새 캐릭터는 즉시 `ccip_anchors`(매칭 후보)엔 추가되면서도 `valid_appearance_ids`엔 반영되지 않았다. 그래서 컷85에서 만든 캐릭터를 컷106의 얼굴이 정확히 재매칭했는데도 "스냅샷에 없는 유령"으로 오판돼 강제로 새 캐릭터로 쪼개짐 — 이게 전체 얼굴에 걸쳐 반복돼 42/42 전부 신규가 나왔다. 실제 Chroma/Postgres 드리프트는 전혀 없었음(Chroma 42개 문서의 appearance_id가 Postgres 42개 행과 정확히 1:1 일치 확인).
-
-**수정**: `_allocate_character` 호출 직후 `valid_appearance_ids.add(appearance_id)` 한 줄 추가 — `ccip_anchors.append(...)`와 동일한 패턴으로 즉시 반영. 재실행 결과 "매칭=29, 신규=13"(최종 캐릭터 13명)으로 정상화 확인.
-
-**데이터 정리**: 잘못 생성된 42개 캐릭터/appearance/face_embedding과 Chroma 컬렉션(`character_faces_naver_820097_CCIP`)을 삭제(Postgres는 `face_record.appearance_id`만 NULL로 리셋, `face_record` 행 자체는 Step1 산출물이라 보존)하고 `webtoon_pipeline_state`의 phase2 카운터도 리셋 — 수정된 코드로 재실행할 수 있게 원복.
-
-### 16.7 Step3 Temporal 워커 액티비티 미등록 버그 (2026-07-04)
-
-수정된 step2 코드로 재실행 후 step3에서 새 에러 발생:
-```
-temporalio.exceptions.ApplicationError: NotFoundError: Activity function step3a_extract for workflow
-naver_820097_chain_step3_2_2 is not registered on this worker, available activities: step3_episode
-```
-
-**원인**: `src/temporal/worker.py`의 `step3_worker`가 `activities=[activities.step3_episode]`(옛 단일 패스 액티비티)만 등록하고 있었는데, `workflows.py::_run_step3`는 이미 2-pass 체인(`step3a_extract`→`step3b_resolve`→`step3c_apply`, 전부 STEP3_QUEUE)을 호출하도록 되어 있었다 — 즉 **워크플로/액티비티 구현은 2-pass로 전환됐는데 워커 프로세스의 등록 목록만 갱신이 안 된 상태**였다.
-
-**수정**: `worker.py`의 `step3_worker` 등록 목록을 `[activities.step3a_extract, activities.step3b_resolve, activities.step3c_apply]`로 교체. `activities.py` 상단 docstring도 갱신.
-
-**확인된 죽은 코드(미삭제)**: `activities.py::step3_episode`(→ `step3.py::analyze_episode_scenes`/`analyze_cut_scene`/`analyze_episode_scenes_by`)는 리포 전체에서 호출자가 전무함(`workflows.py`는 안 씀, `smoke_test.py`는 같은 이름의 독립적인 자체 stub일 뿐 이 함수를 안 씀). §13 R5로 남겨둠 — 삭제 여부는 별도 결정 필요(꽤 큰 블록이라 이번엔 안 건드림).
-
-### 16.8 `narrative_context.fold` 캐시 불일치 버그 (2026-07-04)
-
-ep2 재실행 결과를 검증하던 중 발견. `webtoon_narrative_state.open_threads`(JSON 캐시, 다음 화 프롬프트에 "이전 화까지의 미해결 떡밥"으로 그대로 들어감)에 저장된 떡밥 3건이 `planted_episode: 1`을 갖고 있었는데, 실제 `narrative_thread` 테이블(authoritative)은 같은 떡밥의 `planted_episode_id`를 정확히 ep2(no=2)로 기록하고 있었다 — 캐시와 DB가 어긋남.
-
-**원인**: `_commit_threads`(DB 커밋 담당)는 status가 'resolved'이고 이번 화에 심긴 게 아닌 경우를 제외하면(대부분의 open 떡밥), LLM이 뭐라 답했든 `planted_episode_id`를 **항상 현재 화**로 강제 저장한다. 그런데 `apply_resolution`이 `narrative_context.fold`에 넘기는 `episode_meta["threads"]`는 이 보정 없이 `result.threads`(LLM 원본 응답)를 그대로 썼다 — 이번 케이스에서 LLM이 (ep1이 아예 처리된 적 없는 첫 실행이라) `planted_episode=1`을 추측성으로 반환한 값이 그대로 캐시에 박혔다.
-
-**수정**: `_normalize_threads_for_fold(threads, this_ep_no)` 헬퍼를 추가해 `_commit_threads`와 동일한 보정 규칙을 `episode_meta` 생성 시점에도 적용 — DB와 캐시가 항상 같은 값을 갖도록 함. 이미 오염된 캐시(webtoon_id=60의 `narrative_thread` 3건 + `webtoon_narrative_state` 1건)는 삭제해 다음 실행 때 깨끗하게 재생성되도록 함(`load_prior`는 상태 없으면 빈 초기값으로 처리하므로 안전).
-
-### 16.9 vllm 신뢰성 + Pass-1 병렬화 + max_tokens 절단 수정 + 프롬프트 한국어 강제 + LLM 동시성 config화 (2026-07-04)
-
-**vllm 502/530 재시도**: `vllm.prup.xyz`(Step3 LLM 엔드포인트)도 Cloudflare Tunnel 경유라 §16.1과 같은 이유로 502/530(터널 재연결/일시 다운)이 간헐 발생. `llm_client.py::call_llm_json`엔 재시도가 전혀 없었고, `step3.py`의 `_PASS1_RETRIES=2`도 sleep 없이 즉시 2회뿐이라 지속 장애 구간에서 컷이 통째로 스킵됐다. `ocr_yolo_client.py`와 동일 패턴(최대 10회, 1s→8s 캡 지수 백오프, 5xx+`httpx.TransportError`만 재시도·4xx 즉시 실패)을 추가 — 스트리밍 호출 로직은 `_stream_llm_once`(1회 시도)로 분리하고 `call_llm_json`이 재시도 루프를 담당. 백오프 대기 중엔 `_LLM_SEMAPHORE`를 놓아줘서 다른 컷 시도를 막지 않음.
-
-**Pass-1 병렬화**: `extract_cut`(컷별 비전 콜)은 컷 간 belief 의존이 없음을 코드로 확인(연속성은 Pass-2 담당, `belief` 파라미터는 현재 미사용 예약값) — `extract_episode`에서 `ThreadPoolExecutor`(기본 4워커, `PASS1_WORKERS` env)로 병렬 호출하도록 변경. `_accumulate_belief`의 `last_seen_cut` 갱신처럼 순서 의존적인 후처리는 완료 후 `cut_number`로 재정렬해 단일 스레드로 수행. 실제 동시 LLM 요청 수는 `_LLM_SEMAPHORE`(`LLM_MAX_CONCURRENCY`)가 최종 상한이므로, 워커 수를 올려도 이 값을 같이 올리지 않으면 실질 동시성은 안 늘어남. `db_cursor()`가 `ThreadedConnectionPool`(maxconn=10)이라 컷별 동시 DB 쓰기도 안전 확인.
-
-**max_tokens 절단 버그**: `ep=11 cut=2`에서 `json.JSONDecodeError: Unterminated string...` 발생. DB의 유일한 `llm_model`(`glm-4.6v`) params엔 `max_tokens` 설정이 없어 `_pass1_ctx`의 하한선(4096)이 그대로 적용되고 있었는데, glm-4.6v는 추론형 모델이라 답 이전에 `reasoning_content`(사고과정)로 토큰 예산을 먼저 소모 — 컷이 복잡하면 본문이 다 끝나기 전에 잘린다. `_PASS1_MIN_MAX_TOKENS`를 8192로 상향(§9.4 갱신)하고, `llm_client.py`에서 JSON 파싱 실패 시 `finish_reason`/`completion_tokens`/응답 길이를 에러 메시지에 실어 향후 truncation 여부를 로그만으로 바로 판단 가능하게 함.
-
-**프롬프트 한국어 강제**: beat/summary 등 자연어 출력이 종종 영어로 나오는 문제 — `_PASS1_SYSTEM_PROMPT`/`_PASS2_SYSTEM_PROMPT` 둘 다 앞부분에 "반드시 한국어로 작성" 지시를 눈에 띄게(⚠️) 추가하고, 기존에 문장 끝에 묻혀있던 지시도 강조 처리(`corrected_text`만 OCR 원문 언어 유지 예외).
-
-**LLM 동시성 config화**: `LLM_MAX_CONCURRENCY`/`PASS1_WORKERS`는 코드엔 이미 env var로 있었지만 실제 배포 `proxmox-configuration/pipeline_repo/configmap.yaml`엔 값이 없어 코드 기본값(1/4)에 고정돼 있었다 — ConfigMap에 명시적으로 추가(기존 기본값과 동일 유지, 동작 변화 없음). 이제 이 파일만 고쳐서 배포하면 코드 변경 없이 동시성 조절 가능. `LLM_MAX_CONCURRENCY`를 1보다 올려도 되는지는 vllm 서버의 실제 동시호출 허용치를 실측해야 함(미실측).
-
-**py_compile + 관련 pytest(24개 중 Temporal 테스트서버 포트충돌로 인한 무관한 1개 제외 전부) 통과 확인.**
+- **외부 HTTP 호출 공통 재시도 규칙**: 5xx(Cloudflare 520~526 포함) + `httpx.TransportError`(커넥션/타임아웃)만 최대 10회 지수 백오프(1s→8s 캡), **4xx는 즉시 실패**(우리 쪽 문제를 숨기면 안 됨) — `ocr_yolo_client.py`/`llm_client.py` 공통 패턴. 새로 짜는 외부 호출 코드도 이 패턴을 따를 것.
+- **LLM 콜**: 스트리밍 호출(Cloudflare 터널 idle timeout 회피) + 전역 세마포어(`LLM_MAX_CONCURRENCY`, 기본 1 — 상향 가능 여부 미실측, §13 R4') + primary 재시도 소진 시 **fallback 모델 런타임 전환**(§18.4). max_tokens는 기본 미전송(§18.3).
+- **Step1 멱등성**: resume(커밋된 region/face에서 복원, heartbeat_details 전달) + `ON CONFLICT DO NOTHING` 안전망(human 리뷰 필드 보호를 위해 DO UPDATE 금지).
+- **Step2 방어**: `_get_valid_appearance_ids` 유령 appearance 방어(앵커 필터+루프 내 재검증) — 단 같은 런에서 만든 신규 캐릭터는 즉시 반영. DB/Chroma 리셋은 **비원자적**이므로 "리셋이 완벽했다"고 가정하지 말 것.
+- **Temporal heartbeat**: 긴 텍스트 콜(roster/R/N)과 대용량 apply는 서브스레드 + 30초 주기 heartbeat(`_run_with_heartbeat`, §18.4) — heartbeat_timeout 초과로 인한 재시도 루프 방지. step1은 백오프 총 소요(<~55초/콜)가 heartbeat 5분보다 짧게 설계됨.
+- **model-api**: 전 라우터 동기 추론을 `run_in_threadpool`로 오프로드(이벤트루프 블로킹 해소). 클라이언트 동시 요청은 서버 워커 수에 맞춤(`_EMBED_WORKERS=2`). `HF_HUB_OFFLINE=1`은 미적용(§13 R1). PaddleOCR 주기 재시작(--max-requests)은 의도된 동작 — 재시작 윈도우의 502는 정상.
+- **Chroma REST 직접 호출은 반드시 v2**(`/api/v2/tenants/{tenant}/databases/{database}/...`) — v1은 404가 아니라 **410**을 반환해 "존재 안 함"과 오인하기 쉽다(§10).
+- **프롬프트**: 자연어 출력은 한국어 강제(⚠️ 강조 지시). Pass-1 병렬화는 `PASS1_WORKERS`(configmap 노출), 실질 동시성 상한은 `LLM_MAX_CONCURRENCY`.
 
 ---
 
 ## 17. v4.0 재설계 (확정 방향, 2026-07-05) — 분석 도메인 신규 스키마 + LLM 스테이지 재편
 
-> **전제(사용자 결정)**: 분석 산출 데이터는 전량 폐기·재생성해도 된다. 불가침은 콘텐츠 도메인(`webtoon`/`webtoon_episode`/`webtoon_cut` 등)과 **human 노동분**뿐이다. 따라서 마이그레이션 호환이 아니라 "백지에서 다시 설계해도 같은 걸 만들 것인가"를 기준으로 분석 도메인을 재설계한다. **본 섹션은 설계 확정본이며 구현 전 상태** — 구현 순서는 §17.7.
+> **전제(사용자 결정)**: 분석 산출 데이터는 전량 폐기·재생성해도 된다. 불가침은 콘텐츠 도메인(`webtoon`/`webtoon_episode`/`webtoon_cut` 등)과 **human 노동분**뿐이다. 따라서 마이그레이션 호환이 아니라 "백지에서 다시 설계해도 같은 걸 만들 것인가"를 기준으로 분석 도메인을 재설계한다. **본 섹션은 설계 확정본이며, 구현·prod 적용 완료 상태다**(마이그레이션 0022~0026, 2026-07-05~06 — 현황은 §17.6).
 
 ### 17.1 핵심 전환: 제자리 멱등 갱신 → AnalysisRun 단위 쓰고 버리기
 
-현행 복잡도의 큰 부분(멱등 upsert, scope delete-reinsert, `stable_key`, `resolution_status` 단방향 전이, 리셋 태스크의 부분 실패 — §16.4)은 전부 "기존 데이터를 보존하며 제자리 덮어쓰기"에서 온다. 잘못된 분석을 과감히 버리는 운영 철학에서는 **run 단위 교체**가 정답이다.
+현행 복잡도의 큰 부분(멱등 upsert, scope delete-reinsert, `stable_key`, `resolution_status` 단방향 전이, 리셋 태스크의 부분 실패 — `prd-history.md` §H4.3)은 전부 "기존 데이터를 보존하며 제자리 덮어쓰기"에서 온다. 잘못된 분석을 과감히 버리는 운영 철학에서는 **run 단위 교체**가 정답이다.
 
 - **`AnalysisRun`**(webtoon FK, episode FK NULL허용, kind `vision|resolve|arc`, llm_model FK, status `running|succeeded|failed`, vision_run FK NULL, started/finished_at, stats jsonb).
   - `vision` run: 컷 비전(Stage V) 산출 귀속 — llm `text_annotation`, `cut_scene_meta`.
@@ -736,11 +567,11 @@ ep2 재실행 결과를 검증하던 중 발견. `webtoon_narrative_state.open_t
 | `face_record` | 분해 | `face_detection` + `face_identity` |
 | 레거시 죽은 코드(R5: `step3_episode`/`analyze_cut_scene` 계열) | 삭제 | — |
 
-유지(형태 유지, run FK 추가): `text_region`, `text_annotation`, `cut_scene_meta`, `episode_report`(+`teaser` 필드 신설), `episode_beat`, `narrative_thread`, `character_claim`, `llm_usage`(+run FK), `character_appearance`, 설정 테이블(EmbeddingModel/WebtoonEmbeddingSetting/LLMModel/WebtoonLLMSetting).
+유지(형태 유지, run FK 추가): `text_region`, `text_annotation`, `cut_scene_meta`, `episode_report`(+`teaser` 필드 신설), `episode_beat`, `narrative_thread`, `character_claim`, `llm_usage`(+run FK), `character_appearance`, 설정 테이블(EmbeddingModel/WebtoonEmbeddingSetting/LLMModel — `WebtoonLLMSetting`은 v4.1에서 추가 폐기, §18.1).
 
 ### 17.4 LLM 스테이지 재편: V → R → N → apply (+주기적 A)
 
-Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산과 출력 비대(v3.6 전수 화자 테이블화 이후)를 해소하기 위해 텍스트 해소를 둘로 분리한다. **LLM 스테이지 상한은 에피소드당 3콜** — 이 이상의 분해는 금지(§9.3 과분해 원칙 유지).
+Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산과 출력 비대(v3.6 전수 화자 테이블화 이후)를 해소하기 위해 텍스트 해소를 둘로 분리한다. **에피소드 단위 텍스트 콜 상한은 3콜** — v4.1에서 roster 스테이지가 추가되어 roster/R/N 3콜로 상한을 채웠고(§18.1~18.2), 이 이상의 분해는 금지(§9.3 과분해 원칙 유지). 실제 스테이지 순서는 **V → roster → R → N → apply**.
 
 | Stage | 콜 | 입력 | 출력 |
 |---|---|---|---|
@@ -750,8 +581,8 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 | apply | 0 (결정론) | R+N 산출 | 커밋(human 동결), suggestion 적재, profile llm 행 병합 |
 | **A** 아크 종합 | 주기적(매 N화 또는 아크 경계) | 해당 구간 episode_report들 | `story_arc` — 웹툰 전체 줄거리는 아크 요약의 연결(1~30 fold 나열식 늘어짐의 근본 해법) |
 
-- R/N 분리 이점: 서사 분석이 정체 정정 **후의** 텍스트를 읽음(현재는 한 콜에서 동시 수행), 출력 분산, 실패 격리(N이 죽어도 화자 데이터 착지). 비용은 에피소드당 텍스트 콜 1→2(무제한 플랜에서 무시 가능).
-- **보류 결정**: 앙상블/교차검증(단일 모델 튜닝이 먼저 — "두 번째 의견"은 suggestion 큐+human이 담당), 도감용 Graph/Vector DB(규모상 Postgres 조인으로 충분, 신규 인프라 운영 부담 회피 — 도감 정본은 Postgres, 얼굴 벡터만 Chroma 유지). 민감물 로컬 라우팅은 기존 `WebtoonLLMSetting`으로 충족.
+- R/N 분리 이점: 서사 분석이 정체 정정 **후의** 텍스트를 읽음, 출력 분산, 실패 격리(N이 죽어도 화자 데이터 착지). 비용은 에피소드당 텍스트 콜 증가(무제한 플랜에서 무시 가능).
+- **보류 결정**: 앙상블/교차검증(단일 모델 튜닝이 먼저 — "두 번째 의견"은 suggestion 큐+human이 담당), 도감용 Graph/Vector DB(규모상 Postgres 조인으로 충분, 신규 인프라 운영 부담 회피 — 도감 정본은 Postgres, 얼굴 벡터만 Chroma 유지). (설계 당시 "민감물 로컬 라우팅은 `WebtoonLLMSetting`으로 충족"이라 했으나 v4.1에서 per-webtoon override 자체를 폐기 — 필요해지면 재도입 논의, §18.1.)
 
 ### 17.5 요약/티저 품질 규칙 (Stage N 프롬프트 계약)
 
@@ -762,58 +593,94 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 3. **데이터 기반 스포 차단**: teaser는 이번 화에 resolved된 `narrative_thread`의 답과 `deceptions`의 진실 언급 금지, 미회수 떡밥은 암시만 — 스포일러 목록을 프롬프트 감이 아니라 구조 데이터로 강제.
 4. summary 2~3문장 상한. v3.6 규칙(근거 기반, 평가어 금지, deception은 기만 의도 speech만) 승계.
 
-### 17.6 v3.6 코드 diff 처리 (미커밋 상태)
+### 17.6 구현·적용 현황 + 구현 중 확정된 계약 (2026-07-07 확인)
 
-- **v4.0에 그대로 승계**: Pass-1 화자 영속 + 전수 화자 테이블 + provisional 승격 안전망, confirmed 플래그 배선, max_tokens 16384, deception/요약 프롬프트 규칙, service human-수정 API의 수정 신호(단, is_stale 플래그 → human 타임스탬프 비교로 형태 변경), reresolve CLI(run 재실행으로 개념 승계).
-- **v4.0에서 걷어냄**: `character.extra['llm_profile']` 커밋부 + `CharacterSerializer.profile`의 extra 참조(→ `character_profile` 모델로), `apply_resolution`의 `llm_analyzed_at/is_stale` 컷 마킹(→ run 도출로), `webtoon_narrative_state` 캐시 슬림화(테이블 자체 폐기로 무의미).
+**상태**: §17.7 구상의 1~2단계(+service API)가 구현·커밋됐고(data-pipeline `24f573b`~, service 마이그레이션 `0022`~`0026`), **prod 적용 완료**(0022 wipe+0023 스키마 2026-07-05, 0024~0026 2026-07-06). 신 워커 배포·가동 중, **전량 재분석 진행 중**(wipe 전략 — human 노동분도 이번 전환에 한해 폐기, §15 결정. 유실 실측: face 확정 1,696건·이름 확정 84건·human 주석 36건·제외 마킹 49건, 재작업 감수). 남은 단계: Stage A(§13 A1), webtoonmoa(§13 L3), 검증 지표 확인(§13 V1). 당시 세션 인수인계·마이그레이션 작성 경위 전문은 `prd-history.md` §H5.
 
-### 17.7 구현 순서 (다음 세션부터)
+**구현 중 확정된 살아있는 계약**:
+- **run kind에 `step1`/`step2` 추가**: step1/2는 산출물 run FK 귀속 없이 **완료 원장 행만**(`runs.record_completed_run`). 체인 진행 판정 step→kind 매핑은 `shared.STEP_RUN_KIND`(step3→resolve).
+- **R/N run 공유**: step3b가 resolve run 시작(roster/R/N usage 귀속), **step3c apply 성공이 succeeded 전이** — "에피소드 step3 완료"의 정본 시각. N만 실패하면 화자 데이터 유지+서사 필드만 빈 값(실패 격리).
+- **face_reassign suggestion**: Stage R 출력 `face_reassignments[{cut, face, to_character_id|null, evidence, confidence}]` → apply가 detection_id로 해석해 `suggestion(type=face_reassign)` 적재(수락 시 service가 human FaceIdentity 생성). human 확정 얼굴 동결, 무효 (cut,face) 무시, 무효 to_character_id는 null 강등, 동일/무의미 제안 드롭, 윈도우 병합은 (cut,face) dedup.
+- **reapply(LLM 없는 재투영)는 run을 만들지 않고 suggestion 큐 불가침**: `apply_resolution(refresh_suggestions=False)` — pending 제안 재생성 원료가 비영속이라 delete-reinsert 시 통째 유실되기 때문. 제안 재생성은 새 resolve run의 apply만.
+- **테이블 prefix**: 분석 `analysis_`/설정 `config_`(콘텐츠·추천 불변). **constraint 이름은 불변** — 파이프라인이 `ON CONFLICT ON CONSTRAINT` 이름 참조(`uniq_face_record_cut_idx`가 analysis_face_detection에 legacy 이름으로 유지).
+- **클러스터 이름**: `name=""` + 표시 라벨 `cluster#{id}`. `_find_character_by_name`은 `kind='character'`만 후보.
+- **Stage N 윈도잉 없음**: 입력이 컴팩트해 단일콜. 로컬 16K 폴백에서 긴 에피소드 절단 위험 — 실측 후 필요 시 후속(§13 S1).
 
-1. **service 마이그레이션**: `AnalysisRun`/`character.kind`/`face_detection`+`face_identity`/`character_profile`/`suggestion`/`episode_report.teaser` 신설 + §17.3 폐기 마이그레이션. human 노동분 보존 스크립트(is_confirmed character 이름, 확정 얼굴↔인물, human annotation, is_excluded).
-2. **data-pipeline 스테이지 재편**: Step2가 kind=cluster 생성, Step3를 V/R/N/apply로 재구성(Temporal 액티비티 3분할 유지·R/N은 한 액티비티 내 2콜), run 라이프사이클 배선, 죽은 코드(R5) 삭제.
-3. **Stage A(아크 종합)** 신설 + 트리거 주기 결정.
-4. **webtoonmoa**: suggestion 통합 검토 큐 화면, 도감(profile) 화면.
-5. **검증**: `naver/820097` 전량 재분석(신 스키마) — 화자 부착률/요약·teaser 품질/도감 확인. 골든 회귀 테스트를 신 계약으로 이식.
+---
 
-### 17.8 구현 노트 (2026-07-05, §17.7 1~2단계 구현하며 확정된 보강)
+## 18. v4.1 — 정체성·서사 로스터 & 파이프라인 신뢰성 (2026-07-06~07, 구현·배포 완료)
 
-- **AnalysisRunKind에 `step1`/`step2` 추가**: §17.1은 LLM 도메인(vision/resolve/arc)만 정의했으나, 진행도 3원화를 run으로 수렴하려면 step1/2 완료도 run이어야 한다(구 `EpisodePipelineProgress` 대체). step1/2는 산출물 run FK 귀속 없이 **완료 원장 행만** 남긴다(`runs.record_completed_run`) — 탐지/매칭 레이어는 run 교체 대상이 아니기 때문. 체인 진행 판정(`next_chain_episode`)의 step→kind 매핑은 `shared.STEP_RUN_KIND`(step3→resolve).
-- **R/N run 공유**: step3b가 resolve run을 시작(R+N 2콜 usage 귀속), step3c apply 성공이 succeeded 전이 — "에피소드 step3 완료"의 정본 시각. N 콜만 실패하면 화자 데이터는 유지된 채 서사 필드만 빈 값(실패 격리 확인).
-- **face_reassign suggestion 생산 구현됨(2026-07-05 후속 세션)**: Stage R 출력에 `face_reassignments: [{cut, face(F라벨), to_character_id|null, evidence, confidence}]` 섹션 추가(얼굴 단위 판단 — 인물 전반의 의심은 기존 label_conflict 유지, 프롬프트가 구분 지시). apply(step3c)가 `(cut_number, face_idx)`→`face_detection.id`로 해석(`_episode_face_detection_map`)해 `suggestion(type=face_reassign, detection_id, payload={to_character_id, evidence})`로 적재 — 수락 시 service가 human FaceIdentity 생성(기구현). 커밋 규칙: human 확정(confirmed) 얼굴 동결, 실재하지 않는 (cut,face) 무시, 웹툰에 없는 to_character_id는 null 강등(오배정 신호만 유지), 현재 배정과 동일/미배정+대상미상 제안은 드롭. 윈도우 병합은 (cut,face) dedup(confidence 우선).
-- **reapply는 suggestion 큐 불가침(2026-07-05 후속 세션, 유실 버그 수정)**: `apply_resolution(refresh_suggestions=False)` — reapply(이름만 변경 시 LLM 없는 재투영)가 pending 제안을 delete-reinsert하면 스냅샷에 비영속인 원료(name 후보 confidence, face_reassignments)가 재생성 불가라 직전 run의 pending name/face_reassign 제안이 통째로 유실되던 문제. 재투영은 큐를 건드리지 않는다(제안 재생성은 새 resolve run의 apply만).
-- **마이그레이션 전략 전환: 이식 → 전량 wipe(사용자 결정, 2026-07-05 후속 세션)**: §17 전제의 "human 노동분 불가침"을 이번 전환에 한해 완화 — 분석 데이터 전량 폐기·재생성을 택했다(유실 실측: face 확정 1,696건, 이름 확정 캐릭터 84건, human 주석 36건, 제외 마킹 49건 — 재작업 감수). 불가침은 콘텐츠 도메인(webtoon/webtoon_episode/webtoon_cut/webtoon_author)·설정 테이블·S3 원본뿐. 이에 따라 **구 손작성 0022(RenameModel pk 보존+이식)는 폐기**하고 `0022_v4_wipe_analysis_data`(TRUNCATE, postgres 벤더 가드) + `0023`(전부 makemigrations 자동 생성, faceembedding.detection one-off default는 빈 테이블이라 무의미) 구성으로 재생성. sqlite 체인 검증을 위해 삭제 예정 모델(EpisodePipelineProgress/FaceRecord/NameDiscoverySuggestion)의 constraint/index를 RemoveField 앞에 명시 제거(Django가 자동 생성 안 함 — sqlite 테이블 재작성 크래시 + `uniq_face_record_cut_idx` 이름 충돌 예방).
-- **테이블 prefix 도입(사용자 결정, 2026-07-05 후속 세션)**: 분석 산출 테이블 17개에 `analysis_`(예: `analysis_text_region`, `analysis_character`, `analysis_face_detection`, `analysis_suggestion`, `analysis_llm_usage`, `analysis_episode_segment` — `analysis_run`은 기존 이름 유지), 설정 테이블 5개에 `config_`(`config_llm_model`, `config_webtoon_llm_setting`, `config_embedding_model`, `config_webtoon_embedding_setting`, `config_webtoon_pipeline_state`). 콘텐츠(webtoon*)·추천(reco_*)은 불변. 파이프라인 raw SQL 124곳 일괄 치환(키워드 FROM/JOIN/INTO/UPDATE 앵커로 안전 치환). **constraint 이름은 불변**(파이프라인이 `ON CONFLICT ON CONSTRAINT`로 이름 참조 — `uniq_face_record_cut_idx`는 analysis_face_detection 테이블에 legacy 이름으로 유지됨을 문서화).
-- **reapply(이름만 변경 시 LLM 없는 재투영)는 run을 만들지 않는다** — 기존 run 산출의 재투영이므로 최신 succeeded resolve run id를 그대로 스탬프.
-- **마이그레이션 안전장치**: `face_record`는 Delete+Create가 아니라 **RenameModel**(0022)로 이행해 pk 보존(S3 crop 경로 `face_crop/{pk}.jpg` + human 확정 유지). `is_confirmed=True` 행은 human FaceIdentity로, appearance 배정 행은 step2 FaceIdentity로 이식. `character.kind` 백필: is_confirmed 또는 비-NEW_CHAR 이름 → character.
-- **클러스터 이름**: `name=""`(빈 문자열) + 로그/Chroma 메타 표시용 라벨은 `cluster#{id}`. `_find_character_by_name`은 `kind='character'`만 후보로.
-- **Stage N 윈도잉 없음**: N 입력(정정된 트랜스크립트, 텍스트만)은 컴팩트해서 단일콜. 로컬 16K 폴백에서 긴 에피소드가 초과하면 절단 위험 — 실측 후 필요 시 후속(§9.12 계열 리스크로 이월).
-- **기존 깨진 테스트 7건(step1 resume SQL 픽스처 미모델링) 수리 완료**: conftest FakeCursor에 resume 복원 3쿼리(`SELECT tr.cut_id, MAX(tr.index)`/`fr.face_idx`/`is_used bbox`) 핸들러 추가 + face_record→face_detection 매칭 문자열 전환. 파이프라인 테스트 스위트 전체 그린(2026-07-05, 워크플로 테스트 1건은 Temporal 테스트서버 포트 플래키로 재실행 통과).
+> **계기**: Step3 산출의 "핀트 어긋남" — 죽은 천마를 산 것으로 요약, 놀란 주체·정보 전달자 뒤바뀜, 미등장 인물을 화면 인물로 오귀속, 오류가 프로필에 박제·전파. **조사 결론**: 뿌리는 얼굴 임베딩도 이미지 부재도 아니라 ① 추론 스테이지에 권위 있는 **서사 로스터 부재** + ② 텍스트 스테이지에 **비전 모델(glm-4.6v) 오용**. 손-로스터 주입 시 who-is-who 혼동 7/12→0/6, glm-5.2 자동 로스터가 3웹툰·3장르(화산귀환/아카데미에서 살아남기/참교육) 전부 정확. 조사 경위·실측 수치·가설 반전 이력은 `prd-history.md` §H6.
 
-### 17.9 작업 현황 & 인수인계 (2026-07-05 세션 종료 시점 — 새 세션은 여기부터 읽을 것)
+### 18.1 스테이지·모델 배선 — modality 2-슬롯
 
-**현재 상태: §17.7의 1·2단계 + 3단계 일부(service API)가 구현 완료됐고, 두 레포 모두 미커밋 working tree로 남아 있다(사용자 결정: 유지). 프로덕션 DB에는 아직 아무것도 적용 안 됨.**
+- **스테이지 순서: V(컷 비전, 컷당 1콜) → roster(에피소드 로스터 추출, 신설) → R(정체·화자) → N(서사) → apply(결정론)**. roster/R/N은 이미지 없는 텍스트 콜로 에피소드당 3콜(§17.4 상한 충족). roster/R/N은 step3b 한 액티비티 안에서 순차 실행, resolve run 공유.
+- **모델 해석**: `resolve_llm_model(webtoon_id, role)`, role∈{`vision`,`text`} — 전역 기본 = `config_llm_model WHERE is_default AND is_active AND supports_vision=(role=='vision')`(modality당 활성 기본 1개 partial-unique 제약). **per-webtoon override(`WebtoonLLMSetting`) 폐기**(전역 전용 — 필요해지면 재도입 논의). role 전용 기본이 없으면 아무 활성 기본으로 강등(시드 전/롤백 안전망). 모델명 하드코딩 없음.
+- **시드**: glm-4.6v(vision default) / **glm-5.2(text default)** / qwen-vl(공용 fallback, `fallback` self-FK로 지정). 근거: 텍스트 추론에 비전 모델을 쓰면 반어·욕설·장르 트로프를 사실로 오독(glm-4.6v 로스터 정확도 ~1/7 vs glm-5.2 5/5). qwen-vl은 로스터 추출에서 회차별 불안정 + 2.6~10배 느려 fallback 전용.
+- 코드: `llm_resolver.py`(role·전역 도출·fallback 해석) / `step3.py`(V=vision, roster·R·N=text) / `activities.py`(step3a=vision run, step3b=text).
 
-#### 완료된 변경 (미커밋)
+### 18.2 로스터 스테이지 계약 (who-is-who)
 
-- `data-pipeline` 레포: `prd.md`(본 문서 v4.0), `webtoon-pipeline/src/core/{step1,step2,step3,runs}.py`(runs.py 신규), `src/operators/narrative_context.py`(정본 조인 재작성), `src/temporal/{activities,workflows,shared}.py`, `src/tools/reresolve.py`, `tests/conftest.py`(신 스키마+resume SQL 픽스처), `tests/test_workflow_orchestration.py`(step3 mark 제거 계약), `tests/test_step3_face_reassign.py`(신규 — face_reassign 생산+reapply 큐 보존 계약), `smoke_test.py`(step3a/b/c 스텁).
-- `service` 레포: `backend/apps/api/toon/models.py`(+테이블 prefix), `migrations/0022_v4_wipe_analysis_data.py`(**손작성 wipe** — 구 이식형 0022는 사용자 결정으로 폐기, §17.8), `migrations/0023_analysisrun_characterprofile_facedetection_and_more.py`(자동 생성 + 삭제 모델 constraint 선행 제거 3건 손보정), `views.py`/`serializers.py`/`admin.py`/`tasks.py`/`urls.py`/`service/face_crop.py`/`management/commands/sync_confirmed_face_embeddings.py`.
-- 검증 상태: 파이프라인 pytest 스위트 **전체 그린**(기존 깨져 있던 픽스처 7건 포함 수리, §17.8). service는 `manage.py check` 통과 + 마이그레이션 체인(0001→0023) sqlite 실행 통과 + `makemigrations --check` 클린. **실 Postgres/실 LLM으로는 아무것도 안 돌려봄.**
+- **`extract_roster`**(step3b, R 앞 텍스트 1콜): 에피소드 전체 트랜스크립트(+prior)로 권위 인물 로스터 산출 — `{name, aliases[], present_now, status(생존|사망|불명+근거), role, evidence(컷·원문)}`.
+- **프롬프트 규칙**(전부 실측 실패 사례에서 도출): **언급≠등장**(호명·회상만이면 present_now=false), **반어·욕설 오독 금지**("얼어 죽을 X", "너 X 아냐?!"를 정체/생사로 단정 금지), **회상/현재 분리**, **환생/빙의는 aliases로 동일인 묶음**(원래 이름+현재 몸 이름 한 인물, 정보 전달자 조연과 구분), 사망/부재는 status에 근거와 함께.
+- **주입**: `episode_roster`를 R·N 페이로드에 삽입 + 두 시스템 프롬프트에 `_ROSTER_GUIDANCE`("present_now=false 인물을 현재 화면 인물/화자로 지목 금지, status 사망/부재 인물을 산 것처럼 다루지 말 것, aliases는 동일인").
+- **격리·영속**: 추출 실패 시 빈 로스터로 R/N 진행(run 중단 없음). **영속하지 않음**(`ResolveResult.roster`는 관찰용, apply 미커밋) — 회차 로스터를 다음 회차 prior에 합류시킬지는 오픈(§18.8-4). usage는 `stage='roster'`로 콜당 1행.
 
-#### 남은 작업 (순서 제안)
+### 18.3 max_tokens 정책 — 기본 미전송 (§9.4의 고정 하한 대체)
 
-1. **커밋 정리**: 사용자 검토 후 두 레포 커밋(단위 분리 권장: service 스키마 / service API / pipeline 코어 / 테스트·문서).
-2. **배포 & 검증(§17.7-5)** — ⚠️ 순서 중요 (wipe 전략 반영, §17.8):
-   1. **prod DB 백업**(권장 — 0022가 분석 데이터 TRUNCATE. 콘텐츠/설정만 남기는 게 의도지만 롤백 보험).
-   2. service 마이그레이션 적용(`migrate toon`: 0022 wipe + 0023 스키마) → **곧바로 파이프라인 워커도 함께 배포**(동시 교체 — 구 워커는 구 테이블명(`face_record` 등)·폐기 컬럼을 쓰고, 신 워커는 `analysis_*`/`config_*` 신 테이블 필요).
-   3. **Chroma 컬렉션 리셋**: 기존 벡터가 TRUNCATE로 사라진 face pk를 참조하므로 전량 삭제 후 재시작.
-   4. **step1부터 전량 재분석**(분석 데이터가 비었으므로 step3만이 아니라 전체 체인): 컷 이미지는 S3에 있어 재다운로드 없음. face crop은 새 pk로 S3 덮어쓰기(pk 시퀀스 RESTART).
-   5. 확인 지표: llm speech/monologue의 speaker_id 부착률(v3.6 이전 1~2%가 기준선), `analysis_episode_report.teaser` 품질(스포 여부), `analysis_suggestion` 큐 적재(name/merge/label_conflict/face_reassign), `analysis_character_profile` 생성. (구 human 확정은 wipe로 소멸 — 페니아 confirmed 존중 검증은 webtoonmoa에서 재확정 후 재해소로 대체.)
-3. **Stage A(아크 종합) 신설(§17.7-3)**: story_arc 생산자 — 입력=구간 episode_report들, kind='arc' run, 트리거 주기(매 N화 vs 떡밥 회수 등 경계 감지) **논의 후** 구현. 아직 미설계.
-4. **webtoonmoa(§17.7-4)**: suggestion 통합 검토 큐 화면(`GET .../suggestions/`, `PATCH /suggestion/{id}/` 이미 서비스에 있음), 인물도감 화면(CharacterSerializer의 `kind`/`profile` 노출 완료).
-5. **이월 항목**: litellm 요청 프롬프트(messages) 로깅 설정, Stage N 로컬 16K 절단 리스크 실측, `LLM_MAX_CONCURRENCY` 상향 실측(§13 R4), model-api `HF_HUB_OFFLINE`(§13 R1). ~~face_reassign suggestion 생산~~(2026-07-05 후속 세션에 구현 — §17.8, `tests/test_step3_face_reassign.py`).
+- 고정 max_tokens(하한 16384든 상향 100k든)는 실전 결함 2건: 입력 큰 회차에서 입력+출력 > context_window → **400 ContextWindowExceeded**, 반대로 작으면 **조기절단(finish='length')**(추론형 모델은 reasoning이 예산 선소모).
+- 게이트웨이(vllm) 실측: **max_tokens 미전송 시 남은 컨텍스트만큼 자동 허용 + 자연 종료(finish='stop')**. 따라서 `llm_client._resolve_max_tokens`는 **기본 None(미전송)**. `params.max_tokens` 명시 시에만 cost cap으로 쓰되 `params.context_window` 기준(입력 추정+마진)으로 축소해 400을 막는다. `step3._stage_ctx`는 temperature만 clamp.
+- **DB 규칙**: `config_llm_model.params`에 `context_window`만 설정(glm-4.6v=32768, glm-5.2/qwen-vl=131072 — 게이트웨이 실측), `max_tokens`는 비움. **prod 적용 확인됨(2026-07-07)**.
 
-#### 새 세션 주의사항
+### 18.4 강건성 — json-repair / 런타임 fallback / heartbeat
+
+- **json-repair 파싱 폴백**(`llm_client._parse_json_content`): strict `raw_decode` 실패 시 `json_repair.repair_json`으로 콤마/괄호 누락·미이스케이프 따옴표 등 경미한 손상 복구 — finish='stop'인데 깨진 JSON으로 컷이 통째 스킵되던 문제 해소(실측: ep4 cut80 미이스케이프 따옴표를 5블록 손실 없이 복구). 라이브러리 부재 시 자동 비활성. 의존성 `json-repair` pyproject/uv.lock 추가(이미지 rebuild 필요).
+- **런타임 fallback**(`call_llm_json`): primary 재시도(10회) 소진 시 `ctx["fallback"]`(resolver가 self-FK 1홉 해석, 순환 방지·비활성 무시) 모델로 1회전 더 — glm-5.2/glm-4.6v → qwen-vl. 폴백 모델명은 DB로만 지정(코드 하드코딩 없음).
+- **Temporal heartbeat**(`activities._run_with_heartbeat`): 실제 작업을 서브스레드에서 돌리고 액티비티 본 스레드가 30초마다 heartbeat — step3b(roster/R/N, 대사폭탄 회차 콜 ~14분 실측)와 step3c(대용량 apply)를 감싸 heartbeat_timeout(10분) 초과→재시도 무한루프를 방지.
+
+### 18.5 CCIP 매칭 — 과병합(magnet) 수정 + 재실행 검증 절차 (트랙 C)
+
+- **진단(실측)**: 화산귀환 char7 blob(207얼굴, 주인공 165보다 많음, 전 7화 고른 분포)의 내부 pairwise CCIP diff median **0.206**(=서로 다른 인물 수준) — **CCIP 임베딩 자체는 정상**(다른 인물 medoid 간 0.231 분리, 동일 인물 코어 <0.10대). 근본은 **매칭 magnet**: 앵커 무제한 누적 + greedy 1-NN이라 얼굴 많은 인물의 acceptance 영역이 커져 비슷한 얼굴을 다 빨아들임.
+- **수정**(`matching.py`, env 튜닝·하드코딩 없음): ① **앵커 캡** — `load_ccip_anchors`가 인물(appearance)당 conf 상위 K개만(기본 12, env `CCIP_MAX_ANCHORS_PER_APPEARANCE`, ≤0이면 무제한=옛 동작). ② **마진 룰** — `_find_match_ccip`가 appearance별 최소 diff를 구해, 최근접이 threshold 이내 **AND** 2등(다른 인물)보다 margin(기본 0.03, env `CCIP_MATCH_MARGIN`) 이상 가까울 때만 확정, 애매하면 신규 보류(오병합보다 안전). `ccip_compare`가 전체 diffs를 반환해 model-api 변경 불필요.
+- **데이터 복구는 안 함(사용자 결정)** — HITL 재배정 대신 배포 후 **화산귀환(webtoon_id=17) wipe→전량 재실행**으로 검증.
+- **검증 절차**: ① 선행 — 배포 워커가 새 matching.py를 쓰는지 확인, env 2종을 `proxmox-configuration` pipeline configmap에 노출(무배포 튜닝), (선택) `config_embedding_model` threshold 0.16→0.13 스윕. ② wipe — service admin "분석데이터 초기화하기"(`reset_analysis_action`: DB 분석분+R2 face crop+Chroma 컬렉션 삭제, 컷까지 지워지므로 **phase1부터 전량 재실행** 필요). ③ 판정 쿼리(읽기전용) — 인물별 step2 얼굴 수(한 인물이 주인공보다 많고 전 회차 고르게 깔리면 magnet 재발) + 최다 인물의 에피소드별 분포(실제 등장 arc를 따라야 정상). ④ CCIP 실측 — `_ccip_bleed.py`로 최다 클러스터 내부 median diff **<0.16**(단일 인물 수준)이면 성공(`dghs-imgutils` 로컬 설치, `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python` 필요 — 절차 상세는 스크립트 주석과 `prd-history.md` §H6). ⑤ 튜닝 루프 — blob 재발/과분할 시 K 8~16, margin 0.02~0.05, threshold 0.13~0.16 스윕. 목표는 완벽 분리가 아니라 "char7급 blob 소멸 + 주요 인물 대략 분리"(대인/거지 구간은 본질적 모호).
+- **진행 상태(2026-07-07)**: **wipe는 이미 실행됨** — 화산귀환 run이 118부터 새로 시작(구 run·컷 전부 삭제), phase1 재실행이 **ep1~3까지** step1/step2/step3 완료(컷 146/117/100 재생성). **ep4 이후는 컷 0개**(step1 미도달). ⚠️ **재실행에 쓰인 배포 이미지가 `bfd83f5`(matching.py 앵커캡/마진)를 포함하는지 미확인** — 미포함이면 ep1~3 재실행은 구 매칭으로 돈 것이라 트랙 C 검증으로 무효, 이미지 확인 후 필요 시 재차 wipe→재실행. 판정 쿼리(③④)는 이미지 확인 후 실행할 것.
+
+### 18.6 테스트 오라클 — 화산귀환 정본 인물 로스터 (사용자 확정, 2026-07-06) ⭐
+
+향후 정체성/화자/서사 품질 회귀의 **정답 기준**(naver/769209 초반부):
+- **청명** — 주인공. 대화산파 13대 제자·매화검존. **천마를 죽이고 100년 후 환생**. 환생한 **거지 소년 몸의 원래 이름이 '초삼'**(거지판에서 청명은 초삼으로 불림) — 즉 **청명 = 초삼**(동일 인물, 몸의 이름).
+- **구칠** — 거지. 청명에게 몸의 원래 이름(초삼)과 천마의 죽음을 알려준 **정보 전달자**.
+- **왕초, 종팔** — 거지 무리(구칠과 같은 걸개 패거리).
+- **운암** — 화산파 **제자**(장문인에게 보고, 처소/입관식 준비). 장문인 아님.
+- **장문인** — 화산파 수장. ep2 말~ep3에서 청명의 입문 허락.
+- **천마** — 마교 교주. **100년 전 청명에게 죽음**(회상 속 인물, 현재 시점 미등장. ep2/ep3엔 언급조차 없음).
+- 청진 — 전쟁 중 실종된 화산 무인. ep3에서 청명이 "청진 후손" 거짓 각본에 이용(미등장).
+
+핵심 함정: 환생 트로프(청명=초삼 동일인, 구칠과 혼동 금지), 천마 생사(사망), 운암≠장문인, 회상/현재 분리.
+
+### 18.7 적용 상태 (2026-07-07 prod 실측)
+
+- 마이그레이션 `0024`(모델 스키마: fallback FK+modality 제약, WebtoonLLMSetting 삭제)·`0025`(glm-5.2 시드)·`0026`(LLMUsage stage에 roster) 적용 확인. `config_llm_model` params가 context_window만 보유(max_tokens 제거) 확인.
+- **`stage='roster'` 콜이 2026-07-06 15:57 KST부터 prod 적재 중** — 로스터 포함 빌드(커밋 `a5c777c` 이상) 배포·가동 확인.
+- **미확인**: 이후 커밋 `cc27a69`(max_tokens 정책)·`bfd83f5`(heartbeat+**matching.py 앵커캡/마진**)·`b29ab87`(이름 제안 중복 방지)까지 포함된 이미지인지 — DB만으로 판별 불가, **재배포로 최신화 필요**(특히 트랙 C 검증 전 matching.py 배포가 선행조건). CCIP env 2종의 configmap 노출도 미확인.
+- litellm 게이트웨이: 응답(response)은 `LiteLLM_SpendLogs`에 적재(길이 초과분 절단 — 수용, 앞/뒤는 남음). 요청 프롬프트는 **litellm UI에서는 보이지만 DB에는 영속되지 않음**(2026-07-07 실측: 최신 콜도 `messages={}`, `metadata.proxy_server_request`도 빈 값) — SQL로 과거 프롬프트 복구는 불가, 요청 확인은 UI로. UI 표시가 프록시 재시작 후에도 유지되는지 미확인.
+
+### 18.8 백로그 (미착수 — 우선순위·설계 논의 후 착수)
+
+1. **검출 위생 — 흐름과 안 맞는 텍스트/얼굴 정리** (구 §5.6 확장):
+   - (a) **깨진 효과음 OCR**(예: '하아…'→'Sror', 'Sof', '스록' 같은 정체불명 노이즈): LLM이 `type='other'`로 분류는 하나 파이프라인이 제외를 커밋하지 않음. `other` 일괄 제외는 과삭제(정상 효과음 원문 포함) — 자모 깨짐/라틴 노이즈 비율 또는 LLM garbage 플래그 등 **별도 판정 신호** 필요.
+   - (b) **파편 텍스트 region dedup(2026-07-07 신규)**: OCR이 글자 획 일부를 별도 region으로 뽑는 사례 — 예: 'ㅏ'에서 '-'를 별도 검출. 파편 bbox가 원 region bbox와 IoU상 거의 완전히 겹치는데도(사실상 포함) 별도 region으로 살아남아 `type='other'`로 커밋됨. garbage 텍스트 판정과 별개로 **bbox 포함관계(IoU/containment) 기반 dedup·제외**가 필요.
+   - (c) **오탐 얼굴**(예: conf 0.435 비얼굴): model-api `FACE_CONF_THRESHOLD=0.3`뿐, 파이프라인 추가 하한 없음. 경계값이 애매해 자동 하한보다 **HITL 위주** 권장.
+   - 삭제 방식: **도메인 플래그**(텍스트=`is_excluded`, 얼굴=`is_used=false` — HITL UI에 계속 보이며 가역) > `deleted_at`(전역 숨김이라 복구 어려움).
+2. **character_claim 생사 평탄화 방지** (구 §5.3): 생사류 사실을 "누가·언제 그렇게 주장"+근거 인용으로 커밋해 장르 트로프가 명시 사실을 덮지 않게. glm-5.2 전환으로 급성 문제는 해소돼 후순위.
+3. **트랙 C 재실행 검증**(§18.5) — 배포 확인 후 실행.
+4. **로스터 영속/prior 합류**: 회차 로스터를 저장해 다음 회차 prior에 합류시킬지(현재 인메모리 전용). 정본 인물은 여전히 `analysis_character`.
+5. **step3의 컷 0개 게이트 부재(2026-07-07 실사고)**: step3 체인은 `is_downloaded`만 확인하고 step1 산출(컷) 존재를 게이트하지 않음 — wipe 후 step1이 아직 안 돈 ep4(1101)에 step3 범위 체인이 돌아 **빈 트랜스크립트로 roster/R/N 실행 + "컷 데이터가 제공되지 않아…" 리포트를 succeeded resolve run(132)으로 커밋**. succeeded run이 생기면 자동(unbounded) 체인이 그 회차를 "완료"로 건너뛰므로 **자연 치유 안 됨** — ep4는 step1/2 후 step3 명시 재실행 필요. 근본 대책(컷 0이면 skip/fail 게이트) 논의 필요.
+6. 이월: 재해소 Temporal 자동 트리거(§11.2), Stage N 로컬 16K 절단 실측(§13 S1), `LLM_MAX_CONCURRENCY` 실측(§13 R4'), `HF_HUB_OFFLINE`(§13 R1), 죽은 코드 정리(§13 R5).
+
+### 18.9 새 세션 주의사항
 
 - 사용자 워크플로: **논의 먼저, 코드 수정은 명시 승인 후.** 스키마/설계 변경은 PRD에 결정 기록이 선행된다.
-- 진행도/stale은 이제 컬럼이 아니라 도출이다(§17.1) — "분석 됐나"를 확인하려면 `analysis_run`을 조회할 것(구 `episode_pipeline_progress`/`llm_analyzed_at` 쿼리는 무효).
-- CLAUDE.md의 "자주 쓰는 테이블" 목록은 v4 신 스키마(analysis_/config_ prefix 포함)로 갱신됨(2026-07-05) — 단 **prod 적용 전까지 실제 DB는 구 스키마**임에 유의.
+- 진행도/stale은 컬럼이 아니라 도출(§17.1) — "분석 됐나"는 `analysis_run` 조회.
+- 모델 추가/교체는 DB(`config_llm_model`)로만 — params에는 `context_window`만 넣고 `max_tokens`는 비울 것(§18.3). 이미지 필요하면 vision 슬롯, 텍스트 전용이면 text 슬롯.

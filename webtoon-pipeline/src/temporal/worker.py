@@ -31,7 +31,10 @@ from src.temporal.shared import (
 )
 from src.temporal.workflows import EpisodeChainWorkflow
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 
 async def _connect_with_retry() -> Client:
