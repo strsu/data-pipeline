@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from temporalio.client import Client
@@ -33,8 +34,13 @@ from src.temporal.workflows import EpisodeChainWorkflow
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    format="%(asctime)s KST %(levelname)s %(name)s %(message)s",
 )
+# 컨테이너 TZ(UTC)와 무관하게 로그 시각을 KST로 고정(+9h, DST 없음).
+# DB/litellm 타임스탬프는 전부 명시적 UTC(datetime.now(timezone.utc))라 영향 없다 —
+# 로그 대조 시 "로그는 KST, DB는 UTC"만 기억할 것(포맷에 KST를 박아 오독 방지).
+# staticmethod: 클래스 속성에 넣은 일반 함수는 self가 바인딩돼 TypeError가 난다.
+logging.Formatter.converter = staticmethod(lambda ts: time.gmtime(ts + 9 * 3600))
 
 
 async def _connect_with_retry() -> Client:
