@@ -39,6 +39,8 @@ k3s 클러스터에 ArgoCD로 배포되는 GitOps 설정(YAML) 모음. app-of-ap
 - `temporal_repo/`: Temporal 서버 배포
 - `envoy_repo/`, `monitoring_repo/`, `ollama_repo/`, `system/`: 게이트웨이/모니터링/로컬 LLM/클러스터 공통 컴포넌트
 
+이 레포 push 시 CI(`.github/workflows/deploy.yaml`)가 `ghcr.io/strsu/*` 이미지를 빌드하고 **proxmox-configuration의 `pipeline_repo/kustomization.yaml` 태그를 자동 커밋**한다(`[skip-ci]`) — 태그 수동 수정 금지. 배포 리소스(nodeSelector: k3s-super-worker-01 고정, 리소스, Infisical 시크릿)를 바꾸려면 그쪽 레포에서 작업하고, 그쪽 `CLAUDE.md`·`docs/`를 먼저 읽을 것.
+
 ## 프로덕션 DB 직접 조회
 
 접속 정보는 이 레포 루트의 `prod.env`(gitignore됨)에 있다. 로컬에 `psql`이 없으므로 `webtoon-pipeline/.venv`의 psycopg2로 조회한다(이미 설치돼 있음).
