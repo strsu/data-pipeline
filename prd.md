@@ -237,7 +237,7 @@ WebtoonWorkflow (id="{source}_{title_id}")        # 웹툰당 1개 → 순차/�
 
 ### 8.1 실험 근거 (face-embed-lab, 1292 crop)
 - CLIP: 식별력 약함(여러 인물 한 덩어리). CCIP(deepghs, 애니 동일인 판별 전용) 채택.
-- CCIP avg linkage 스윕 → **threshold 0.16** 기준값.
+- CCIP avg linkage 스윕 → **threshold 0.16** 기준값. ⚠️ 이 값은 **평균 거리(avg-linkage) 기준** — v2 매칭(top-3 평균 통계량, §18.5)에서는 **0.12**가 대응값이다(min 통계량에 0.16을 쓰던 v1이 magnet의 원인). threshold는 통계량과 세트로만 의미가 있다.
 
 ### 8.2 해석 규칙
 ```
@@ -478,6 +478,8 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 | 날짜 | 결정 | 비고 |
 |------|------|------|
+| 2026-07-07 | **CCIP 매칭 v2(§18.5)** — v1 마진 룰의 과분할 자기강화(876얼굴→773클러스터) 실증 후 교체: ①통계량 min→**top-k(3) 평균**(0.16이 avg-linkage 캘리브레이션인데 min에 적용된 게 magnet 근본, `CCIP_MATCH_TOPK`) ②마진 **면제형**(2등도 in-threshold면 중복 경합 — 배정+`ambiguous_with`→step2 merge 제안 자동 발행; 2등 out이면 기존 보류) ③threshold **0.12**(top3평균 스케일, DB 변경 필요). 근거: 873 feature 72조합 오프라인 시뮬(현행 재현 750≈773, 채택안 67클러스터·F1@16 최고). 잔여 외형모드 파편은 human 병합(사용자 승인). 구현·테스트 완료, 배포 대기 | §18.5 |
+| 2026-07-07 | **병합 시맨틱 확정(§19)** — 계기: 화산귀환 "청명" 확정 캐릭터 19명 사건. ①병합은 **undo 없음**(비가역 human 판단, 정정=재배정·물리삭제 금지) ②human 명시 병합 시 **확정(is_confirmed) 캐릭터도 흡수 허용** ③name 제안 수락 시 동명 kind=character 존재하면 rename 아닌 **자동 병합** ④병합 시 FK(speaker/claim/profile) 즉시 이관 + **Chroma 메타 재투영**(파생물 취급, 실패 허용), jsonb 산출은 stale→재해소 재생성 ⑤human 프로필 충돌=primary 우선(absorbed는 soft-delete 보존). merge log/이벤트소싱은 안 만듦 | §19 |
 | 2026-07-07 | **문서 재구성** — 변경 경위·세션 로그를 `prd-history.md`로 분리, `prd-step3.md`(v3.3에서 §9로 흡수 완료)·`prd-identity-roster.md`(§18로 흡수) 삭제, §7을 v4 현행 스키마로 갱신. litellm 요청 프롬프트는 UI 열람 가능·DB(SpendLogs.messages) 미영속 확인(응답 길이 절단은 수용) | 전반 |
 | 2026-07-06~07 | **v4.1 정체성·서사 로스터 + 신뢰성(§18)** — ①로스터=Stage R 흡수가 아닌 **별도 텍스트 콜**(에피소드당 텍스트 3콜: roster/R/N, §17.4 계약 개정) ②모델 배선=**modality 2-슬롯**(is_default+supports_vision 도출, per-webtoon override 폐기) ③fallback=`config_llm_model.fallback` self-FK 런타임 전환 ④max_tokens=**기본 미전송**(context_window는 명시 cap 안전장치로만 — 고정값 100k안 폐기, 400/조기절단 실전 결함) ⑤CCIP 과병합=매칭 magnet으로 진단(CCIP 정상), 앵커캡+마진 룰 채택 ⑥bleed 데이터 복구는 HITL 아닌 wipe→재실행 ⑦qwen-vl 로스터 비권장(불안정+느림), glm-5.2 채택 | §18 |
 | 2026-07-05 | **v4.0 설계 확정(§17)** — "분석 데이터는 전량 폐기·재생성 가능, human 노동분만 불멸" 전제(사용자 결정)로 분석 도메인 재설계: ①제자리 멱등 갱신 → **AnalysisRun 단위 쓰고 버리기**(진행도/stale 플래그는 저장 않고 도출), ②`character.kind(cluster\|character)` 판별자(NEW_CHAR 관습 폐기), ③얼굴 레이어링 `face_detection`+`face_identity`(human>step2), ④`character_profile`(source `llm\|human` 레이어링, 필드 단위 human 우선 병합), ⑤`suggestion` 통합 검토 큐, ⑥LLM 스테이지 **V→R→N→apply**(+주기 A로 story_arc 부활, 에피소드당 LLM 3콜 상한), ⑦summary/teaser 분리+데이터 기반 스포 차단, ⑧`webtoon_narrative_state`/진행도 3원화/`name_discovery_suggestion` 폐기. 앙상블·Graph DB는 보류. §14-9~11은 이 결정으로 종결 | §17 |
@@ -638,7 +640,16 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 - **런타임 fallback**(`call_llm_json`): primary 재시도(10회) 소진 시 `ctx["fallback"]`(resolver가 self-FK 1홉 해석, 순환 방지·비활성 무시) 모델로 1회전 더 — glm-5.2/glm-4.6v → qwen-vl. 폴백 모델명은 DB로만 지정(코드 하드코딩 없음).
 - **Temporal heartbeat**(`activities._run_with_heartbeat`): 실제 작업을 서브스레드에서 돌리고 액티비티 본 스레드가 30초마다 heartbeat — step3b(roster/R/N, 대사폭탄 회차 콜 ~14분 실측)와 step3c(대용량 apply)를 감싸 heartbeat_timeout(10분) 초과→재시도 무한루프를 방지.
 
-### 18.5 CCIP 매칭 — 과병합(magnet) 수정 + 재실행 검증 절차 (트랙 C)
+### 18.5 CCIP 매칭 — 과병합(magnet)·과분할(파편화) 수정 + 재실행 검증 절차 (트랙 C)
+
+> **⚠️ v2로 대체됨(2026-07-07)**: 아래 v1(앵커캡+무조건 마진)은 배포·검증 결과 **과분할 자기강화**를 일으켰다 — 마진 룰이 "2등=다른 인물"을 전제해, 같은 인물이 중복 클러스터로 쪼개진 순간 1·2등 모두 그 인물이라 영구 기각→파편 무한생산(실측: 876얼굴→773클러스터, 수락률 ~12%, 주인공 얼굴 1개짜리 클러스터 710개 → "청명 19명" 사건의 공급원, §19). **v2 (실험 근거로 채택·구현됨, 배포 대기)**:
+> - **통계량**: 인물별 min → **가까운 top-k(기본 3)개 diff의 평균**(env `CCIP_MATCH_TOPK`, 1=옛 min 롤백). 근거: 0.16은 애초에 avg-linkage(평균) 기준으로 캘리브레이션된 값인데 min(N이 클수록 요행으로 하락)에 적용돼 magnet이 생겼던 것 — 통계량을 캘리브레이션 의미에 맞춤. 전체 평균은 외형 멀티모달(거지꼴/도복)에서 손해라 top-k 평균 채택.
+> - **마진 룰(면제형)**: 2등도 threshold 이내면 "중복 클러스터 경합"이므로 마진 없이 1등 배정 + 근소 차(<margin)면 `ambiguous_with` 신호 → **step2가 `suggestion(type=merge)` 자동 발행**(episode_id NULL — apply의 에피소드 스코프 재적재에 안 쓸림, 웹툰 내 쌍 dedup). 2등이 threshold 밖일 때만 기존 마진 보류 유지(경계 얼굴 보호).
+> - **threshold: 0.12** (top3평균 기준 — min 기준 0.16과 스케일이 다름). DB 변경은 admin 수동이 아니라 **service 마이그레이션 `0027_ccip_threshold_topk_mean`**(0.16→0.12, 가역)으로 — 배포 시 자동 적용돼 누락 불가. ⚠️ data-pipeline v2 배포와 세트(한쪽만 반영된 과도기 산출은 wipe로 폐기 전제).
+> - **실험 근거**: Chroma 실 feature 873개로 증분 매칭 오프라인 재현, 통계량 3×마진 3×threshold 8 = 72조합. 현행(min+strict@0.16)은 시뮬 750 클러스터로 prod 773 재현(시뮬 검증). strict 마진은 모든 조합에서 631~780 클러스터(구조 문제 확증). 채택안(top3평균+exempt@0.12): 67 클러스터, F1@16 0.587(최고), 주인공 파편 7 — 잔여 파편(외형 모드 단위 2~3개)은 human 병합으로 수습(사용자 승인). 하니스 `_margin_sim.py`(throwaway), 리포트 artifact "margin-sim-report".
+> - 코드: `matching.py`(`_find_match_ccip` v2) + `step2.py`(`_record_merge_candidates`) + `tests/test_matching_topk.py`(판정 규칙 7케이스 고정).
+
+**아래는 v1 기록(경위 보존용) — 진단·검증 절차는 여전히 유효:**
 
 - **진단(실측)**: 화산귀환 char7 blob(207얼굴, 주인공 165보다 많음, 전 7화 고른 분포)의 내부 pairwise CCIP diff median **0.206**(=서로 다른 인물 수준) — **CCIP 임베딩 자체는 정상**(다른 인물 medoid 간 0.231 분리, 동일 인물 코어 <0.10대). 근본은 **매칭 magnet**: 앵커 무제한 누적 + greedy 1-NN이라 얼굴 많은 인물의 acceptance 영역이 커져 비슷한 얼굴을 다 빨아들임.
 - **수정**(`matching.py`, env 튜닝·하드코딩 없음): ① **앵커 캡** — `load_ccip_anchors`가 인물(appearance)당 conf 상위 K개만(기본 12, env `CCIP_MAX_ANCHORS_PER_APPEARANCE`, ≤0이면 무제한=옛 동작). ② **마진 룰** — `_find_match_ccip`가 appearance별 최소 diff를 구해, 최근접이 threshold 이내 **AND** 2등(다른 인물)보다 margin(기본 0.03, env `CCIP_MATCH_MARGIN`) 이상 가까울 때만 확정, 애매하면 신규 보류(오병합보다 안전). `ccip_compare`가 전체 diffs를 반환해 model-api 변경 불필요.
@@ -684,3 +695,35 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 - 사용자 워크플로: **논의 먼저, 코드 수정은 명시 승인 후.** 스키마/설계 변경은 PRD에 결정 기록이 선행된다.
 - 진행도/stale은 컬럼이 아니라 도출(§17.1) — "분석 됐나"는 `analysis_run` 조회.
 - 모델 추가/교체는 DB(`config_llm_model`)로만 — params에는 `context_window`만 넣고 `max_tokens`는 비울 것(§18.3). 이미지 필요하면 vision 슬롯, 텍스트 전용이면 text 슬롯.
+
+---
+
+## 19. 캐릭터 병합 시맨틱 (2026-07-07 확정) — undo 없음, FK 이관 + Chroma 재투영
+
+> **계기**: 화산귀환(webtoon 17)에 이름 "청명"인 캐릭터 19명(18명 is_confirmed=True) 발생. 원인 3겹: ① Step2 CCIP 과분할(876 얼굴→773 캐릭터, 710개가 얼굴 1개 — §19.4) ② service의 name 제안 수락이 동명 존재를 확인하지 않고 rename+승격+확정 ③ `_merge_characters`가 얼굴만 옮기고 화자/프로필/claim/Chroma를 이관하지 않으며 확정 캐릭터는 흡수 불가(청명끼리 병합 자체가 안 됨). 구현 대상은 전부 `service`(webtoonmoa UI 일부).
+
+### 19.1 원칙 (사용자 확정)
+
+1. **병합은 비가역(undo 없음)** — merge log/이벤트소싱을 만들지 않는다. 정정 수단은 역병합이 아니라 **또 다른 human 판단**(face reassign 재배정). 근거: 콘텐츠 도메인 불가침 + 분석 산출은 재생성 가능(§17.1) + human 레이어는 upsert 덮어쓰기 가능이라 "복구 불가능한 손실"이 구조적으로 없음.
+2. **물리 삭제 금지** — 밀려나는 human 노동분(absorbed의 human 프로필 등)은 soft-delete로 보존("롤백은 없지만 증거는 남는다").
+3. **즉시 이관 = FK 컬럼 + Chroma 메타. jsonb 산출(character_timeline 등)은 이관하지 않는다** — stale 마킹→재해소가 재생성(v4 쓰고-버리기 유지).
+4. **Chroma는 파생물** — 병합 DB 커밋 후 메타 재투영을 시도하되 **실패해도 병합은 성립**(§16 전제상 실패 정상). 정본은 Postgres face_identity. 수습은 2단: ①병합 인라인 갱신(옮긴 doc만, 뷰 안에서 동기) 실패 시 **웹툰 단위 재투영 celery 태스크 자동 큐잉**(`fallback_task_id`로 응답 노출, 태스크는 실패 컬렉션 잔존 시 지수 백오프 1→16분 최대 5회 재시도 — Chroma 복구되면 자가 수습) ②admin 액션 "Chroma 메타 재투영"으로 수동 실행(과거 병합 드리프트 소급 수습). 구현: `service.chroma_reproject.reproject_webtoon_chroma`(동기 함수, API/admin 직접 호출 가능) + celery `tasks.reproject_chroma_metadata`(운영 액션은 management command가 아니라 admin/celery 경유가 이 레포 관례). 재투영은 멱등.
+
+### 19.2 병합 동작 (`_merge_characters` 확장)
+
+- **확정(is_confirmed=True) 캐릭터도 흡수 허용** — human 명시 병합은 최신 human 판단이므로. 흡수된 캐릭터는 종류 불문 soft-delete.
+- **FK 이관**(병합 트랜잭션 내 old→primary UPDATE): `analysis_text_annotation.speaker_id`, `analysis_character_claim.character_id`.
+- **프로필**: absorbed의 llm 행 soft-delete(다음 재해소가 primary 기준 재생성). human 행은 primary에 활성 human 행이 **없으면** 내용을 primary로 이전, **있으면 primary 우선** — absorbed 것 soft-delete 보존.
+- **이름/aliases 합류**: absorbed의 이름(비어있지 않고 primary와 다르면)과 aliases를 primary.aliases에 합집합 — 이름 정보 유실 방지(`_find_character_by_name`이 aliases도 매칭).
+- **Chroma 메타 재투영**: 옮긴 detection들의 `chroma_doc_id`를 embedding_model별 컬렉션으로 묶어 v2 REST update — `character_id/appearance_id/appearance_label/character_name/is_confirmed`를 primary 기준으로. 실패 시 로깅+응답에 상태 표기.
+- suggestion(absorbed 참조 pending)은 soft-delete 유지(의미 소멸), 컷 human_modified 마킹 유지.
+
+### 19.3 name 제안 수락 = 동명 존재 시 병합
+
+`SuggestionDetailAPIView` 수락 시 동명(이름/aliases, kind=character) 캐릭터 존재 확인 — 없으면 현행(rename+승격+확정), **있으면 그 캐릭터로 병합**(§19.2 재사용, 응답에 merged_into). "이 클러스터는 청명" 수락의 실질 의미가 병합이므로. UI는 수락 전 "기존 ○○로 병합됩니다"를 표시(제안 응답에 existing_character 동봉). 동명이인 실존 웹툰은 드묾 — 필요 시 별도 유지 선택지는 후속.
+
+### 19.4 범위 외 / 연계
+
+- ~~Step2 margin 자기강화 과분할~~ → **§18.5 v2로 해결(2026-07-07)**: top-k 평균 통계량 + 면제형 마진 + threshold 0.12 + step2 merge 제안 자동 발행. 구현·테스트 완료, 배포 대기(배포 시 DB threshold 0.16→0.12 변경 필요). CCIP env 3종(`CCIP_MAX_ANCHORS_PER_APPEARANCE`/`CCIP_MATCH_MARGIN`/`CCIP_MATCH_TOPK`)의 configmap 노출은 여전히 미완(코드 기본값으로 가동).
+- 기존 청명 19명의 실제 정리는 **트랙 C 재wipe 결정 전 보류**(human 병합 노동이 wipe로 증발).
+- 재해소 자동 트리거(§18.8-6)는 여전히 범위 외 — 병합 후 stale 해소는 수동 CLI.

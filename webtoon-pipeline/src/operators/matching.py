@@ -15,14 +15,19 @@ from typing import Optional, TypedDict
 
 from src.operators.embedding import ccip_compare
 
-# ── 과병합(magnet) 방지 파라미터 (env로 튜닝, 코드 하드코딩 없음) ──────────────────
-# 문제: load_ccip_anchors가 Chroma의 모든 저장 얼굴을 앵커로 싣던 탓에, 얼굴이 많은 인물은
-# 앵커가 무제한 누적(예: 화산귀환 초삼'C 207개)돼 acceptance 영역이 넓어지고 아무 비슷한 얼굴이나
-# 빨아들이는 magnet이 됐다(과병합 blob). 대책:
-#   1) 앵커 캡: 인물(appearance)당 매칭에 쓰는 앵커를 conf 상위 K개로 제한.
-#   2) 마진 룰: 최근접 인물이 2등(다른 인물)보다 margin 이상 더 가까울 때만 확정, 애매하면 보류(신규).
+# ── 과병합(magnet)·과분할(파편화) 방지 파라미터 (env로 튜닝, 코드 하드코딩 없음) ──────
+# v1(앵커캡+무조건 마진)의 마진 룰은 "2등=다른 인물"을 전제해, 같은 인물이 중복 클러스터로
+# 쪼개진 순간 1·2등이 모두 그 인물이라 영구 기각→파편 무한생산(자기강화)했다 — 화산귀환 실측
+# 876얼굴→773클러스터. 873얼굴 72조합 오프라인 시뮬(prd §18.5) 결과로 v2 채택(2026-07-07):
+#   1) 앵커 캡: 인물(appearance)당 매칭 앵커를 conf 상위 K개로 제한(비교 비용·magnet 완화).
+#   2) 통계량: 인물별 min이 아니라 **가까운 TOPK개 평균**(기본 3, 1이면 옛 min 동작) —
+#      앵커 1개의 우연한 근접(min의 요행, magnet의 근본)을 걸러낸다.
+#   3) 마진 룰(면제형): 2등도 threshold 이내면 "중복 클러스터 경합"이므로 마진 없이 1등 배정
+#      (+호출측에 병합 후보 신호). 2등이 threshold 밖일 때만 마진 미달 시 보류(경계 얼굴 보호).
+# ⚠️ threshold 의미가 통계량에 결속: TOPK 평균 기준 권장값 0.12 (min 기준 0.16과 다름).
 _MAX_ANCHORS_PER_APPEARANCE = int(os.getenv("CCIP_MAX_ANCHORS_PER_APPEARANCE", "12") or "12")
 _MATCH_MARGIN = float(os.getenv("CCIP_MATCH_MARGIN", "0.03") or "0.03")
+_MATCH_TOPK = int(os.getenv("CCIP_MATCH_TOPK", "3") or "3")
 
 
 class CcipAnchor(TypedDict):
@@ -104,13 +109,17 @@ def _find_match_cosine(
 
 def _find_match_ccip(
     feature: list[float], threshold: float, anchors: list[CcipAnchor],
-    margin: float = _MATCH_MARGIN,
+    margin: float = _MATCH_MARGIN, topk: int = _MATCH_TOPK,
 ) -> Optional[dict]:
-    """캐시된 anchor 목록(§load_ccip_anchors) 대상 CCIP metric 비교 + 마진 룰.
+    """캐시된 anchor 목록(§load_ccip_anchors) 대상 CCIP metric 비교 — v2(topk 평균 + 면제 마진).
 
-    인물(appearance)별 최소 diff를 구해, 최근접 인물이 (a) threshold 이내이고 (b) 2등(다른 인물)보다
-    margin 이상 더 가까울 때만 그 인물로 확정한다. 두 인물이 margin 이내로 붙어 애매하면(시각적으로
-    비슷한 인물 경계) None → 신규 클러스터로 보류(잘못된 병합보다 안전). margin<=0이면 순수 1-NN.
+    인물(appearance)별로 가까운 topk개 diff의 **평균**을 통계량으로 쓴다(topk<=1이면 min).
+    판정(시뮬 근거는 prd §18.5):
+      - 1등 stat > threshold → None(신규).
+      - 2등 stat ≤ threshold → 중복 클러스터 경합 신호 — 마진 없이 1등 배정.
+        2등과의 차이 < margin이면 반환값에 `ambiguous_with`(2등 대표 meta)를 실어
+        호출측(step2)이 병합 후보 suggestion을 발행하게 한다.
+      - 2등 stat > threshold → (1등-2등 차이) < margin이면 경계 모호 → None(보류, 옛 마진 유지).
     """
     if not anchors:
         return None
@@ -120,25 +129,37 @@ def _find_match_ccip(
     if not diffs:
         return None
 
-    # appearance_id별 최소 diff와 그 대표 앵커 인덱스.
-    best_by_app: dict = {}
+    # appearance_id별 diff 목록 + 대표(최소 diff) 앵커 인덱스.
+    by_app: dict = {}  # aid -> [diffs...], rep: aid -> (min_diff, idx)
+    rep_by_app: dict = {}
     for i, d in enumerate(diffs):
         if d is None:
             continue
         aid = anchors[i]["meta"].get("appearance_id")
         if aid is None:
             continue
-        cur = best_by_app.get(aid)
+        by_app.setdefault(aid, []).append(d)
+        cur = rep_by_app.get(aid)
         if cur is None or d < cur[0]:
-            best_by_app[aid] = (d, i)
-    if not best_by_app:
+            rep_by_app[aid] = (d, i)
+    if not by_app:
         return None
 
-    ranked = sorted(best_by_app.values(), key=lambda x: x[0])  # (diff, idx) 오름차순
-    best_diff, best_i = ranked[0]
-    if best_diff > threshold:
+    k = max(1, topk)
+    ranked = sorted(
+        (sum(sorted(ds)[:k]) / min(k, len(ds)), aid) for aid, ds in by_app.items()
+    )  # (stat, appearance_id) 오름차순
+    best_stat, best_aid = ranked[0]
+    if best_stat > threshold:
         return None
-    # 마진: 2등(다른 인물)이 margin 이내면 모호 → 확정하지 않음(신규/보류).
-    if margin > 0 and len(ranked) >= 2 and (ranked[1][0] - best_diff) < margin:
-        return None
-    return {"meta": anchors[best_i]["meta"], "score": float(best_diff)}
+
+    match = {"meta": anchors[rep_by_app[best_aid][1]]["meta"], "score": float(best_stat)}
+    if len(ranked) >= 2:
+        second_stat, second_aid = ranked[1]
+        if second_stat <= threshold:
+            # 중복 클러스터 경합 — 배정하되, 근소 차이면 병합 후보 신호를 동봉.
+            if margin > 0 and (second_stat - best_stat) < margin:
+                match["ambiguous_with"] = anchors[rep_by_app[second_aid][1]]["meta"]
+        elif margin > 0 and (second_stat - best_stat) < margin:
+            return None  # 경계 모호(2등은 threshold 밖 = 타인/미지 후보) — 보류
+    return match

@@ -359,6 +359,69 @@ def _summarize_episode_faces(webtoon_episode_id: int) -> tuple[int, int]:
         return matched or 0, new_chars or 0
 
 
+def _record_merge_candidates(webtoon_id: int, candidates: dict) -> int:
+    """매칭 중 감지된 중복 클러스터 경합 쌍을 suggestion(type=merge)으로 적재.
+
+    후보 = `_find_match_ccip`의 `ambiguous_with`(1·2등 모두 threshold 이내 + 근소 차) —
+    두 appearance가 같은 인물의 중복 클러스터라는 강한 신호(prd §18.5 v2). 사람이 수락하면
+    service 병합 경로가 실제로 합친다(§19). episode_id는 넣지 않는다 — apply(step3c)의
+    에피소드 스코프 pending 재적재(delete-reinsert)에 쓸려 지워지지 않게(§17.6).
+    dedup: 웹툰 내 동일 (unordered) 캐릭터 쌍의 pending이 이미 있으면 재적재하지 않는다.
+    """
+    if not candidates:
+        return 0
+    with db_cursor() as cur:
+        aids = sorted({a for pair in candidates for a in pair})
+        cur.execute(
+            """
+            SELECT ca.id, ca.character_id FROM analysis_character_appearance ca
+            JOIN analysis_character c ON c.id = ca.character_id AND c.deleted_at IS NULL
+            WHERE ca.id = ANY(%s) AND ca.deleted_at IS NULL
+            """,
+            (aids,),
+        )
+        char_by_app = dict(cur.fetchall())
+        cur.execute(
+            """
+            SELECT character_id, payload FROM analysis_suggestion
+            WHERE webtoon_id = %s AND type = 'merge' AND status = 'pending' AND deleted_at IS NULL
+            """,
+            (webtoon_id,),
+        )
+        existing = set()
+        for cid, payload in cur.fetchall():
+            for other in (payload or {}).get("other_character_ids") or []:
+                existing.add(frozenset({cid, other}))
+
+        now = datetime.now(timezone.utc)
+        inserted = 0
+        for pair, evidence in candidates.items():
+            char_ids = {char_by_app.get(a) for a in pair}
+            char_ids.discard(None)
+            if len(char_ids) != 2:
+                continue  # 같은 캐릭터의 외형끼리거나 해석 불가 — 병합 제안 무의미
+            key = frozenset(char_ids)
+            if key in existing:
+                continue
+            primary, other = sorted(char_ids)
+            cur.execute(
+                """
+                INSERT INTO analysis_suggestion
+                    (webtoon_id, type, character_id, payload, status, created_at, updated_at)
+                VALUES (%s, 'merge', %s, %s, 'pending', %s, %s)
+                """,
+                (webtoon_id, primary,
+                 Json({"other_character_ids": [other],
+                       "evidence": f"step2 매칭 경합 — ep{evidence['episode_no']} 컷{evidence['cut']} "
+                                   f"얼굴이 두 클러스터 모두와 threshold 이내(diff {evidence['score']})",
+                       "source": "step2"}),
+                 now, now),
+            )
+            existing.add(key)
+            inserted += 1
+    return inserted
+
+
 # ── 에피소드 단위 식별 진입점 (Temporal 액티비티가 호출) ──────────────────────
 
 def identify_episode_faces(
@@ -430,6 +493,8 @@ def identify_episode_faces(
     match_log_every = max(1, len(pending) // 10)
     n_matched = 0
     n_new = 0
+    # 중복 클러스터 경합(1·2등 모두 in-threshold) 쌍 — 에피소드 끝에 merge 제안으로 적재.
+    merge_candidates: dict = {}  # frozenset({aid1, aid2}) → 최초 발견 evidence
     for i, face in enumerate(pending):
         feature = features_by_face_id.get(face["id"])
         if feature is None:
@@ -466,6 +531,13 @@ def identify_episode_faces(
             match_score = match["score"]
             n_matched += 1
             _update_character_first_seen(appearance_id, webtoon_episode_id, episode_no, face["cut_number"])
+            other = match.get("ambiguous_with")
+            if other is not None and other.get("appearance_id") not in (None, appearance_id):
+                merge_candidates.setdefault(
+                    frozenset({appearance_id, other["appearance_id"]}),
+                    {"episode_no": episode_no, "cut": face["cut_number"],
+                     "score": round(float(match["score"]), 4)},
+                )
         else:
             allocated = _allocate_character(webtoon_id, webtoon_episode_id, face["cut_number"])
             appearance_id = allocated["appearance_id"]
@@ -504,9 +576,13 @@ def identify_episode_faces(
         if heartbeat_cb:
             heartbeat_cb(resume_from + i + 1)
 
+    n_merge_suggested = _record_merge_candidates(webtoon_id, merge_candidates)
+
     matched_n, new_n = _summarize_episode_faces(webtoon_episode_id)
     logger.info(
-        "[step2] 에피소드 식별 완료 ep_id=%s episode_no=%s: faces=%d, matched=%d, new_chars=%d",
-        webtoon_episode_id, episode_no, len(faces), matched_n, new_n,
+        "[step2] 에피소드 식별 완료 ep_id=%s episode_no=%s: faces=%d, matched=%d, new_chars=%d, "
+        "병합후보 제안=%d",
+        webtoon_episode_id, episode_no, len(faces), matched_n, new_n, n_merge_suggested,
     )
-    return {"faces": len(faces), "matched": matched_n, "new_chars": new_n}
+    return {"faces": len(faces), "matched": matched_n, "new_chars": new_n,
+            "merge_suggested": n_merge_suggested}
