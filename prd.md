@@ -478,6 +478,8 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 | 날짜 | 결정 | 비고 |
 |------|------|------|
+| 2026-07-10 | **재도출 프롬프트·스키마 확정(§20.6~20.7)** — ①프롬프트 v3 확정: role=항상적 정체(회차사건 금지), **progression 신규 필드**(변천사 `[{when,change}]` 자유형 — 판타지=스탯/드라마=관계·심경, 두 장르 실측), 장르 addendum 합성(스키마 포크 X, `webtoon.genre` 버킷), 교차인물 혼동 가드 ②모델=DB glm-5.2+self-FK 통일(모델차 아니라 프롬프트차 실증: v2로 qwen=glm급, v3로 glm 최상) ③**캡 제거 필수**(`_commit_profiles` 8/12 슬라이딩윈도우=지식폐기, 질문봇 no-discard·§17.1 "재생성≠휘발"). ④구현순서 §20.7(스키마→재도출워크플로→service훅→webtoonmoa). 구현 미착수 | §20.6~20.7 |
+| 2026-07-09 | **캐릭터 재분석(재도출) 설계(§20)** — 계기: webtoon 23 바바리안 제안검토 병합이 역방향으로 돼 에르웬·비요른 프로필 소실(근본=`_merge_characters`가 absorbed llm 프로필 무조건 폐기, 양쪽 다 있으면 손실). ①프로필은 파생물 → 두 프로필 재봉합이 아니라 **원천 근거에서 재도출**(re-derive>stitch 실측; 재생성 모델 **glm-5.2**>qwen3.5-122b) ②프로필=텍스트(대사+장면) 도출, 얼굴 피쳐는 Step2 정체성 전용 ③대사는 speaker_id로 캐릭터에 묶임 → 얼굴 이동해도 자동 미변경, 화자 재귀속은 re-resolve로만(얼굴 교정엔 `rerun_extract=True` 필요 — provisional block이 옛 speaker_id 재주입) ④두 모드(병합→profile 1콜 / 얼굴이동→reresolve) Temporal 워크플로+celery 트리거+자동 훅, 모델은 resolve_llm_model(text) self-FK fallback ⑤LLM 비용 무제한 정책. 즉시 복구는 glm 재도출본으로 완료(미커밋 데이터), 기능 구현 미착수 | §20 |
 | 2026-07-07 | **CCIP 매칭 v2(§18.5)** — v1 마진 룰의 과분할 자기강화(876얼굴→773클러스터) 실증 후 교체: ①통계량 min→**top-k(3) 평균**(0.16이 avg-linkage 캘리브레이션인데 min에 적용된 게 magnet 근본, `CCIP_MATCH_TOPK`) ②마진 **면제형**(2등도 in-threshold면 중복 경합 — 배정+`ambiguous_with`→step2 merge 제안 자동 발행; 2등 out이면 기존 보류) ③threshold **0.12**(top3평균 스케일, DB 변경 필요). 근거: 873 feature 72조합 오프라인 시뮬(현행 재현 750≈773, 채택안 67클러스터·F1@16 최고). 잔여 외형모드 파편은 human 병합(사용자 승인). 구현·테스트 완료, 배포 대기 | §18.5 |
 | 2026-07-07 | **병합 시맨틱 확정(§19)** — 계기: 화산귀환 "청명" 확정 캐릭터 19명 사건. ①병합은 **undo 없음**(비가역 human 판단, 정정=재배정·물리삭제 금지) ②human 명시 병합 시 **확정(is_confirmed) 캐릭터도 흡수 허용** ③name 제안 수락 시 동명 kind=character 존재하면 rename 아닌 **자동 병합** ④병합 시 FK(speaker/claim/profile) 즉시 이관 + **Chroma 메타 재투영**(파생물 취급, 실패 허용), jsonb 산출은 stale→재해소 재생성 ⑤human 프로필 충돌=primary 우선(absorbed는 soft-delete 보존). merge log/이벤트소싱은 안 만듦 | §19 |
 | 2026-07-07 | **문서 재구성** — 변경 경위·세션 로그를 `prd-history.md`로 분리, `prd-step3.md`(v3.3에서 §9로 흡수 완료)·`prd-identity-roster.md`(§18로 흡수) 삭제, §7을 v4 현행 스키마로 갱신. litellm 요청 프롬프트는 UI 열람 가능·DB(SpendLogs.messages) 미영속 확인(응답 길이 절단은 수용) | 전반 |
@@ -688,7 +690,8 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 3. **트랙 C 재실행 검증**(§18.5) — 배포 확인 후 실행.
 4. **로스터 영속/prior 합류**: 회차 로스터를 저장해 다음 회차 prior에 합류시킬지(현재 인메모리 전용). 정본 인물은 여전히 `analysis_character`.
 5. **step3의 컷 0개 게이트 부재(2026-07-07 실사고)**: step3 체인은 `is_downloaded`만 확인하고 step1 산출(컷) 존재를 게이트하지 않음 — wipe 후 step1이 아직 안 돈 ep4(1101)에 step3 범위 체인이 돌아 **빈 트랜스크립트로 roster/R/N 실행 + "컷 데이터가 제공되지 않아…" 리포트를 succeeded resolve run(132)으로 커밋**. succeeded run이 생기면 자동(unbounded) 체인이 그 회차를 "완료"로 건너뛰므로 **자연 치유 안 됨** — ep4는 step1/2 후 step3 명시 재실행 필요. 근본 대책(컷 0이면 skip/fail 게이트) 논의 필요.
-6. 이월: 재해소 Temporal 자동 트리거(§11.2), Stage N 로컬 16K 절단 실측(§13 S1), `LLM_MAX_CONCURRENCY` 실측(§13 R4'), `HF_HUB_OFFLINE`(§13 R1), 죽은 코드 정리(§13 R5).
+6. **이름 없는 얼굴만 CCIP 재배치(2026-07-10 논의, 의견만·미착수)**: step2 소스(비확정) 얼굴 풀만 **현재 confirmed/named 앵커에 재매칭** → 확신 매치면 흡수, 아니면 클러스터 유지(human FaceIdentity 불가침). 효과: 대표 하나만 명명하면 나머지 이름 없는 파편이 그 앵커로 흡수돼 **과분할 청소**. **전제: CCIP v2 매칭(§18.5) 필수**(현행 min+strict 룰로 재매칭하면 magnet/과분할 재생산). **한계**: 외형 모드(측/후면) 파편은 임베딩 거리가 멀어 앵커에 안 붙음 → 여전히 human 병합. **안전**: 자동 흡수는 보수적 threshold+margin, 경계값은 `suggestion`(merge/face_reassign) 경유(§18.5 ambiguous 발행 재사용). **워크플로 위치**: 재도출(§20) **앞단** 정체성 정리 레버, 웹툰 단위 온디맨드 버튼.
+7. 이월: 재해소 Temporal 자동 트리거(§11.2) → **§20.4로 설계 정식화(구현 미착수)**, Stage N 로컬 16K 절단 실측(§13 S1), `LLM_MAX_CONCURRENCY` 실측(§13 R4'), `HF_HUB_OFFLINE`(§13 R1), 죽은 코드 정리(§13 R5).
 
 ### 18.9 새 세션 주의사항
 
@@ -726,4 +729,120 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 - ~~Step2 margin 자기강화 과분할~~ → **§18.5 v2로 해결(2026-07-07)**: top-k 평균 통계량 + 면제형 마진 + threshold 0.12 + step2 merge 제안 자동 발행. 구현·테스트 완료, 배포 대기(배포 시 DB threshold 0.16→0.12 변경 필요). CCIP env 3종(`CCIP_MAX_ANCHORS_PER_APPEARANCE`/`CCIP_MATCH_MARGIN`/`CCIP_MATCH_TOPK`)의 configmap 노출은 여전히 미완(코드 기본값으로 가동).
 - 기존 청명 19명의 실제 정리는 **트랙 C 재wipe 결정 전 보류**(human 병합 노동이 wipe로 증발).
-- 재해소 자동 트리거(§18.8-6)는 여전히 범위 외 — 병합 후 stale 해소는 수동 CLI.
+- 재해소 자동 트리거(§18.8-6)는 **§20.4로 정식화** — 병합→profile, 얼굴 이동→reresolve를 celery/Temporal로 자동 큐잉(구현 미착수). 그 전까지는 수동 CLI(`src.tools.reresolve`).
+
+---
+
+## 20. 캐릭터 재분석 (재도출) — 병합/얼굴교정 후 프로필·화자 재생성 (2026-07-10 설계 확정, **같은 날 구현 완료**)
+
+> **⏩ 재개 anchor**: 설계 확정 + **2026-07-10 구현 완료(세 레포, §20.7 구현 내역)**. 남은 것: prod 실측 검증(웹툰 23 병합/재해소 시나리오). 실측 하니스/결과는 세션 scratchpad(throwaway): `test_profile_regen.py`·`test_qwen_prompt.py`(v2/v3)·`test_drama.py`, 결과 `regen_results.json`·`qwen_prompt_v2.json`·`qwen_prompt_v3ds.json`·`drama_glm_v3.json`, 근거 `evidence.json`, 재해소 스냅샷 `snap_ep13_*.json`. 최종 목표는 **웹툰 분석+질문봇(RAG+tool)** — 분석 산출=지식베이스라 "버리면 안 됨"(§20.6 캡 제거의 근거).
+
+> **계기**: webtoon 23("게임 속 바바리안으로 살아남기") 제안검토 병합이 **역방향**(이름/풍부한 쪽이 absorbed로 흡수)으로 수행돼 에르웬·비요른 프로필이 소실. 근본은 §19.2 프로필 규칙 — `_merge_characters`가 absorbed의 llm 프로필을 **무조건 soft-delete**하고 primary llm만 유지 → **양쪽 다 프로필이 있으면**(llm 프로필은 캐릭터마다 자동 생성되므로 사실상 기본값) 한쪽 정보가 통째로 소실. 얼굴/화자 FK는 이미 생존자로 정상 이관됐으므로 손실은 프로필뿐이고, soft-delete라 내용은 복구 가능.
+
+### 20.1 원칙 — 프로필은 파생물, "재봉합"이 아니라 "원천 재도출"
+
+- 손실 방지의 정답은 두 프로필을 AI로 합치는(stitch) 게 **아니라**, 교정된 정체성 위에서 **원천 근거(귀속 대사·장면 서술·트랜스크립트)로 다시 계산(re-derive)**. §17.1 "분석 산출은 재생성 가능, human 노동분만 불멸"의 직접 적용.
+- **실측(2026-07-09, LLM 비용 무제한 전제)**: 에르웬/비요른의 귀속 대사 + 장면 action_summary + 과거 프로필 조각을 전량 주입해 단일 프로필 재생성, **glm-5.2 vs qwen3.5-122b** 비교. **glm-5.2 우월**(에르웬 key_facts 17·비요른 18개, 저장된 두 프로필 **어디에도 없던 사실까지 복원** — 정식명·서사·스탯 등), qwen은 유효 JSON이나 희박(5·6개)·포맷 흠. → **재도출 > 저장 프로필 union 실증**, 재생성 모델은 **glm-5.2** 채택. 하니스는 scratchpad throwaway.
+- 결정론적 필드-union은 폐기가 아니라 **재도출 완료 전 0-지연 자리표시자**로만 남긴다.
+
+### 20.2 두 레이어 구분 (오개념 방지 — 핵심)
+
+- **정체성(누구 얼굴이냐)** = CCIP **임베딩(피쳐)** → Step2 매칭. human이 옮기면 human FaceIdentity로 동결(정답 앵커).
+- **프로필(성격·사실)** = **텍스트**(귀속 대사 + 얼굴이 등장한 컷의 장면 서술)에서 도출. **얼굴 피쳐(임베딩)는 프로필 생성에 전혀 안 들어간다.**
+- **대사는 얼굴이 아니라 캐릭터에 묶인다**: `analysis_text_annotation.speaker_id`(→character)만 있고 detection 링크 없음. 화자는 Stage R이 "이 컷에 누가 있나(얼굴 정체성)"를 보고 결정.
+- 귀결: **얼굴만 옮기면 대사(speaker_id)는 따라오지 않는다.** 섞였던 인물의 대사가 옛 화자로 잔존 → 화자 재귀속은 **Stage R 재실행(re-resolve)** 으로만 된다. 얼굴 정리 후 프로필-only 재생성만 하면 옛 화자귀속을 그대로 읽어 **재오염**.
+
+### 20.3 두 모드
+
+| 액션 | 모드 | 이유 |
+|---|---|---|
+| **병합**(동일인 합침) | **profile** (경량 1콜) | 대사 합집합이 전부 정당 → 화자 재해소 불필요 |
+| **얼굴 이동/섞임 풀기** | **reresolve** (에피소드 재실행, `rerun_extract=True`) | 교정 얼굴 기준으로 화자 재귀속 필요 |
+
+- **`rerun_extract=True` 필요 근거(코드 확인)**: `_load_faces`는 현재 face_identity(human>step2)를 fresh 읽으므로 `rerun_extract=False`(텍스트 전용)도 얼굴 자체는 반영하나, **`_load_provisional_blocks`가 옛 speaker_id를 hint(`spk_cid`)로 재주입**한다 → 섞임 화자가 되살아날 수 있음. 비전 재실행이 provisional을 교정 얼굴 기준으로 새로 산출해야 깨끗(기존 `reresolve_episode` docstring과 일치).
+- 재사용 자산: `step3.reresolve_episode(rerun_extract=)`, CLI `python -m src.tools.reresolve <src> <title> <no|stale> [--rerun-extract]` 이미 존재.
+
+### 20.4 기능화 계획 (Temporal, 프론트 버튼 → celery — 2026-07-10 구현 완료, §20.7)
+
+```
+프론트 버튼 → service API → celery task → Temporal 트리거
+  → data-pipeline 워크플로 regenerate_character(character_id, mode)
+      profile:   근거(대사 by speaker + 장면 by 현재 FaceIdentity + soft-deleted 흡수분 key_facts) → LLM 1콜 → character_profile(llm) upsert
+      reresolve: 캐릭터 등장 에피소드 집합 → 각 에피소드 reresolve_episode(rerun_extract=True) → 화자·프로필·리포트 재생성
+```
+
+- **모델**: 하드코딩 없이 `resolve_llm_model(webtoon_id, TEXT)` → DB glm-5.2 + self-FK fallback(§18.3/§18.4).
+- **자동 훅**: `_merge_characters` 커밋 후 → 생존자 **mode=profile** enqueue(+union 자리표시자); 얼굴 이동/`face_reassign` 수락 경로 → **mode=reresolve** enqueue.
+- **레포 책임**: LLM 로직(프롬프트·모델해석·호출)은 data-pipeline에 두고 **service celery는 트리거만**(중복 방지). service 관례는 management command 금지 → service 함수 + celery task + admin 액션 + 프론트 API.
+- webtoonmoa: 캐릭터 관리 버튼(문구는 "재분석"보다 "얼굴 정리 반영 재해소"류로 의미 정합), 진행 상태(run) 표시.
+
+### 20.5 현황 / 잔여
+
+- **즉시 복구(2026-07-09)**: 에르웬(1858)·비요른(1883) llm 프로필을 glm-5.2 재도출본으로 복구(docker exec service ORM, 직접 SQL 없음). ⚠️ 에르웬 1858은 **무명 cluster + 중복 1862** 존재 — 얼굴 정리 후 승격/병합 + reresolve로 깨끗이 덮을 예정.
+- **re-resolve 얼굴교정 반영 실측(2026-07-09, webtoon 23 ep13, `rerun_extract=False`, 텍스트 3콜 ~23분)**:
+  - **화자 재귀속 완벽(라인 단위 검증)**: 아이나르에 섞였던 에르웬 대사(cut82 '상처가/아저씨 얼른 포션 마시세요' 등)가 **에르웬으로**, 비요른 명령 대사(cut91 '옷을 벗겨라/에르웬')가 **비요른으로**, 분산됐던 에르웬 중복(1862)이 **1858로 통합**. 화자 부착 103→183줄. `_load_provisional_blocks`의 옛 speaker_id hint(conf 0.0)는 현재 얼굴에 덮여 무해 → 텍스트 전용도 un-mixing은 **완벽**.
+  - **True(rerun_extract) 비교(같은 ep13, ~1.5h)**: 44줄 상이. True가 **어려운/애매 화자에서 더 정확**(cut84·93 '저 모험가들 시체'→에르웬, cut65 전략독백→비요른, 적 1770을 '방패쟁이'로 명명 — 근거 대조 모두 True 맞음), 대신 약간 보수적(cut98 '포탈이에요!' 에르웬을 미해소로 놓침). **결론: False가 un-mixing 100%+대부분 화자를 잡고, True는 남은 ~5% 애매 화자를 clean provisional+재생성 cut_summary로 더 정확히**. docstring "얼굴 교정엔 True" 실측 뒷받침 — 단 차이 marginal. **비용 무제한이면 얼굴이동 재해소=True 정석**, 빠른 처리면 False가 가치 대부분.
+  - **프로필은 re-resolve로 정리되지 않음(중요)**: `_commit_profiles`가 key_facts=append 후 **최근 12개만**(캡 12), personality 최근 8, 스칼라(role)=**최신 회차값 replace**. 즉 프로필은 누적 dossier가 아니라 **최근 12사실 슬라이딩 윈도우**. 귀결: ①union은 오염 사실을 **제거 못함**(추가만) ②단일 옛 회차 재해소는 role을 그 회차 사건으로 **회귀**시킴(ep13 재해소가 1858/1883 role을 ep13 값으로 덮음; 전 회차 순차 재해소면 최신 회차로 끝나 완화). → **프로필 정리는 re-resolve(union)가 아니라 §20.4 mode=profile(전량 재도출·replace)이 정답**임을 실측 확증. 리치 프로필을 원하면 **12/8 캡 상향**이 선결(현행 캡은 임의값 — LLM 비용 무제한 전제와 상충).
+  - 정리: **화자=re-resolve(에피소드), 프로필=mode=profile(전량 재도출)** 로 도구가 갈린다는 §20.3 두 모드 설계가 실측으로 뒷받침됨.
+- **LLM 비용 무제한**(사용자 확정): 재도출은 비용 절감형(요약 재봉합·저렴 모델·토큰 캡)이 아니라 원천 근거 전량 주입 + 최상위 모델을 기본으로 한다.
+
+### 20.6 확정된 재도출 프롬프트·스키마·모델 (2026-07-10, 실측 확정)
+
+- **모델(확정)**: 전부 **DB `config_llm_model` 값 + self-FK fallback으로 통일, 기본 `glm-5.2`**(재도출 전용 특별 배선 없음 — `resolve_llm_model(webtoon_id, TEXT)` 그대로). *일단 구현하고 성능은 프롬프트로 올린다.* (테스트에서 qwen3.5-122b·deepseek-v4-flash도 썼으나, **모델차가 아니라 프롬프트차**였음이 실증 — v2 프롬프트로 qwen이 glm 동급, v3로 glm이 최상. glm-5.2 context=100k로 충분.)
+
+- **프롬프트 = v3(확정)**, 세 축:
+  1. **role = 항상적 정체**(장기 불변: 정체·핵심 목표·서사적 위치). **특정 회차 사건 서술 금지**(예 'n화에서 교전 후 탈출' 금지 — 그건 key_facts). 이유: `_commit_profiles`가 role을 최신 회차값으로 replace해 회차 사건이 role을 오염시켰음(qwen v2 실측). 재도출(mode=profile)은 1콜이라 항상성 유지 가능.
+  2. **progression(신규 필드) = 변천사** `[{"when":"회차/국면","change":"무엇이 어떻게 바뀌었나"}]` 연대순. traits(현재값 스냅샷)·key_facts(사실 로그)와 구분되는 **변화 궤적**. **자유형 확정**(구조화 `[{stat,from,to}]` 반대) — 장르 불문 동작 실증: **판타지=스탯/스킬/파워 성장**(비요른 12단계: 아이템레벨+13/정신+1/부상심화), **드라마=처지·관계·심경 변화**(김진현 9단계: 왕따→파산→환생결의→원수 재회). 구조화였으면 드라마에서 텅 빔.
+  3. **장르 addendum(합성)** = 유니버설 base + 짧은 장르 스니펫(`_ROSTER_GUIDANCE` 패턴). **스키마는 통째로 포크하지 않음**(traits free-form이 이미 장르중립). `webtoon.genre`(단일 컬럼, 존재) → 버킷: **판타지/게임/무협→스탯·스킬·아이템·파워 성장**, **로맨스/로판→관계·호감·감정선 변화(스탯 만들지 말 것)**, **스릴러/드라마→비밀·처지·심경·갈등·반전(스탯 금지)**. addendum이 progression에 무엇을 담을지 조종.
+  4. **교차 인물 혼동 가드**: 다른 등장인물 이름/정체를 이 인물에 섞지 말라 명시 + "이 인물 아님" 목록(로스터/타 캐릭터 이름) 주입. (실측 실패: deepseek가 비요른(얀델 둘째)에 별개 바바리안 '카락'(파눈 셋째)을 본래정체로 오귀속.)
+  - **확정 v3 프롬프트 원문(scratchpad는 휘발 — 여기 영속)**:
+    ```
+    [BASE — 유니버설]
+    당신은 웹툰 캐릭터의 모든 근거 자료를 읽고 철저하고 상세한 인물 도감 프로필을 재구성하는 분석기입니다. 한국어. 마지막에 JSON만 출력.
+    입력 근거 3종: 1) dialogue(귀속 대사/독백 — speech 거짓·과장 가능, monologue 속마음, narration/system 객관진실) 2) scenes(등장 컷 행동 서술, 객관진실) 3) prior_profile_fragments(과거 조각, 중복·구식 가능).
+    [절차] 1단계 전수추출: dialogue·scenes 처음~끝, 모든 개별 사실 빠짐없이 회차(ep)순. 2단계 중복만 병합(서로 다른 사실 생략 금지). 3단계 스키마 정리.
+    [role 규칙] role은 항상적 정체·서사적 위치(장기 불변). 특정 회차 사건·상황 금지 — 사건은 key_facts로. 어느 시점에 봐도 성립하는 한 문장.
+    [progression] 시간에 따라 변하는 값은 traits로 뭉개지 말고 progression에 연대순: [{"when":"회차/국면","change":"무엇이 어떻게 바뀌었나"}]. traits엔 최근 현재값만.
+    [분량] 주요 인물이라 근거 풍부 — key_facts 15+, traits 8+, progression 변하는 값 모두. 요약으로 날리지 말되 근거 없는 창작 금지.
+    [교차 인물 혼동 금지] 다른 등장인물 이름·정체·행적을 이 인물에 섞지 말 것(+"이 인물 아님" 목록 주입).
+    [출력 JSON] {gender, age_group, affiliation, role(항상적 한 문장), personality[3~6], traits{현재값 8+}, key_facts[연대순 15+], progression[{when,change}]}
+
+    [+ 장르 addendum — webtoon.genre 버킷으로 base에 이어붙임]
+    판타지/게임/무협: 스탯 수치·스킬/능력 습득·아이템/장비·정수/파워 시스템·전투력 성장을 빠짐없이. 수치·능력 변화 시점은 progression에 연대순.
+    로맨스/로판: 관계·호감/애정 변화·감정선·오해와 화해 중심. 스탯 만들지 말 것. 관계 진전/후퇴는 progression에.
+    스릴러/드라마: 비밀·진짜 동기·처지·심경·관계 갈등·반전 중심. 스탯 만들지 말 것. 처지·내면 변화는 progression에.
+    ```
+
+- **출력 스키마**: `{gender, age_group, affiliation, role(항상적), personality[3~6], traits{현재값 8+}, key_facts[연대순 15+], progression[{when,change}]}`.
+
+- **스키마 변경(필요)**: `analysis_character_profile`에 **`progression` JSONField(default=list) 추가**(service 마이그레이션). CharacterProfileSerializer/도감 서빙에 노출.
+
+- **캡 제거(필수, 단순 최적화 아님)**: `_commit_profiles`의 `personality[-8:]`/`key_facts[-12:]` 슬라이딩 윈도우는 **지식 폐기** — 질문봇 코퍼스(no-discard 목표)와 §17.1 재해석("재생성 가능 ≠ 휘발, 최신본은 항상 보존")상 **제거/대폭 상향**. `mode=profile`(전량 재도출)은 **무캡 replace**로 쓴다(role/personality/traits/key_facts/progression 전체 교체). 증상: glm 복원 17facts가 다음 apply에서 12로 잘림.
+
+### 20.7 구현 내역 (2026-07-10 구현 완료 — 세 레포)
+
+1. **service 스키마**: `CharacterProfile.progression` JSONField(마이그레이션 0028, **`db_default=[]` 유지** — data-pipeline raw INSERT가 컬럼을 몰라도 안 깨지게/배포 순서 무관) + `AnalysisRunKind.PROFILE`/`LLMStage.PROFILE`(0029). 서빙 `merge_character_profile`(human 우선 병합)에 progression 포함, human patch allowed에도 추가.
+2. **data-pipeline 재도출**: 신규 **`src/core/regen.py`** — `regenerate_character_profile(character_id, absorbed_character_ids=)`: 근거수집(유효 대사 by speaker[human>llm] + 장면 by 현재 FaceIdentity[human>step2] action_summary+narration/system + prior 조각[본인 활성 + 흡수 soft-delete분]) → genre 버킷 addendum 합성(v3 프롬프트) → `resolve_llm_model(TEXT)` 1콜 → llm 행 **무캡 replace** upsert(progression 포함). usage stage='profile'. `_commit_profiles` 캡(8/12) **제거**. Temporal `RegenerateCharacterWorkflow(RegenInput{character_id, mode, absorbed_character_ids})`: profile=재도출 1콜 / reresolve=등장 에피소드(얼굴∪화자) 전부 `reresolve_episode(rerun_extract=True)` 순차 **후 프로필 재도출로 마무리**(union 재봉합은 오염 제거 불가 — §20.5). 무거운 액티비티는 STEP3_QUEUE(동시성 1). 진행표시 정본 = **umbrella run(kind=profile, episode NULL, stats.character_id/mode/episodes_total/episodes_done)** — supersede는 같은 character_id만. smoke_test.py에 오케스트레이션 검증 포함(통과).
+3. **service 트리거/훅/API**: `send_regenerate_trigger`(temporal.py, workflow_id=`regen_char_{id}_{mode}` 멱등) + celery `trigger_character_regenerate`(재시도 백오프) + 자동 훅(`transaction.on_commit`): 병합 3경로(수동 merge API·merge 제안 수락·name 수락=동명 병합) → mode=profile(+흡수 id), **face_reassign 제안 수락** → mode=reresolve. 프론트 API `POST /character/{pk}/regenerate/`(202) + `GET /webtoon/{s}/{t}/regen-status/`(kind=profile run 최근 30건) + admin 액션 2종.
+   - **결정**: 수동 얼굴 이동(FaceRecordReassign/BulkReassign)은 자동 enqueue **안 함** — 라벨링 세션에서 이동마다 수 시간짜리 재해소가 폭주하는 것 방지. 얼굴 정리 후 프론트 버튼("얼굴 정리 반영 재해소")이 의도된 트리거.
+4. **webtoonmoa**: 도감 버튼 2종("프로필 재생성"/"얼굴 정리 반영 재해소"+confirm) + 진행 배지(재해소 중 n/m화, 5초 폴링 — running 있을 때만) + 도감 **변천사(progression) 타임라인** 렌더.
+
+**배포 순서 주의**: service 먼저(0028/0029 migrate) → data-pipeline(regen 코드가 progression 컬럼에 INSERT) → webtoonmoa. 최종 목표(웹툰 분석+질문봇/RAG)는 §20.6 캡 제거의 상위 근거.
+
+---
+
+## 21. 최종 목표 — 웹툰 분석 + 질문봇 (RAG + tool chain) (2026-07-10, 방향만·상세 미논의)
+
+> **제품 방향(사용자)**: 웹툰을 분석하고 그 위에 **질문봇**을 얹는다. 개인 선호로 **RAG 구축 + tool chain**(모델이 필요하면 RAG 검색을 tool로 호출).
+
+### 21.1 "버리는 건 안 됨" — §17.1 재해석
+- 분석 산출(프로필·progression·key_facts·episode_report·thread·claim·화자귀속 대사·cut_scene_meta)이 곧 **질문봇의 지식베이스**다. 폐기하면 지식 손실.
+- **§17.1 "분석 데이터 전량 폐기·재생성 가능"은 재계산 경로가 있다는 뜻이지 "휘발해도 됨"이 아니다** — 최신 재생성본은 **항상 보존·인덱싱**. *재생성 가능 ≠ 버려도 됨.* (§17을 읽을 때 이 단서를 함께.)
+- 직접 영향: `_commit_profiles` 슬라이딩 윈도우 캡 제거(§20.6), progression·전체 key_facts 영속.
+
+### 21.2 아키텍처 방향 (의견 — 상세 설계 미논의)
+- **순수 텍스트 RAG 지양.** 강점은 이미 **구조화된 분석**(프로필/progression/thread/화자귀속 대사/episode_report)을 가진 것. "비요른이 몇 화에서 정수 얻었나" 같은 질문은 **progression 구조 질의**가 벡터 검색보다 정확 → **구조화 tool(스키마 직접 질의) + 시맨틱 RAG 하이브리드**, 모델이 tool chain으로 선택.
+- 벡터스토어: **Chroma 이미 배포**(얼굴 임베딩) → 텍스트 컬렉션 추가 또는 pgvector.
+- **스포일러/시간 스코프**: 독자용이면 "N화까지" 제한 필요 — 기존 prior/roster 시간 스코프(§18.7 등) 재사용.
+- 연결: **재도출(§20) 품질 = RAG 코퍼스 품질** — role 항상성·progression·캡 제거가 봇 답변 품질로 직결.
+- **상태**: 방향만 합의, 상세 설계(스키마·인덱싱·tool 정의·시간 스코프 구현) 미논의.

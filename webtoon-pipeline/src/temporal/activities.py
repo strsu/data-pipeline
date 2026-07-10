@@ -19,7 +19,7 @@ import logging
 
 from temporalio import activity
 
-from src.temporal.shared import STEP_RUN_KIND, ChainInput, EpisodeInput
+from src.temporal.shared import STEP_RUN_KIND, ChainInput, EpisodeInput, RegenInput
 
 logger = logging.getLogger(__name__)
 
@@ -363,3 +363,85 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
         else:
             runs.finish_run(run_id, stats=meta.get("stats") or {})
     return meta
+
+
+# ── 캐릭터 재분석(재도출, §20) ────────────────────────────────────────────────
+#
+# RegenerateCharacterWorkflow가 사용. regen_begin(가벼움, ORCH_QUEUE)이 대상 해석 +
+# umbrella run(kind=profile)을 만들고, 무거운 작업(regen_reresolve_episode /
+# regen_profile)은 STEP3_QUEUE(동시성 1)에서 다른 step3/LLM 작업과 직렬화된다.
+
+
+@activity.defn
+def regen_begin(inp: RegenInput) -> dict | None:
+    """재분석 대상 해석 + umbrella run 시작. 캐릭터가 없으면 None(워크플로 no-op 종료).
+
+    반환: {"webtoon_id", "run_id", "episodes": [{"episode_id","episode_no"}...]}.
+    episodes는 mode=reresolve일 때만 채운다(등장 에피소드 = 얼굴 등장 ∪ 화자 귀속).
+    """
+    from src.core import regen
+    from src.operators.llm_resolver import TEXT, resolve_llm_model
+
+    info = regen._character_info(inp.character_id)
+    if info is None:
+        logger.warning("[regen_begin] character=%s 없음/삭제됨 — 재분석 건너뜀", inp.character_id)
+        return None
+    episodes = regen.character_episode_ids(inp.character_id) if inp.mode == "reresolve" else []
+    ctx = resolve_llm_model(info["webtoon_id"], TEXT)
+    run_id = regen.begin_profile_run(
+        info["webtoon_id"], inp.character_id, inp.mode,
+        llm_model_id=ctx.get("id"), episodes_total=len(episodes),
+    )
+    return {"webtoon_id": info["webtoon_id"], "run_id": run_id, "episodes": episodes}
+
+
+@activity.defn
+def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
+                            run_id: int, episodes_done: int) -> dict:
+    """등장 에피소드 1개 재해소 — reresolve_episode(rerun_extract=True)(§20.3 두 모드).
+
+    rerun_extract=True 필수 근거: 텍스트 전용 재해소는 `_load_provisional_blocks`가 옛
+    speaker_id를 hint로 재주입해 섞임 화자가 되살아날 수 있다(§20.3) — 비전 재실행이
+    provisional을 교정 얼굴 기준으로 새로 산출해야 깨끗하다. 에피소드당 자체 vision/resolve
+    run을 만들며(진행도/stale 정본), umbrella run stats.episodes_done도 갱신한다.
+    LLM 콜이 회차당 1시간을 넘을 수 있어 서브스레드 + 주기 하트비트로 감싼다.
+    """
+    from src.core import regen, step3
+
+    out = _run_with_heartbeat(
+        step3.reresolve_episode,
+        args=(webtoon_episode_id,),
+        kwargs=dict(rerun_extract=True, webtoon_id=webtoon_id),
+        detail="regen:reresolve",
+    )
+    regen.bump_profile_run_progress(run_id, episodes_done)
+    return {"webtoon_episode_id": webtoon_episode_id,
+            "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
+
+
+@activity.defn
+def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int) -> dict:
+    """프로필 원천 재도출(LLM 1콜, 무캡 replace) + umbrella run 종료(§20.6).
+
+    reresolve 모드에서도 마지막에 호출된다 — 재해소로 화자가 깨끗해진 근거 위에서 프로필을
+    다시 뽑는다(union 재봉합은 오염 사실을 제거 못함 — §20.5 실측).
+    """
+    from src.core import regen, runs
+
+    result = _run_with_heartbeat(
+        regen.regenerate_character_profile,
+        args=(inp.character_id,),
+        kwargs=dict(absorbed_character_ids=inp.absorbed_character_ids or [], run_id=run_id),
+        detail="regen:profile",
+    )
+    profile = result.get("profile") or {}
+    if result.get("error"):
+        runs.finish_run(run_id, status="failed", error=str(result["error"]))
+    else:
+        runs.finish_run(run_id, stats={
+            "character_id": inp.character_id, "mode": inp.mode,
+            "key_facts": len(profile.get("key_facts") or []),
+            "progression": len(profile.get("progression") or []),
+            "usage": result.get("usage") or {},
+        })
+    return {"character_id": inp.character_id, "error": result.get("error")}

@@ -30,7 +30,7 @@ from src.temporal.shared import (
     TEMPORAL_ADDRESS,
     TEMPORAL_NAMESPACE,
 )
-from src.temporal.workflows import EpisodeChainWorkflow
+from src.temporal.workflows import EpisodeChainWorkflow, RegenerateCharacterWorkflow
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,12 +67,13 @@ async def main() -> None:
     orch_worker = Worker(
         client,
         task_queue=ORCH_QUEUE,
-        workflows=[EpisodeChainWorkflow],
+        workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow],
         activities=[
             activities.resolve_episode_for_chain,
             activities.next_chain_episode,
             activities.mark_phase_complete,
             activities.is_phase3_enabled,
+            activities.regen_begin,
         ],
         activity_executor=orch_executor,
     )
@@ -104,6 +105,8 @@ async def main() -> None:
             activities.step3a_extract,
             activities.step3b_resolve,
             activities.step3c_apply,
+            activities.regen_reresolve_episode,
+            activities.regen_profile,
         ],
         activity_executor=step3_executor,
         max_concurrent_activities=1,

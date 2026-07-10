@@ -66,3 +66,20 @@ class EpisodeInput:
     webtoon_episode_id: int
     start_cut: int = 1
     max_cut: int = 0  # 0이면 activity로 조회
+
+
+@dataclass
+class RegenInput:
+    """캐릭터 재분석(재도출) 입력 — RegenerateCharacterWorkflow(§20).
+
+    mode:
+      - "profile"  : 병합 후 경량 재도출 — 근거 전량 주입 LLM 1콜로 프로필 replace.
+      - "reresolve": 얼굴 이동/섞임 풀기 후 — 등장 에피소드 전부를
+                     reresolve_episode(rerun_extract=True)로 순차 재해소한 뒤,
+                     clean 근거 위에서 프로필 재도출로 마무리.
+    absorbed_character_ids: 병합 훅이 넘기는 흡수 캐릭터 id들 — soft-delete된 프로필 조각
+    (key_facts 등)을 재도출 근거로 회수한다(§20.4). 수동 트리거면 빈 리스트.
+    """
+    character_id: int
+    mode: str = "profile"
+    absorbed_character_ids: list[int] | None = None

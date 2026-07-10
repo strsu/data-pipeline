@@ -53,8 +53,9 @@ _SPEAKER_TYPES = ("speech", "monologue")  # 화자 귀속 대상 type
 _PENDING_SPEAKER_MAX_CONFIDENCE = 0.5
 _PASS1_STAGE = "vision"  # LLMUsage.stage — Stage V 컷 비전 콜(step3a).
 # LLMUsage.stage 허용값(service `LLMStage` enum과 일치) — usage 적재의 단일 진실원천.
-# vision=컷 비전(V), resolve=정체·화자 해소(R), narrative=서사 분석(N), arc=아크 종합(A).
-_USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc")
+# vision=컷 비전(V), resolve=정체·화자 해소(R), narrative=서사 분석(N), arc=아크 종합(A),
+# profile=캐릭터 프로필 재도출(§20, src.core.regen).
+_USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc", "profile")
 
 # ── Pass-1 (컷별 provisional 추출) ────────────────────────────────────────────
 # 정본: qwen-vl/_pass1.py SYS 프롬프트를 그대로 이관(분류 먼저→화자 나중, strict JSON,
@@ -2436,8 +2437,11 @@ def _commit_profiles(
     """Stage N profiles → `character_profile` llm 행 병합 upsert(v4.0 §17.2).
 
     human 행은 절대 건드리지 않는다(source 레이어링 — 서빙이 필드 단위 human 우선 병합).
-    스칼라는 최신값 우선, personality는 합집합(캡 8), traits는 dict 병합, key_facts는
-    append-dedup(캡 12) — 인물의 누적 사실 저장처(구 narrative_state key_facts 흡수).
+    스칼라는 최신값 우선, personality는 합집합, traits는 dict 병합, key_facts는
+    append-dedup — 인물의 누적 사실 저장처(구 narrative_state key_facts 흡수).
+    **무캡**(§20.6): 구 personality[-8:]/key_facts[-12:] 슬라이딩 윈도우는 지식 폐기라 제거
+    (분석 산출=질문봇 코퍼스, §17.1 "최신본은 항상 보존"). progression(변천사)은 재도출
+    (src.core.regen) 전용 산출 — Stage N은 만들지 않으므로 기존 값을 보존한다(insert시 []).
     """
     updated = 0
     with db_cursor() as cur:
@@ -2469,19 +2473,17 @@ def _commit_profiles(
             for p in prof.get("personality") or []:
                 if p not in merged["personality"]:
                     merged["personality"].append(p)
-            merged["personality"] = merged["personality"][-8:]
             merged["traits"] = {**merged["traits"], **(prof.get("traits") or {})}
             for f in prof.get("key_facts") or []:
                 if f not in merged["key_facts"]:
                     merged["key_facts"].append(f)
-            merged["key_facts"] = merged["key_facts"][-12:]
 
             cur.execute(
                 """
                 INSERT INTO analysis_character_profile
                     (character_id, source, gender, age_group, affiliation, role,
-                     personality, traits, key_facts, run_id, created_at, updated_at)
-                VALUES (%s, 'llm', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     personality, traits, key_facts, progression, run_id, created_at, updated_at)
+                VALUES (%s, 'llm', %s, %s, %s, %s, %s, %s, %s, '[]'::jsonb, %s, %s, %s)
                 ON CONFLICT ON CONSTRAINT uniq_character_profile_character_source
                 DO UPDATE SET gender = EXCLUDED.gender, age_group = EXCLUDED.age_group,
                               affiliation = EXCLUDED.affiliation, role = EXCLUDED.role,
