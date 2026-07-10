@@ -25,7 +25,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import (
         ORCH_QUEUE, STEP1, STEP1_QUEUE, STEP2, STEP2_QUEUE, STEP3, STEP3_QUEUE,
-        ChainInput, EpisodeInput,
+        ChainInput, EpisodeInput, RegenInput,
     )
 
 _RETRY = RetryPolicy(
@@ -167,4 +167,63 @@ class EpisodeChainWorkflow:
             args=[ep, phase],
             task_queue=ORCH_QUEUE,
             start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
+        )
+
+
+# 재해소/재도출은 재시도를 관대하게 하지 않는다 — LLM 콜 자체가 llm_client에서 10회
+# 재시도 + 폴백 모델 1회전을 이미 소화하므로, 액티비티 수준 재시도는 일시 인프라 장애
+# (워커 재시작 등)만 흡수하면 된다.
+_REGEN_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=10),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=5),
+    maximum_attempts=5,
+)
+
+
+@workflow.defn
+class RegenerateCharacterWorkflow:
+    """캐릭터 재분석(§20) — mode=profile(경량 1콜) / mode=reresolve(등장 에피소드 재해소).
+
+    - profile  : 병합 후. 근거(귀속 대사+장면+흡수분 조각) 전량 주입 LLM 1콜 → 프로필 무캡 replace.
+    - reresolve: 얼굴 이동/섞임 풀기 후. 등장 에피소드 전부 reresolve_episode(rerun_extract=True)
+                 순차(§20.3 — 얼굴 교정 반영엔 비전 재실행 필수) 후 프로필 재도출로 마무리.
+    무거운 액티비티는 STEP3_QUEUE(동시성 1)로 보내 정규 step3/LLM 작업과 직렬화한다.
+    진행표시는 umbrella run(kind=profile, stats.character_id/mode/episodes_done)이 정본.
+    """
+
+    @workflow.run
+    async def run(self, inp: RegenInput) -> None:
+        meta = await workflow.execute_activity(
+            activities.regen_begin, inp,
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
+        if meta is None:
+            return  # 캐릭터 없음/삭제 — no-op
+
+        if inp.mode == "reresolve":
+            episodes = meta.get("episodes") or []
+            for i, ep in enumerate(episodes):
+                workflow.logger.info(
+                    "[regen] character=%s — ep%s 재해소 (%d/%d)",
+                    inp.character_id, ep["episode_no"], i + 1, len(episodes),
+                )
+                await workflow.execute_activity(
+                    activities.regen_reresolve_episode,
+                    args=[ep["episode_id"], meta["webtoon_id"], meta["run_id"], i + 1],
+                    task_queue=STEP3_QUEUE,
+                    # rerun_extract=True 실측 회차당 ~1.5h(§20.5) — 넉넉히.
+                    start_to_close_timeout=timedelta(hours=4),
+                    heartbeat_timeout=timedelta(minutes=10),
+                    retry_policy=_REGEN_RETRY,
+                )
+
+        await workflow.execute_activity(
+            activities.regen_profile,
+            args=[inp, meta["webtoon_id"], meta["run_id"]],
+            task_queue=STEP3_QUEUE,
+            start_to_close_timeout=timedelta(hours=1),
+            heartbeat_timeout=timedelta(minutes=10),
+            retry_policy=_REGEN_RETRY,
         )

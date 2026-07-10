@@ -25,6 +25,7 @@ KIND_STEP2 = "step2"
 KIND_VISION = "vision"
 KIND_RESOLVE = "resolve"
 KIND_ARC = "arc"
+KIND_PROFILE = "profile"  # 캐릭터 프로필 재도출(§20) — episode NULL, stats.character_id/mode
 
 
 def start_run(
