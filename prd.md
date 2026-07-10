@@ -735,7 +735,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 ## 20. 캐릭터 재분석 (재도출) — 병합/얼굴교정 후 프로필·화자 재생성 (2026-07-10 설계 확정, **같은 날 구현 완료**)
 
-> **⏩ 재개 anchor**: 설계 확정 + **2026-07-10 구현 완료(세 레포, §20.7 구현 내역)**. 남은 것: prod 실측 검증(웹툰 23 병합/재해소 시나리오). 실측 하니스/결과는 세션 scratchpad(throwaway): `test_profile_regen.py`·`test_qwen_prompt.py`(v2/v3)·`test_drama.py`, 결과 `regen_results.json`·`qwen_prompt_v2.json`·`qwen_prompt_v3ds.json`·`drama_glm_v3.json`, 근거 `evidence.json`, 재해소 스냅샷 `snap_ep13_*.json`. 최종 목표는 **웹툰 분석+질문봇(RAG+tool)** — 분석 산출=지식베이스라 "버리면 안 됨"(§20.6 캡 제거의 근거).
+> **⏩ 재개 anchor**: 설계 확정 + **2026-07-10 구현 완료(세 레포, §20.7 구현 내역) + 같은 날 prod 실측 검증 완료** — ①수동 profile(에르웬 1858: key_facts 38·progression 7·role 항상적, run 363) ②병합 자동 훅 E2E(중복 1862→1858 실병합 → on_commit→celery(lopri)→Temporal 자동 발화, run 367 succeeded) ③reresolve E2E(수정 연합 간부 1864 실 API 트리거: ep9 vision·resolve 재실행(run 370/371 succeeded)→프로필 재도출, run 368 succeeded) ④regen-status API shape 확인. 소소한 알려진 동작: umbrella run 종료 시 stats가 최종 결과로 replace → episodes_done 진행값은 running 중에만 표시(의도 허용). 실측 하니스/결과는 세션 scratchpad(throwaway): `test_profile_regen.py`·`test_qwen_prompt.py`(v2/v3)·`test_drama.py`, 결과 `regen_results.json`·`qwen_prompt_v2.json`·`qwen_prompt_v3ds.json`·`drama_glm_v3.json`, 근거 `evidence.json`, 재해소 스냅샷 `snap_ep13_*.json`. 최종 목표는 **웹툰 분석+질문봇(RAG+tool)** — 분석 산출=지식베이스라 "버리면 안 됨"(§20.6 캡 제거의 근거).
 
 > **계기**: webtoon 23("게임 속 바바리안으로 살아남기") 제안검토 병합이 **역방향**(이름/풍부한 쪽이 absorbed로 흡수)으로 수행돼 에르웬·비요른 프로필이 소실. 근본은 §19.2 프로필 규칙 — `_merge_characters`가 absorbed의 llm 프로필을 **무조건 soft-delete**하고 primary llm만 유지 → **양쪽 다 프로필이 있으면**(llm 프로필은 캐릭터마다 자동 생성되므로 사실상 기본값) 한쪽 정보가 통째로 소실. 얼굴/화자 FK는 이미 생존자로 정상 이관됐으므로 손실은 프로필뿐이고, soft-delete라 내용은 복구 가능.
 
