@@ -2168,8 +2168,9 @@ def resolve_and_narrate(
 #     주석은 단일 확정 이름을 공유.
 #   - status 전이(Property 6): resolution_status는 unresolved→resolved 단방향. resolved는 speaker_id가
 #     non-null(speech/monologue 해소)이거나 명시적 화자 없음(narration/system/other).
-#   - significance 정합(Property 7): significance='extra' ⇒ is_match_excluded=true(역방향 자동화
-#     없음 — human override 허용).
+#   - significance 정합(Property 7 v2, prd §22.2): llm 몫 is_match_excluded는 significance 파생값
+#     (extra ⇔ 제외, 양방향 동기화). named(kind='character')는 llm 제외 금지, human 세팅
+#     (match_excluded_source='human')은 동결. v1 편도 규칙은 파편 폭발 유발로 폐기.
 # LLM 호출 없음. fold(11.4)는 task 8.2가 본 함수 반환 episode_meta로 별도 호출(여기선 호출 안 함).
 
 _APPLY_SPEAKER_MIN_CONFIDENCE = 0.5      # speaker_resolution 커밋 임계값(미만은 provisional 유지 — Req 10.3)
@@ -2225,6 +2226,26 @@ def _episode_no_id_map(webtoon_id: int) -> dict[int, int]:
         return {r[0]: r[1] for r in cur.fetchall()}
 
 
+def _sync_match_exclusion(final_kind: str, sig, cur_excl: bool, source: str):
+    """Property 7 v2 (prd §22.2): llm 몫 `is_match_excluded`는 significance **파생값**.
+
+    v1(편도: extra→제외, 해제 없음)은 회차-국소 extra 판정이 주요 인물을 영구 제외시켜
+    step2 파편 폭발을 일으켰다(화산귀환 실측 42건). 규칙:
+      - human 세팅은 동결(None = 변경 없음) — 출처는 match_excluded_source 컬럼.
+      - named(kind='character')는 llm이 제외 불가 → 항상 False로 수렴.
+      - 클러스터는 이번 R 판정 sig가 있을 때만 (sig=='extra')로 **양방향** 동기화.
+    Returns: None(변경 없음) 또는 원하는 bool.
+    """
+    if source == "human":
+        return None
+    if final_kind == "character":
+        return False if cur_excl else None
+    if sig in _SIGNIFICANCE:
+        desired = sig == "extra"
+        return desired if desired != cur_excl else None
+    return None
+
+
 def _project_characters(
     webtoon_id: int, characters: list[dict], valid_ids: set[int], now: datetime,
 ) -> list[dict]:
@@ -2235,8 +2256,8 @@ def _project_characters(
       - 명명·승격(rename+kind=character)은 confidence>=_NAME_AUTO_CONFIDENCE(0.85) &
         현재 kind='cluster'(미명명 기계 산출물) & 동명 기존 인물 부재일 때만 자동 수행
         (is_name_auto_assigned=true). 그 외 이름 후보는 **제안**(suggestion type=name)으로만.
-      - significance는 허용 enum이면 갱신, 'extra'면 is_match_excluded=true도 함께(Property 7,
-        가역: 역방향 자동 해제 없음 — human override 허용).
+      - significance는 허용 enum이면 갱신. is_match_excluded는 Property 7 v2 파생 동기화
+        (`_sync_match_exclusion` — llm 몫 양방향, named 제외 금지, human 동결. prd §22.2).
     이름은 Character 행 1곳에만 쓰므로 speaker_id FK를 통해 전 컷에 소급 반영된다(Req 5.2).
 
     Returns: suggestion(type=name) 적재 대상 [{character_id, name, confidence, evidence}].
@@ -2258,7 +2279,8 @@ def _project_characters(
         with db_cursor() as cur:
             cur.execute(
                 """
-                SELECT name, kind, is_confirmed, significance, is_match_excluded
+                SELECT name, kind, is_confirmed, significance, is_match_excluded,
+                       match_excluded_source
                 FROM analysis_character WHERE id = %s AND webtoon_id = %s AND deleted_at IS NULL
                 """,
                 (cid, webtoon_id),
@@ -2266,19 +2288,18 @@ def _project_characters(
             row = cur.fetchone()
             if not row:
                 continue
-            _cur_name, cur_kind, is_confirmed, _cur_sig, cur_excl = row
+            _cur_name, cur_kind, is_confirmed, _cur_sig, cur_excl, excl_src = row
             if is_confirmed:
                 continue  # 동결 — human 확정 Character는 LLM이 건드리지 않음(Property 4)
 
             sets: list[str] = []
             params: list = []
+            promoted = False
 
-            # significance 투영(Property 7) — 가역적·human-override 가능 라벨.
+            # significance 투영 — 가역적·human-override 가능 라벨(제외 동기화는 아래 P7 v2).
             if sig in _SIGNIFICANCE:
                 sets.append("significance = %s")
                 params.append(sig)
-                if sig == "extra" and not cur_excl:
-                    sets.append("is_match_excluded = true")
 
             # 명명·승격 — 유일한 비가역성 식별 액션이므로 고신뢰 + 클러스터 + 동명 부재일 때만
             # 자동 수행하고, 그 외는 suggestion(type=name)으로만 둔다(Req 10.3/10.4).
@@ -2291,6 +2312,7 @@ def _project_characters(
                     and not dup_in_run
                 )
                 if can_promote:
+                    promoted = True
                     sets.append("name = %s")
                     params.append(name[:64])
                     sets.append("kind = 'character'")
@@ -2302,6 +2324,13 @@ def _project_characters(
                         "character_id": cid, "name": name,
                         "confidence": conf, "evidence": evidence,
                     })
+
+            # Property 7 v2 — is_match_excluded 파생 동기화(prd §22.2).
+            final_kind = "character" if promoted else cur_kind
+            desired_excl = _sync_match_exclusion(final_kind, sig, cur_excl, excl_src)
+            if desired_excl is not None:
+                sets.append("is_match_excluded = %s")
+                params.append(desired_excl)
 
             if sets:
                 sets.append("updated_at = %s")
