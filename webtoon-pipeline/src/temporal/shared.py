@@ -10,10 +10,10 @@ TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
 # ── Task Queue 구성 (step별 독립 동시성) ──────────────────────────────────────
 #
 # 체인 오케스트레이터(EpisodeChainWorkflow)는 ORCH_QUEUE에서 돌고, 무거운 step 작업은
-# step별 전용 큐로 분기한다. 각 step 큐를 서빙하는 워커를 max_concurrent_activities=1로
-# 두면 step1/step2/step3가 각각 전역에서 1개씩만 동시 실행된다(개인 서버 자원 보호).
-# 체인이 몇 개 떠 있든(웹툰 여러 개·범위 실행 등) 같은 step 액티비티는 그 큐에서 줄 서므로
-# 자동 직렬화된다.
+# step별 전용 큐로 분기한다. step1/step2 큐는 max_concurrent_activities=1이라 전역에서
+# 1개씩만 동시 실행(자동 직렬화, 개인 서버 자원 보호). step3 큐는 동시성 2 — 서로 다른
+# 웹툰의 step3는 동시에 진행될 수 있으니, 같은 웹툰/에피소드를 겹쳐 건드리는 두 step3류
+# 작업 사이의 자동 직렬화는 더 이상 보장되지 않는다(worker.py 참고).
 ORCH_QUEUE = os.getenv("ORCH_TASK_QUEUE", "webtoon-orchestrator")
 STEP1_QUEUE = os.getenv("STEP1_TASK_QUEUE", "webtoon-step1")
 STEP2_QUEUE = os.getenv("STEP2_TASK_QUEUE", "webtoon-step2")

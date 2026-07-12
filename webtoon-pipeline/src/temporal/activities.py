@@ -369,7 +369,8 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
 #
 # RegenerateCharacterWorkflow가 사용. regen_begin(가벼움, ORCH_QUEUE)이 대상 해석 +
 # umbrella run(kind=profile)을 만들고, 무거운 작업(regen_reresolve_episode /
-# regen_profile)은 STEP3_QUEUE(동시성 1)에서 다른 step3/LLM 작업과 직렬화된다.
+# regen_profile)은 STEP3_QUEUE(동시성 2)에서 다른 step3/LLM 작업과 함께 처리된다 —
+# 같은 에피소드를 정규 체인이 동시에 건드리는 경우가 아니면 안전(§20 전제).
 
 
 @activity.defn
@@ -500,8 +501,8 @@ def consolidation_begin(inp: ConsolidateInput) -> dict:
 def consolidation_adjudicate(webtoon_id: int, run_id: int) -> dict:
     """심판 본체 — 도시에 구성→LLM 판정(순차)→교차대조/가드→권고 영속(adjudicate.py).
 
-    STEP3_QUEUE(동시성 1)에서 정규 step3/LLM 작업과 직렬화. 도시에 수×콜 시간이
-    길 수 있어 서브스레드 + 주기 하트비트로 감싼다(§18.4 패턴).
+    STEP3_QUEUE(동시성 2)에서 정규 step3/LLM 작업과 함께 처리(더 이상 완전 직렬화는
+    아님). 도시에 수×콜 시간이 길 수 있어 서브스레드 + 주기 하트비트로 감싼다(§18.4 패턴).
     """
     from src.core import adjudicate
 
