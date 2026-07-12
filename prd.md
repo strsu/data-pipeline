@@ -405,6 +405,15 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 ### 11.3 이름 자동 확정
 §9.5(name_evidence 누적) 참조. 주요 캐릭터는 여러 컷 증거가 쌓이며 `NameDiscoverySuggestion`으로 확정 제안(human은 confirm만), 조연은 제안 큐, 단역(`significance=extra`)은 soft-exclude 유지.
 
+### 11.4 수동 정정 운영 가이드 (2026-07-12, 화산귀환 조걸↔윤종 스왑에서 정립)
+
+- **두 캐릭터 이름이 서로 바뀐 경우(스왑)**: 병합 금지(별개 실존 인물) — **이름 맞교환**이 정답. 수동 rename(PATCH)은 §19.3 동명-병합 로직을 **타지 않으므로**(그건 제안 *수락* 경로 전용) 순간적 동명 중복은 무해하나, 그 사이 resolve가 돌지 않게 할 것. 수동 rename은 is_confirmed=True 동결. 이름 교환 후 **각자 "프로필 재생성"**(프로필 본문이 서로의 서사로 쓰여 있음). 과거 회차 리포트의 옛 이름 문장은 재해소 때 자연 재생성.
+- **잘못 들어온 얼굴인데 누군지 모를 때** 3옵션:
+  1. **재등장 예상 인물 → 새 캐릭터 생성 후 이동(추천)**: 이름은 인상착의 서술명(시스템 관례 — '복면 노인', '현지 거지 두목'). CCIP 앵커가 생겨 이후 회차 얼굴이 자동 귀속, 실명 확인 시 rename 1회.
+  2. **일회성 잡얼굴 → 재배정 대상 비우기(미배정)**: human FaceIdentity(appearance=NULL) = "인물 아님/미배정" 판단. ⚠️ human 레이어 동결 — 이후 자동 재매칭 안 됨(중요해지면 수동 재배정).
+  3. **얼굴 오탐 → is_used=false** (§18.8-1c).
+- **미배정 얼굴 UI**: 캐릭터 상세에 미확인/확인됨/이동됨과 별개의 **"미배정" 섹션**(2026-07-12 신설 — service `human_unassigned` 필드 + webtoonmoa 섹션, 커밋 `8d893d4`/`21d1422`). 주의: 마스터 '미배정' 목록(WebtoonUnassignedFaces)은 여전히 "누구에게도 배정된 적 없음" 기준이라 human-미배정 얼굴은 안 나옴(구 캐릭터 상세의 미배정 섹션에서 보임) — 통합은 필요 시 후속.
+
 ---
 
 ## 12. webtoonmoa 기능 요구사항
@@ -829,6 +838,19 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 **배포 순서 주의**: service 먼저(0028/0029 migrate) → data-pipeline(regen 코드가 progression 컬럼에 INSERT) → webtoonmoa. 최종 목표(웹툰 분석+질문봇/RAG)는 §20.6 캡 제거의 상위 근거.
 
+### 20.8 supersede 좀비 수정 (2026-07-12 실사고 → 커밋 `de022ce`, 배포 대기)
+
+- **사고**: 청명(1651) 재해소(28ep×~1.5h) 진행 중 같은 캐릭터의 프로필 버튼 클릭 →
+  `begin_profile_run`의 supersede가 **mode 무구분**이라 재해소 umbrella run을 failed로 덮음.
+  결과: 진행표시는 죽고 Temporal 워크플로는 STEP3_QUEUE(동시성 1)를 ~42h 계속 점유하는 **좀비**
+  — 뒤에 줄 선 프로필 run들이 "재갱신 중"으로 무한 대기(프론트는 사실대로 보여준 것).
+- **수정 2축**: ① supersede를 **같은 character_id + 같은 mode**로 한정(같은 mode 중복 기동은
+  workflow_id 멱등이 이미 차단 — supersede 본 목적은 워커 크래시 잔재 정리).
+  ② `regen.run_is_live(run_id)` — 무거운 액티비티(regen_reresolve_episode/regen_profile)가
+  작업 전 확인, superseded면 워크플로 **자기 조기 종료**(좀비의 큐 점유 원천 차단).
+- **운영 노트**: 수정 배포 전의 기존 좀비는 Temporal UI에서 수동 Terminate. umbrella run이
+  running이어도 실제로는 큐 대기일 수 있음(진행표시 ≠ 실행 중 — 대기/실행 구분 표시는 후속 여지).
+
 ---
 
 ## 21. 최종 목표 — 웹툰 분석 + 질문봇 (RAG + tool chain) (2026-07-10, 방향만·상세 미논의)
@@ -900,3 +922,10 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 2. 정리 패스 + 심판(§22.3~22.4) — service(수락 경로/스키마) + data-pipeline(심판·오케스트레이션) + webtoonmoa(human 큐 정렬·버튼). [ ] 미착수
 3. §18.8-6 CCIP 재배치(경합쌍 207 해소)는 별도 트랙.
 - 드라이런 결과물: `~/.claude/jobs/5b9e9531/tmp/suggest_{judge_full,sid_reconciled,visual_check}.json`, 눈검증 artifact "merge-visual-check"(GT는 이 절에 영속됨).
+
+**잔여 TODO (2026-07-12 세션 마감 기준)**:
+- [ ] Temporal UI에서 좀비 `regen_char_1651_reresolve`(257f9ad9) Terminate — 해야 프로필 4개(1651/1704/1665/1659)가 순차 실행됨(개당 7~20분).
+- [ ] **push/배포**: data-pipeline `b1a526b`(P7 v2)+`de022ce`(supersede) — push=CI 배포 트리거. service `8d893d4`(human_unassigned) / webtoonmoa `21d1422`(미배정 섹션)도 배포.
+- [ ] P7 배포 후 검증: 화산귀환 resolve 재개 → 신규 클러스터 발생률·제외 수 판정 쿼리(§18.5-③ 패턴)로 파편 재생산 멎었는지 확인. 조걸(1721) 등 제외 해제가 유지되는지(extra 재판정 시 재제외는 정상 — 파생값).
+- [ ] §22.5-2 정리 패스+심판 구현 착수(설계는 §22.3~22.4 확정 상태).
+- 참고: 조걸↔윤종 스왑은 수동 rename으로 처리 완료(2026-07-12, §11.4 가이드의 출처 사례) — 병합이 아니었으므로 aliases 오염 없음.
