@@ -927,9 +927,11 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 3. §18.8-6 CCIP 재배치(경합쌍 207 해소)는 별도 트랙.
 - 드라이런 결과물: `~/.claude/jobs/5b9e9531/tmp/suggest_{judge_full,sid_reconciled,visual_check}.json`, 눈검증 artifact "merge-visual-check"(GT는 이 절에 영속됨).
 
-**잔여 TODO (2026-07-12 세션 마감 기준)**:
-- [ ] Temporal UI에서 좀비 `regen_char_1651_reresolve`(257f9ad9) Terminate — 해야 프로필 4개(1651/1704/1665/1659)가 순차 실행됨(개당 7~20분).
-- [ ] **push/배포**: data-pipeline `b1a526b`(P7 v2)+`de022ce`(supersede) — push=CI 배포 트리거. service `8d893d4`(human_unassigned) / webtoonmoa `21d1422`(미배정 섹션)도 배포.
-- [ ] P7 배포 후 검증: 화산귀환 resolve 재개 → 신규 클러스터 발생률·제외 수 판정 쿼리(§18.5-③ 패턴)로 파편 재생산 멎었는지 확인. 조걸(1721) 등 제외 해제가 유지되는지(extra 재판정 시 재제외는 정상 — 파생값).
-- [ ] §22.5-2 정리 패스+심판 구현 착수(설계는 §22.3~22.4 확정 상태).
-- 참고: 조걸↔윤종 스왑은 수동 rename으로 처리 완료(2026-07-12, §11.4 가이드의 출처 사례) — 병합이 아니었으므로 aliases 오염 없음.
+**잔여 TODO (2026-07-12 세션 마감 — 2차 갱신)**:
+
+완료(같은 날): ~~좀비 Terminate~~(사용자 수동 종료) / ~~P7 push·배포~~(`de022ce` 이미지 가동 확인) / ~~P7 백필~~(사용자 prod 직접 실행, 위반 잔존 0) / ~~정리 패스+심판 구현~~(§22.5-2 ✅). **화산귀환은 사용자가 분석데이터 초기화 → 새 이미지(P7 v2+CCIP v2)로 전량 재실행 중** — §18.5 트랙C wipe 검증 겸함. 조걸↔윤종 스왑·프로필 재생성 등 human 노동분은 wipe로 증발(§11.4 가이드는 유효).
+
+- [ ] **정리 패스 배포**: ①proxmox-configuration pipeline_repo에 워커 env `BROKER_URL_`/`BROKER_PORT_`/`BROKER_PASSWORD` 노출(+선택 `CONSOLIDATE_EVERY_N_RESOLVES`) ②service `3ec2d67`(0034 migrate) ③data-pipeline `0b7d6e0` push(celery dep 이미지 재빌드) ④webtoonmoa `23eb0ad`. env 없이 배포되면 심판·권고 배지까지만 동작(자동 실행은 enqueue_failed, run stats에 결정 목록 남아 수동 수습 가능).
+- [ ] **재실행 관찰(화산귀환)**: (a) P7+CCIP v2 효과 — 무명 클러스터 발생률·is_match_excluded 수가 이전(175개/42건)보다 유의미하게 낮은지 판정 쿼리 (b) resolve 5개 도달 시 첫 정리 패스 자동 발화 확인(`consolidate_webtoon_17` 워크플로, consolidate-status API, suggestions 심판 배지) (c) 자동수락이 실제 병합으로 이어지고 §20 프로필 재도출 훅이 따라오는지 E2E.
+- [ ] 후속 백로그: suggestions **서버측 judge 정렬**(JSONB order_by — 현재 배지만, §22.4 주의) / 마스터 '미배정' 목록에 human-미배정 얼굴 포함 여부(§11.4 주의) / §18.8-6 CCIP 재배치(경합쌍 해소) / Stage A(아크 종합)는 여전히 미착수.
+- 참고: 파이프라인 신규 테스트(reconcile 가드 9·워크플로 오케스트레이션·P7 동기화 8케이스)는 `tests/`가 gitignore라 로컬 보관(기존 테스트 전부와 동일 관례) — 커밋엔 미포함.
