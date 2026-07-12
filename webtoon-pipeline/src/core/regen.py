@@ -323,7 +323,14 @@ def _sanitize_regen_profile(raw: dict) -> dict:
 def begin_profile_run(webtoon_id: int, character_id: int, mode: str,
                       llm_model_id: Optional[int] = None,
                       episodes_total: int = 0) -> int:
-    """재분석 umbrella run 시작 — 같은 캐릭터의 잔여 running 행만 supersede(다른 캐릭터와 독립)."""
+    """재분석 umbrella run 시작 — 같은 캐릭터·**같은 mode**의 잔재 running 행만 supersede.
+
+    mode를 가르지 않으면 profile 버튼이 진행 중인 reresolve run을 failed로 덮어
+    "진행표시는 죽고 워크플로는 큐를 계속 점유하는 좀비"를 만든다(2026-07-12 실사고).
+    같은 mode 중복 기동은 Temporal workflow_id 멱등이 이미 막으므로, 이 supersede의
+    본 목적은 워커 크래시 등으로 남은 stale running 행 정리다(+ §아래 run_is_live
+    체크가 좀비 워크플로를 자기 종료시킨다).
+    """
     now = datetime.now(timezone.utc)
     stats = {"character_id": character_id, "mode": mode, "episodes_total": episodes_total,
              "episodes_done": 0}
@@ -334,8 +341,9 @@ def begin_profile_run(webtoon_id: int, character_id: int, mode: str,
             SET status='failed', error='superseded by new regen', finished_at=%s, updated_at=%s
             WHERE kind='profile' AND status='running' AND webtoon_id=%s
               AND (stats->>'character_id')::int = %s
+              AND stats->>'mode' = %s
             """,
-            (now, now, webtoon_id, character_id),
+            (now, now, webtoon_id, character_id, mode),
         )
         cur.execute(
             """
@@ -350,6 +358,17 @@ def begin_profile_run(webtoon_id: int, character_id: int, mode: str,
         run_id = cur.fetchone()[0]
     logger.info("[regen] start profile run=%s character=%s mode=%s", run_id, character_id, mode)
     return run_id
+
+
+def run_is_live(run_id: int) -> bool:
+    """umbrella run이 아직 이 재분석의 정본인지(supersede/외부 종료 안 됐는지).
+
+    액티비티가 무거운 작업 전에 확인해, superseded 워크플로가 큐를 계속 점유하는
+    좀비를 자기 종료시키는 용도(RegenerateCharacterWorkflow)."""
+    with db_cursor() as cur:
+        cur.execute("SELECT status FROM analysis_run WHERE id = %s", (run_id,))
+        row = cur.fetchone()
+    return bool(row and row[0] == "running")
 
 
 def bump_profile_run_progress(run_id: int, episodes_done: int) -> None:

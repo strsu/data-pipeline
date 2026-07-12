@@ -408,6 +408,12 @@ def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
     """
     from src.core import regen, step3
 
+    # 좀비 차단: umbrella run이 superseded/종료됐으면 무거운 작업 없이 워크플로를 끝낸다.
+    if not regen.run_is_live(run_id):
+        logger.info("[regen] run=%s superseded — ep%s 재해소 건너뜀(워크플로 종료 신호)",
+                    run_id, webtoon_episode_id)
+        return {"superseded": True, "webtoon_episode_id": webtoon_episode_id}
+
     out = _run_with_heartbeat(
         step3.reresolve_episode,
         args=(webtoon_episode_id,),
@@ -427,6 +433,10 @@ def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int) -> dict:
     다시 뽑는다(union 재봉합은 오염 사실을 제거 못함 — §20.5 실측).
     """
     from src.core import regen, runs
+
+    if not regen.run_is_live(run_id):
+        logger.info("[regen] run=%s superseded — 프로필 재도출 건너뜀", run_id)
+        return {"character_id": inp.character_id, "superseded": True}
 
     result = _run_with_heartbeat(
         regen.regenerate_character_profile,

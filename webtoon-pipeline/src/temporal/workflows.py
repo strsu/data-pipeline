@@ -209,7 +209,7 @@ class RegenerateCharacterWorkflow:
                     "[regen] character=%s — ep%s 재해소 (%d/%d)",
                     inp.character_id, ep["episode_no"], i + 1, len(episodes),
                 )
-                await workflow.execute_activity(
+                out = await workflow.execute_activity(
                     activities.regen_reresolve_episode,
                     args=[ep["episode_id"], meta["webtoon_id"], meta["run_id"], i + 1],
                     task_queue=STEP3_QUEUE,
@@ -218,6 +218,12 @@ class RegenerateCharacterWorkflow:
                     heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=_REGEN_RETRY,
                 )
+                if out and out.get("superseded"):
+                    # umbrella run이 다른 재분석에 superseded — 좀비로 큐를 점유하지 않고 종료.
+                    workflow.logger.info(
+                        "[regen] character=%s run superseded — 워크플로 조기 종료", inp.character_id,
+                    )
+                    return
 
         await workflow.execute_activity(
             activities.regen_profile,
