@@ -25,7 +25,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import (
         ORCH_QUEUE, STEP1, STEP1_QUEUE, STEP2, STEP2_QUEUE, STEP3, STEP3_QUEUE,
-        ChainInput, EpisodeInput, RegenInput,
+        ChainInput, ConsolidateInput, EpisodeInput, RegenInput,
     )
 
 _RETRY = RetryPolicy(
@@ -161,6 +161,27 @@ class EpisodeChainWorkflow:
         # v4.0: step3 완료 마킹은 별도 없음 — step3c가 resolve run을 succeeded로 전이하는 것이
         # 진행도의 정본이다(§17.1). _mark는 step1/2(run 원장 완료 기록)에만 쓴다.
 
+        # 정리 패스 트리거(§22.3): 마지막 정리 이후 succeeded resolve가 임계(기본 5) 이상이면
+        # 웹툰 단위 정리 자식 워크플로 발화. 웹툰당 workflow_id 멱등 + ABANDON(체인이
+        # continue-as-new로 넘어가도 정리는 독립 수명). 발화 실패는 체인을 막지 않는다.
+        due_webtoon_id = await workflow.execute_activity(
+            activities.consolidation_due_for_episode, ep.webtoon_episode_id,
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
+        )
+        if due_webtoon_id:
+            try:
+                await workflow.start_child_workflow(
+                    ConsolidateWebtoonWorkflow.run,
+                    ConsolidateInput(webtoon_id=due_webtoon_id),
+                    id=f"consolidate_webtoon_{due_webtoon_id}",
+                    task_queue=ORCH_QUEUE,
+                    parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+                )
+                workflow.logger.info("[chain] webtoon=%s 정리 패스 발화", due_webtoon_id)
+            except Exception as e:  # 이미 실행 중(멱등 id) 등 — 무해
+                workflow.logger.info("[chain] 정리 패스 발화 생략: %s", e)
+
     async def _mark(self, ep: EpisodeInput, phase: int) -> None:
         await workflow.execute_activity(
             activities.mark_phase_complete,
@@ -232,4 +253,41 @@ class RegenerateCharacterWorkflow:
             start_to_close_timeout=timedelta(hours=1),
             heartbeat_timeout=timedelta(minutes=10),
             retry_policy=_REGEN_RETRY,
+        )
+
+
+@workflow.defn
+class ConsolidateWebtoonWorkflow:
+    """웹툰 단위 정리 패스(§22.3~22.4) — 제안검토 심판 → 실행 위임.
+
+    begin(umbrella run, ORCH) → adjudicate(LLM 심판+가드, STEP3_QUEUE 직렬화)
+    → finish(수락/기각을 service celery로 위임 + run 종료, ORCH).
+    실행(병합 §19·자동 훅 §20)은 service 수락 경로가 담당 — 여기서는 판정까지만.
+    workflow_id(consolidate_webtoon_{id}) 멱등이라 체인 훅/버튼의 중복 발화는 무해.
+    """
+
+    @workflow.run
+    async def run(self, inp: ConsolidateInput) -> None:
+        begin = await workflow.execute_activity(
+            activities.consolidation_begin, inp,
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
+        run_id = begin["run_id"]
+
+        result = await workflow.execute_activity(
+            activities.consolidation_adjudicate,
+            args=[inp.webtoon_id, run_id],
+            task_queue=STEP3_QUEUE,
+            # 도시에 수십 개 × 콜 수 분 — 관대하게. 진행은 하트비트로.
+            start_to_close_timeout=timedelta(hours=6),
+            heartbeat_timeout=timedelta(minutes=10),
+            retry_policy=_REGEN_RETRY,
+        )
+
+        await workflow.execute_activity(
+            activities.consolidation_finish,
+            args=[inp.webtoon_id, run_id, result],
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
         )

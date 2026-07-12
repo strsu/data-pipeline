@@ -4,6 +4,17 @@ FAUST_APP_NAME = os.getenv("FAUST_APP_NAME", "webtoon-pipeline")
 
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "").split(",")
 
+# service celery 브로커 (redis) — 정리 패스가 실행(제안 수락/기각)을 service celery로
+# 위임할 때 send_task용(§22.3 역할 분리: 판정=pipeline, 실행=service 수락 경로).
+# 변수명은 service settings/base.py와 동일(BROKER_URL_/BROKER_PORT_/BROKER_PASSWORD).
+# CELERY_BROKER_URL이 비면 정리 패스는 판정·권고 영속까지만 하고 실행 위임을 건너뛴다.
+_BROKER_HOST = os.getenv("BROKER_URL_", "")
+_BROKER_PORT = os.getenv("BROKER_PORT_", "6379")
+_BROKER_PASSWORD = os.getenv("BROKER_PASSWORD", "")
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or (
+    f"redis://:{_BROKER_PASSWORD}@{_BROKER_HOST}:{_BROKER_PORT}" if _BROKER_HOST else ""
+)
+
 # DB (service 레포와 동일한 변수명 사용)
 DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
 DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))

@@ -30,7 +30,7 @@ from src.temporal.shared import (
     TEMPORAL_ADDRESS,
     TEMPORAL_NAMESPACE,
 )
-from src.temporal.workflows import EpisodeChainWorkflow, RegenerateCharacterWorkflow
+from src.temporal.workflows import ConsolidateWebtoonWorkflow, EpisodeChainWorkflow, RegenerateCharacterWorkflow
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,13 +67,16 @@ async def main() -> None:
     orch_worker = Worker(
         client,
         task_queue=ORCH_QUEUE,
-        workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow],
+        workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow, ConsolidateWebtoonWorkflow],
         activities=[
             activities.resolve_episode_for_chain,
             activities.next_chain_episode,
             activities.mark_phase_complete,
             activities.is_phase3_enabled,
             activities.regen_begin,
+            activities.consolidation_due_for_episode,
+            activities.consolidation_begin,
+            activities.consolidation_finish,
         ],
         activity_executor=orch_executor,
     )
@@ -107,6 +110,7 @@ async def main() -> None:
             activities.step3c_apply,
             activities.regen_reresolve_episode,
             activities.regen_profile,
+            activities.consolidation_adjudicate,
         ],
         activity_executor=step3_executor,
         max_concurrent_activities=1,

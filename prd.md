@@ -919,7 +919,11 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
    - service: `Character.match_excluded_source`(llm|human, db_default='llm' — raw INSERT 안전) + human PATCH 경로가 source='human' 세팅 + admin/serializer 노출. 스키마 `0033`(AddField)은 커밋 `4a3d666`으로 **prod 적용 완료**(2026-07-12 14:17 KST).
    - **백필은 마이그레이션 없이 사용자가 prod에 직접 실행**(2026-07-12): llm 몫 제외 중 named 또는 sig≠extra 해제 — 실행 후 실측 규칙위반 잔존 0(남은 제외는 전 웹툰 extra 클러스터뿐, w17은 49→24).
    - data-pipeline: `step3._sync_match_exclusion`(순수 규칙: 양방향 동기화/named 금지/human 동결) + `_project_characters` 재배선(승격 시 즉시 해제 포함) + `tests/test_match_exclusion_sync.py` 8케이스. 스위트 84 passed(orchestration 1건은 테스트서버 기동 플레이크 — 단독 재실행 통과). 커밋됨 — **배포만 남음**(컬럼·백필 모두 prod 반영돼 배포 순서 제약 없음).
-2. 정리 패스 + 심판(§22.3~22.4) — service(수락 경로/스키마) + data-pipeline(심판·오케스트레이션) + webtoonmoa(human 큐 정렬·버튼). [ ] 미착수
+2. 정리 패스 + 심판(§22.3~22.4) — ✅ **구현 완료(2026-07-12, 세 레포 — 미배포)**:
+   - **data-pipeline**: `src/core/adjudicate.py`(도시에 구성→glm-5.2 심판(순차, 도시에당 제안 60 캡 분할)→sid 기반 교차대조+가드→`payload['judge']` 권고 영속, usage stage='judge') / `ConsolidateWebtoonWorkflow`(begin→adjudicate[STEP3_QUEUE, heartbeat]→finish) / 체인 훅(step3c 후 `consolidation_due` 판정→자식 워크플로, `consolidate_webtoon_{id}` 멱등+ABANDON, env `CONSOLIDATE_EVERY_N_RESOLVES` 기본 5) / `service_bus.send_service_task`(celery send_task — **의존성 celery[redis] 추가, 이미지 재빌드 필요**). 테스트: reconcile 가드 9케이스 + 워크플로 오케스트레이션.
+   - **service**: 수락 로직을 뷰에서 `service/suggestion_adjudication.py`로 추출(`apply_suggestion_status` — 뷰/celery 공용, §19/§19.3/§20 훅 그대로) + `execute_adjudication`(건별 격리, 병합 primary=named 쪽 명시, 결과를 run stats.execution에 기록) / celery `execute_consolidation`(pipeline이 send_task)·`trigger_webtoon_consolidation` / `send_consolidation_trigger`(temporal.py) / API `POST consolidate/`·`GET consolidate-status/` / admin 액션 "제안 정리 패스 실행" / `AnalysisRunKind.CONSOLIDATE`+`LLMStage.JUDGE`(마이그레이션 `0034`, choices-only).
+   - **webtoonmoa**: suggestions 페이지 — 심판 배지(payload.judge: 자동수락/자동기각/권고/사람판단, 표결·사유 툴팁) + "제안 정리 패스 실행" 버튼 + 최근 run 상태(5초 폴링, running일 때만). 서버측 judge 정렬은 후속(JSONB order_by — §22.4 주의 참조).
+   - **배포 요건**: ①service 먼저(0034 migrate) ②data-pipeline 이미지 재빌드(celery dep) + **워커 env `BROKER_URL_`/`BROKER_PORT_`/`BROKER_PASSWORD` 추가 필요(proxmox-configuration pipeline_repo — 미노출 시 판정·권고까지만 되고 실행 위임이 enqueue_failed로 run failed, 수동 수습 가능)** ③webtoonmoa.
 3. §18.8-6 CCIP 재배치(경합쌍 207 해소)는 별도 트랙.
 - 드라이런 결과물: `~/.claude/jobs/5b9e9531/tmp/suggest_{judge_full,sid_reconciled,visual_check}.json`, 눈검증 artifact "merge-visual-check"(GT는 이 절에 영속됨).
 

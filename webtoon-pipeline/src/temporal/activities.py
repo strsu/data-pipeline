@@ -19,7 +19,7 @@ import logging
 
 from temporalio import activity
 
-from src.temporal.shared import STEP_RUN_KIND, ChainInput, EpisodeInput, RegenInput
+from src.temporal.shared import STEP_RUN_KIND, ChainInput, ConsolidateInput, EpisodeInput, RegenInput
 
 logger = logging.getLogger(__name__)
 
@@ -455,3 +455,101 @@ def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int) -> dict:
             "usage": result.get("usage") or {},
         })
     return {"character_id": inp.character_id, "error": result.get("error")}
+
+
+# ── 정리 패스(§22.3~22.4): 제안검토 심판 + 실행 위임 ─────────────────────────
+# ConsolidateWebtoonWorkflow가 사용. 판정(LLM 심판+가드)은 pipeline(adjudicate.py),
+# 실행(제안 수락=§19 병합 시맨틱, 자동 훅 §20)은 service celery로 위임(service_bus).
+
+# service celery task 이름/큐 — service apps/api/toon/tasks.py의 명시 name과 일치해야 함.
+_EXECUTE_CONSOLIDATION_TASK = "apps.api.toon.tasks.execute_consolidation"
+_EXECUTE_CONSOLIDATION_QUEUE = "middle"
+
+
+@activity.defn
+def consolidation_due_for_episode(webtoon_episode_id: int) -> int | None:
+    """체인 훅용 트리거 판정 — due면 webtoon_id, 아니면 None."""
+    from src.config.db import db_cursor
+    from src.core import runs
+    from src.temporal.shared import CONSOLIDATE_EVERY_N_RESOLVES
+
+    with db_cursor() as cur:
+        cur.execute("SELECT webtoon_id FROM webtoon_episode WHERE id = %s", (webtoon_episode_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    webtoon_id = row[0]
+    if runs.consolidation_due(webtoon_id, CONSOLIDATE_EVERY_N_RESOLVES):
+        return webtoon_id
+    return None
+
+
+@activity.defn
+def consolidation_begin(inp: ConsolidateInput) -> dict:
+    """umbrella run(kind=consolidate, episode NULL) 시작 — 잔재 running은 start_run이 supersede."""
+    from src.core import runs
+    from src.operators.llm_resolver import TEXT, resolve_llm_model
+
+    ctx = resolve_llm_model(inp.webtoon_id, TEXT)
+    run_id = runs.start_run(inp.webtoon_id, None, runs.KIND_CONSOLIDATE,
+                            llm_model_id=ctx.get("id"))
+    return {"run_id": run_id}
+
+
+@activity.defn
+def consolidation_adjudicate(webtoon_id: int, run_id: int) -> dict:
+    """심판 본체 — 도시에 구성→LLM 판정(순차)→교차대조/가드→권고 영속(adjudicate.py).
+
+    STEP3_QUEUE(동시성 1)에서 정규 step3/LLM 작업과 직렬화. 도시에 수×콜 시간이
+    길 수 있어 서브스레드 + 주기 하트비트로 감싼다(§18.4 패턴).
+    """
+    from src.core import adjudicate
+
+    return _run_with_heartbeat(
+        adjudicate.adjudicate_webtoon,
+        args=(webtoon_id,),
+        kwargs=dict(run_id=run_id),
+        detail="consolidate:judge",
+    )
+
+
+@activity.defn
+def consolidation_finish(webtoon_id: int, run_id: int, result: dict) -> dict:
+    """실행 위임 + umbrella run 종료.
+
+    수락/기각 목록이 있으면 service celery(execute_consolidation)로 위임하고 run은
+    succeeded(stats.execution='enqueued')로 닫는다 — 실행 결과는 service task가
+    같은 run stats에 덧붙인다(진행 정본은 여전히 run 1행). 브로커 미설정/전송 실패면
+    수동 실행이 가능하도록 stats에 결정 목록을 남기고 failed로 닫는다.
+    """
+    from src.core import runs
+    from src.operators import service_bus
+
+    accepts = result.get("accept_suggestion_ids") or []
+    rejects = result.get("reject_suggestion_ids") or []
+    stats = {"judge": result.get("stats") or {},
+             "accept_suggestion_ids": accepts, "reject_suggestion_ids": rejects}
+
+    if result.get("error"):
+        runs.finish_run(run_id, status="failed", error=str(result["error"]), stats=stats)
+        return {"run_id": run_id, "enqueued": False, "error": result["error"]}
+
+    if not accepts and not rejects:
+        stats["execution"] = "noop"
+        runs.finish_run(run_id, stats=stats)
+        return {"run_id": run_id, "enqueued": False, "error": None}
+
+    try:
+        service_bus.send_service_task(
+            _EXECUTE_CONSOLIDATION_TASK,
+            args=[webtoon_id, run_id, accepts, rejects],
+            queue=_EXECUTE_CONSOLIDATION_QUEUE,
+        )
+        stats["execution"] = "enqueued"
+        runs.finish_run(run_id, stats=stats)
+        return {"run_id": run_id, "enqueued": True, "error": None}
+    except Exception as e:  # noqa: BLE001 — 전송 실패는 run에 남기고 수동 수습 가능하게
+        stats["execution"] = "enqueue_failed"
+        runs.finish_run(run_id, status="failed", error=f"celery enqueue 실패: {e}", stats=stats)
+        logger.error("[consolidate] w%s run=%s 실행 위임 실패: %s", webtoon_id, run_id, e)
+        return {"run_id": run_id, "enqueued": False, "error": str(e)}
