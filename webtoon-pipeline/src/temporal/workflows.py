@@ -125,7 +125,7 @@ class EpisodeChainWorkflow:
 
         # 에피소드 단위 2-pass(Req 9.1): step3a(추출) → step3b(해소) → step3c(커밋).
         # LLM 스테이지는 2개(Pass-1 비전, Pass-2a 텍스트)로 한정하며, 세 액티비티 모두 STEP3_QUEUE에서
-        # 돌아 LLM 스테이지 전체에 걸쳐 동시성 1(두 에피소드의 step3가 동시에 돌지 않음)을 보존한다(Req 9.2).
+        # 돌아 동시성 2(최대 두 에피소드의 step3가 동시에 진행 가능, worker.py 참고)로 제한된다(Req 9.2).
         # 단계 간 데이터는 activity 반환값/입력으로 흘린다(Req 9.3): step3a의 ExtractResult dict를
         # step3b 입력으로, step3b의 ResolveResult dict를 step3c 입력으로 직접 전달한다.
         workflow.logger.info(
@@ -209,7 +209,7 @@ class RegenerateCharacterWorkflow:
     - profile  : 병합 후. 근거(귀속 대사+장면+흡수분 조각) 전량 주입 LLM 1콜 → 프로필 무캡 replace.
     - reresolve: 얼굴 이동/섞임 풀기 후. 등장 에피소드 전부 reresolve_episode(rerun_extract=True)
                  순차(§20.3 — 얼굴 교정 반영엔 비전 재실행 필수) 후 프로필 재도출로 마무리.
-    무거운 액티비티는 STEP3_QUEUE(동시성 1)로 보내 정규 step3/LLM 작업과 직렬화한다.
+    무거운 액티비티는 STEP3_QUEUE(동시성 2)로 보내 정규 step3/LLM 작업과 함께 처리한다.
     진행표시는 umbrella run(kind=profile, stats.character_id/mode/episodes_done)이 정본.
     """
 
@@ -260,7 +260,7 @@ class RegenerateCharacterWorkflow:
 class ConsolidateWebtoonWorkflow:
     """웹툰 단위 정리 패스(§22.3~22.4) — 제안검토 심판 → 실행 위임.
 
-    begin(umbrella run, ORCH) → adjudicate(LLM 심판+가드, STEP3_QUEUE 직렬화)
+    begin(umbrella run, ORCH) → adjudicate(LLM 심판+가드, STEP3_QUEUE)
     → finish(수락/기각을 service celery로 위임 + run 종료, ORCH).
     실행(병합 §19·자동 훅 §20)은 service 수락 경로가 담당 — 여기서는 판정까지만.
     workflow_id(consolidate_webtoon_{id}) 멱등이라 체인 훅/버튼의 중복 발화는 무해.
