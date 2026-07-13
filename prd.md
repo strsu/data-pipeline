@@ -932,7 +932,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 완료(같은 날): ~~좀비 Terminate~~(사용자 수동 종료) / ~~P7 push·배포~~(`de022ce` 이미지 가동 확인) / ~~P7 백필~~(사용자 prod 직접 실행, 위반 잔존 0) / ~~정리 패스+심판 구현~~(§22.5-2 ✅). **화산귀환은 사용자가 분석데이터 초기화 → 새 이미지(P7 v2+CCIP v2)로 전량 재실행 중** — §18.5 트랙C wipe 검증 겸함. 조걸↔윤종 스왑·프로필 재생성 등 human 노동분은 wipe로 증발(§11.4 가이드는 유효).
 
-- [ ] **정리 패스 배포**: ①proxmox-configuration pipeline_repo에 워커 env `BROKER_URL_`/`BROKER_PORT_`/`BROKER_PASSWORD` 노출(+선택 `CONSOLIDATE_EVERY_N_RESOLVES`) ②service `3ec2d67`(0034 migrate) ③data-pipeline `0b7d6e0` push(celery dep 이미지 재빌드) ④webtoonmoa `23eb0ad`. env 없이 배포되면 심판·권고 배지까지만 동작(자동 실행은 enqueue_failed, run stats에 결정 목록 남아 수동 수습 가능).
+- [x] **정리 패스 배포 (2026-07-13 실측 확인, ①~③ 완료)**: ①pipeline_repo env — `BROKER_PASSWORD`(infisical-secret) + `BROKER_URL_`/`BROKER_PORT_`/`CONSOLIDATE_EVERY_N_RESOLVES`(configmap) 노출 확인 ②service 0034 migrate 적용 확인(prod django_migrations, 07-12 10:13 UTC) ③pipeline 배포 태그 `13a796e`(=0b7d6e0 celery dep 포함) 확인. ④webtoonmoa `23eb0ad`(심판 배지 UI)만 배포 여부 미확인 — 비차단. ⚠️ 배포 이미지에 동시성 2가 포함되나 웹툰 락(`1679b03`)은 미포함 — 정리 패스 첫 발동(resolve 5개) 전에 락 커밋 배포 권장(심판↔apply pending suggestion sid 경합 방지, §9.9).
 - [ ] **재실행 관찰(화산귀환)**: (a) P7+CCIP v2 효과 — 무명 클러스터 발생률·is_match_excluded 수가 이전(175개/42건)보다 유의미하게 낮은지 판정 쿼리 (b) resolve 5개 도달 시 첫 정리 패스 자동 발화 확인(`consolidate_webtoon_17` 워크플로, consolidate-status API, suggestions 심판 배지) (c) 자동수락이 실제 병합으로 이어지고 §20 프로필 재도출 훅이 따라오는지 E2E.
 - [ ] 후속 백로그: suggestions **서버측 judge 정렬**(JSONB order_by — 현재 배지만, §22.4 주의) / 마스터 '미배정' 목록에 human-미배정 얼굴 포함 여부(§11.4 주의) / §18.8-6 CCIP 재배치(경합쌍 해소) / Stage A(아크 종합)는 여전히 미착수.
 - 참고: 파이프라인 신규 테스트(reconcile 가드 9·워크플로 오케스트레이션·P7 동기화 8케이스)는 `tests/`가 gitignore라 로컬 보관(기존 테스트 전부와 동일 관례) — 커밋엔 미포함.
