@@ -89,6 +89,30 @@ def finish_run(
     logger.info("[runs] finish run=%s status=%s", run_id, status)
 
 
+def fail_run_if_running(run_id: int, error: str) -> bool:
+    """run이 아직 running일 때만 failed로 전이한다. 전이했으면 True.
+
+    `finish_run`과 달리 종료 상태(succeeded/failed)를 덮지 않는다 — step3c 최종 실패
+    (액티비티 재시도 소진) 시 워크플로가 running 좀비를 정리하는 용도. apply가 커밋·
+    succeeded 전이까지 끝낸 뒤 결과 보고만 유실된 경계 케이스에서 succeeded를 되돌리지
+    않기 위한 가드다.
+    """
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE analysis_run
+            SET status='failed', error=%s, finished_at=%s, updated_at=%s
+            WHERE id=%s AND status='running'
+            """,
+            (error or "", now, now, run_id),
+        )
+        changed = bool(cur.rowcount)
+    if changed:
+        logger.info("[runs] fail-if-running run=%s → failed: %s", run_id, error)
+    return changed
+
+
 def record_completed_run(webtoon_id: int, episode_id: int, kind: str, stats: Optional[dict] = None) -> int:
     """시작/종료를 한 번에 기록하는 원샷 완료 run(step1/step2 완료 마킹용).
 

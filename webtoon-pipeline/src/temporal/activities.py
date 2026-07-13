@@ -16,12 +16,59 @@ chromadb/boto3/psycopg2를 끌어오지 않게 해, 오케스트레이션 단위
 from __future__ import annotations
 
 import logging
+import threading
+from contextlib import contextmanager
 
 from temporalio import activity
 
 from src.temporal.shared import STEP_RUN_KIND, ChainInput, ConsolidateInput, EpisodeInput, RegenInput
 
 logger = logging.getLogger(__name__)
+
+
+# ── 웹툰 단위 직렬화 락 (STEP3_QUEUE 동시성 2 전제) ──────────────────────────
+#
+# STEP3_QUEUE는 동시성 2로 **서로 다른 웹툰**의 step3류 작업을 병렬 처리한다. 같은 웹툰을
+# 겹쳐 건드리는 두 작업(정규 체인 step3 ↔ regen reresolve ↔ 정리 패스 심판)은 suggestion
+# delete-reinsert 경합, 동명 승격 TOCTOU, run supersede 상호 덮어쓰기를 일으키므로,
+# 무거운 step3류 액티비티는 진입 시 webtoon_id별 락을 잡아 같은 웹툰을 직렬화한다.
+# 워커가 replicas=1(단일 프로세스)이라 프로세스 내 threading.Lock으로 충분하다 —
+# replicas를 늘리려면 이 락을 pg advisory lock으로 교체해야 한다.
+#
+# 대기 정책: 락을 못 잡으면 heartbeat를 보내며 블로킹 대기한다(retryable 에러로 슬롯을
+# 반납하면 _REGEN_RETRY(5회)가 긴 점유를 못 넘겨 워크플로가 죽는다). 같은 웹툰 경합 시
+# 슬롯 하나가 일시적으로 대기에 묶이는 건 감수 — 종전 동시성 1 수준으로 강등될 뿐이고,
+# 경합이 없는 평시에는 웹툰 2개가 병렬로 돈다.
+
+_webtoon_locks: dict[int, threading.Lock] = {}
+_webtoon_locks_guard = threading.Lock()
+
+
+def _get_webtoon_lock(webtoon_id: int) -> threading.Lock:
+    with _webtoon_locks_guard:
+        lock = _webtoon_locks.get(webtoon_id)
+        if lock is None:
+            lock = _webtoon_locks[webtoon_id] = threading.Lock()
+        return lock
+
+
+@contextmanager
+def _webtoon_serialized(webtoon_id: int, what: str = ""):
+    """같은 웹툰의 step3류 작업을 프로세스 내에서 직렬화한다(위 주석 참조).
+
+    대기 중에는 15초마다 heartbeat를 보내 heartbeat_timeout을 넘기지 않는다.
+    액티비티가 취소되면 heartbeat가 CancelledError를 던져 대기 스레드도 정리된다.
+    """
+    lock = _get_webtoon_lock(webtoon_id)
+    if not lock.acquire(blocking=False):
+        logger.info("[webtoon-lock] webtoon=%s 대기 시작 (%s) — 같은 웹툰 작업 진행 중", webtoon_id, what)
+        while not lock.acquire(timeout=15.0):
+            activity.heartbeat(f"webtoon-lock:wait:{what}")
+        logger.info("[webtoon-lock] webtoon=%s 획득 (%s)", webtoon_id, what)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _run_with_heartbeat(fn, *, args=(), kwargs=None, detail: str = "working",
@@ -257,18 +304,19 @@ def step3a_extract(ep: EpisodeInput) -> dict:
         activity.heartbeat(done)
 
     webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
-    ctx = resolve_llm_model(webtoon_id, VISION)
-    run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_VISION,
-                            llm_model_id=ctx.get("id"))
-    try:
-        result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb, run_id=run_id)
-    except Exception as e:
-        runs.finish_run(run_id, status="failed", error=str(e))
-        raise
-    runs.finish_run(run_id, stats={
-        "cuts_total": result.cuts_total, "cuts_analyzed": result.cuts_analyzed,
-        "cuts_skipped": result.cuts_skipped, "usage": result.usage_total,
-    })
+    with _webtoon_serialized(webtoon_id, "step3a"):
+        ctx = resolve_llm_model(webtoon_id, VISION)
+        run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_VISION,
+                                llm_model_id=ctx.get("id"))
+        try:
+            result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb, run_id=run_id)
+        except Exception as e:
+            runs.finish_run(run_id, status="failed", error=str(e))
+            raise
+        runs.finish_run(run_id, stats={
+            "cuts_total": result.cuts_total, "cuts_analyzed": result.cuts_analyzed,
+            "cuts_skipped": result.cuts_skipped, "usage": result.usage_total,
+        })
     out = asdict(result)
     out["run_id"] = run_id
     return out
@@ -297,37 +345,38 @@ def step3b_resolve(ep: EpisodeInput, extract: dict) -> dict:
     activity.heartbeat("resolve:start")  # 준비 단계(load_prior 등) 동안의 초기 갱신
 
     webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
-    prior = load_prior(webtoon_id, ep.episode_no)
+    with _webtoon_serialized(webtoon_id, "step3b"):
+        prior = load_prior(webtoon_id, ep.episode_no)
 
-    # ExtractResult 재구성(records는 Pass1Record 데이터클래스로 복원 — windowed 경로가 속성 접근).
-    vision_run_id = extract.get("run_id")
-    records = [Pass1Record(**r) for r in extract.get("records", [])]
-    extract_obj = ExtractResult(
-        webtoon_episode_id=extract.get("webtoon_episode_id", ep.webtoon_episode_id),
-        records=records,
-        belief=extract.get("belief", {}),
-        cuts_total=extract.get("cuts_total", 0),
-        cuts_analyzed=extract.get("cuts_analyzed", 0),
-        cuts_skipped=extract.get("cuts_skipped", 0),
-        usage_total=extract.get("usage_total", {}),
-    )
-
-    # resolve run 시작(R+N+apply가 공유; apply 성공 시 step3c가 succeeded 전이).
-    # Stage R/N은 텍스트 전용 → text role 모델(예: glm-5.2)로 해석.
-    from src.operators.llm_resolver import TEXT, resolve_llm_model
-    ctx = resolve_llm_model(webtoon_id, TEXT)
-    run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_RESOLVE,
-                            llm_model_id=ctx.get("id"), vision_run_id=vision_run_id)
-    try:
-        result = _run_with_heartbeat(
-            step3.resolve_and_narrate,
-            args=(extract_obj, prior),
-            kwargs=dict(webtoon_id=webtoon_id, ctx=ctx, run_id=run_id),
-            detail="resolve:working",
+        # ExtractResult 재구성(records는 Pass1Record 데이터클래스로 복원 — windowed 경로가 속성 접근).
+        vision_run_id = extract.get("run_id")
+        records = [Pass1Record(**r) for r in extract.get("records", [])]
+        extract_obj = ExtractResult(
+            webtoon_episode_id=extract.get("webtoon_episode_id", ep.webtoon_episode_id),
+            records=records,
+            belief=extract.get("belief", {}),
+            cuts_total=extract.get("cuts_total", 0),
+            cuts_analyzed=extract.get("cuts_analyzed", 0),
+            cuts_skipped=extract.get("cuts_skipped", 0),
+            usage_total=extract.get("usage_total", {}),
         )
-    except Exception as e:
-        runs.finish_run(run_id, status="failed", error=str(e))
-        raise
+
+        # resolve run 시작(R+N+apply가 공유; apply 성공 시 step3c가 succeeded 전이).
+        # Stage R/N은 텍스트 전용 → text role 모델(예: glm-5.2)로 해석.
+        from src.operators.llm_resolver import TEXT, resolve_llm_model
+        ctx = resolve_llm_model(webtoon_id, TEXT)
+        run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_RESOLVE,
+                                llm_model_id=ctx.get("id"), vision_run_id=vision_run_id)
+        try:
+            result = _run_with_heartbeat(
+                step3.resolve_and_narrate,
+                args=(extract_obj, prior),
+                kwargs=dict(webtoon_id=webtoon_id, ctx=ctx, run_id=run_id),
+                detail="resolve:working",
+            )
+        except Exception as e:
+            runs.finish_run(run_id, status="failed", error=str(e))
+            raise
     out = asdict(result)
     out["run_id"] = run_id
     return out
@@ -341,6 +390,10 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
     `ResolveResult`로 복원해 `step3.apply_resolution`에 넘긴다(소급 전파·멱등·동결 보장 — Req 5).
     커밋 성공 시 resolve run을 succeeded로 전이한다 — 이 순간이 "에피소드 step3 완료"의 정본이다
     (§17.1: 진행도 도출, stale 도출 기준 시각).
+
+    예외 시 여기서 run을 failed로 전이하지 않는다(attempt 단위 failed 전이는 재시도 성공 시
+    failed↔succeeded 왕복을 만든다) — 재시도 소진(최종 실패) 처리는 워크플로가
+    `mark_resolve_run_failed`로 수행한다(running 좀비 방지).
     """
     from src.core import runs, step3
     from src.core.step3 import ResolveResult
@@ -349,20 +402,37 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
 
     run_id = resolution.pop("run_id", None)
     result = ResolveResult(**resolution)
-    # 결정론 커밋이지만 대용량 회차(수백 speaker/annotation)에서 DB 쓰기가 길어질 수 있어
-    # 서브스레드 + 주기 하트비트로 감싼다(step3c heartbeat_timeout 초과 방지).
-    meta = _run_with_heartbeat(
-        step3.apply_resolution,
-        args=(ep.webtoon_episode_id, result),
-        kwargs=dict(run_id=run_id),
-        detail="apply:working",
-    )
-    if run_id is not None:
-        if result.error:
-            runs.finish_run(run_id, status="failed", error=str(result.error))
-        else:
-            runs.finish_run(run_id, stats=meta.get("stats") or {})
+    webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
+    with _webtoon_serialized(webtoon_id, "step3c"):
+        # 결정론 커밋이지만 대용량 회차(수백 speaker/annotation)에서 DB 쓰기가 길어질 수 있어
+        # 서브스레드 + 주기 하트비트로 감싼다(step3c heartbeat_timeout 초과 방지).
+        meta = _run_with_heartbeat(
+            step3.apply_resolution,
+            args=(ep.webtoon_episode_id, result),
+            kwargs=dict(run_id=run_id),
+            detail="apply:working",
+        )
+        if run_id is not None:
+            if result.error:
+                runs.finish_run(run_id, status="failed", error=str(result.error))
+            else:
+                runs.finish_run(run_id, stats=meta.get("stats") or {})
     return meta
+
+
+@activity.defn
+def mark_resolve_run_failed(run_id: int | None, error: str) -> None:
+    """step3c 최종 실패(액티비티 재시도 소진) 시 워크플로가 호출 — resolve run을 failed로 닫는다.
+
+    running일 때만 전이한다(이미 succeeded/superseded면 no-op) — apply가 커밋·전이까지 끝낸 뒤
+    결과 보고만 유실된 재시도 경계 케이스에서 succeeded를 failed로 되돌리지 않기 위함.
+    """
+    from src.core import runs
+
+    if run_id is None:
+        return
+    if runs.fail_run_if_running(run_id, error):
+        logger.warning("[step3c] run=%s 최종 실패 — failed 전이(running 좀비 방지): %s", run_id, error)
 
 
 # ── 캐릭터 재분석(재도출, §20) ────────────────────────────────────────────────
@@ -370,7 +440,7 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
 # RegenerateCharacterWorkflow가 사용. regen_begin(가벼움, ORCH_QUEUE)이 대상 해석 +
 # umbrella run(kind=profile)을 만들고, 무거운 작업(regen_reresolve_episode /
 # regen_profile)은 STEP3_QUEUE(동시성 2)에서 다른 step3/LLM 작업과 함께 처리된다 —
-# 같은 에피소드를 정규 체인이 동시에 건드리는 경우가 아니면 안전(§20 전제).
+# 같은 웹툰을 정규 체인이 동시에 건드리는 경우는 _webtoon_serialized 락이 직렬화한다.
 
 
 @activity.defn
@@ -409,19 +479,21 @@ def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
     """
     from src.core import regen, step3
 
-    # 좀비 차단: umbrella run이 superseded/종료됐으면 무거운 작업 없이 워크플로를 끝낸다.
-    if not regen.run_is_live(run_id):
-        logger.info("[regen] run=%s superseded — ep%s 재해소 건너뜀(워크플로 종료 신호)",
-                    run_id, webtoon_episode_id)
-        return {"superseded": True, "webtoon_episode_id": webtoon_episode_id}
+    with _webtoon_serialized(webtoon_id, "regen:reresolve"):
+        # 좀비 차단: umbrella run이 superseded/종료됐으면 무거운 작업 없이 워크플로를 끝낸다.
+        # (락 획득 후 확인 — 대기 중 supersede된 run이 무거운 작업을 시작하지 않게.)
+        if not regen.run_is_live(run_id):
+            logger.info("[regen] run=%s superseded — ep%s 재해소 건너뜀(워크플로 종료 신호)",
+                        run_id, webtoon_episode_id)
+            return {"superseded": True, "webtoon_episode_id": webtoon_episode_id}
 
-    out = _run_with_heartbeat(
-        step3.reresolve_episode,
-        args=(webtoon_episode_id,),
-        kwargs=dict(rerun_extract=True, webtoon_id=webtoon_id),
-        detail="regen:reresolve",
-    )
-    regen.bump_profile_run_progress(run_id, episodes_done)
+        out = _run_with_heartbeat(
+            step3.reresolve_episode,
+            args=(webtoon_episode_id,),
+            kwargs=dict(rerun_extract=True, webtoon_id=webtoon_id),
+            detail="regen:reresolve",
+        )
+        regen.bump_profile_run_progress(run_id, episodes_done)
     return {"webtoon_episode_id": webtoon_episode_id,
             "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
 
@@ -435,26 +507,27 @@ def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int) -> dict:
     """
     from src.core import regen, runs
 
-    if not regen.run_is_live(run_id):
-        logger.info("[regen] run=%s superseded — 프로필 재도출 건너뜀", run_id)
-        return {"character_id": inp.character_id, "superseded": True}
+    with _webtoon_serialized(webtoon_id, "regen:profile"):
+        if not regen.run_is_live(run_id):
+            logger.info("[regen] run=%s superseded — 프로필 재도출 건너뜀", run_id)
+            return {"character_id": inp.character_id, "superseded": True}
 
-    result = _run_with_heartbeat(
-        regen.regenerate_character_profile,
-        args=(inp.character_id,),
-        kwargs=dict(absorbed_character_ids=inp.absorbed_character_ids or [], run_id=run_id),
-        detail="regen:profile",
-    )
-    profile = result.get("profile") or {}
-    if result.get("error"):
-        runs.finish_run(run_id, status="failed", error=str(result["error"]))
-    else:
-        runs.finish_run(run_id, stats={
-            "character_id": inp.character_id, "mode": inp.mode,
-            "key_facts": len(profile.get("key_facts") or []),
-            "progression": len(profile.get("progression") or []),
-            "usage": result.get("usage") or {},
-        })
+        result = _run_with_heartbeat(
+            regen.regenerate_character_profile,
+            args=(inp.character_id,),
+            kwargs=dict(absorbed_character_ids=inp.absorbed_character_ids or [], run_id=run_id),
+            detail="regen:profile",
+        )
+        profile = result.get("profile") or {}
+        if result.get("error"):
+            runs.finish_run(run_id, status="failed", error=str(result["error"]))
+        else:
+            runs.finish_run(run_id, stats={
+                "character_id": inp.character_id, "mode": inp.mode,
+                "key_facts": len(profile.get("key_facts") or []),
+                "progression": len(profile.get("progression") or []),
+                "usage": result.get("usage") or {},
+            })
     return {"character_id": inp.character_id, "error": result.get("error")}
 
 
@@ -501,17 +574,20 @@ def consolidation_begin(inp: ConsolidateInput) -> dict:
 def consolidation_adjudicate(webtoon_id: int, run_id: int) -> dict:
     """심판 본체 — 도시에 구성→LLM 판정(순차)→교차대조/가드→권고 영속(adjudicate.py).
 
-    STEP3_QUEUE(동시성 2)에서 정규 step3/LLM 작업과 함께 처리(더 이상 완전 직렬화는
-    아님). 도시에 수×콜 시간이 길 수 있어 서브스레드 + 주기 하트비트로 감싼다(§18.4 패턴).
+    STEP3_QUEUE(동시성 2)에서 정규 step3/LLM 작업과 함께 처리하되, 같은 웹툰과는
+    _webtoon_serialized 락으로 직렬화한다(apply의 pending suggestion delete-reinsert와
+    겹치면 심판 중이던 sid가 소멸). 도시에 수×콜 시간이 길 수 있어 서브스레드 +
+    주기 하트비트로 감싼다(§18.4 패턴).
     """
     from src.core import adjudicate
 
-    return _run_with_heartbeat(
-        adjudicate.adjudicate_webtoon,
-        args=(webtoon_id,),
-        kwargs=dict(run_id=run_id),
-        detail="consolidate:judge",
-    )
+    with _webtoon_serialized(webtoon_id, "consolidate:judge"):
+        return _run_with_heartbeat(
+            adjudicate.adjudicate_webtoon,
+            args=(webtoon_id,),
+            kwargs=dict(run_id=run_id),
+            detail="consolidate:judge",
+        )
 
 
 @activity.defn

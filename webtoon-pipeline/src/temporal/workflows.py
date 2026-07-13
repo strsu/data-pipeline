@@ -7,9 +7,11 @@ EpisodeChainWorkflow — 정식 단일 오케스트레이터.
   - steps          : 회차당 실행할 step 목록(["step1"], ["step1","step2"],
                      ["step1","step2","step3"], ["step3"] 등). 정규 경로와 admin 단독/범위
                      실행이 동일 워크플로를 steps만 바꿔 사용한다.
-  - 동시성          : 무거운 step 작업은 step별 전용 큐(STEP1/2/3_QUEUE)로 보내고, 그 큐를
-                     서빙하는 워커가 동시성 1이라 step별 전역 1개 실행이 보장된다. 체인
-                     워크플로 자체와 가벼운 판정 액티비티는 ORCH_QUEUE에서 돈다.
+  - 동시성          : 무거운 step 작업은 step별 전용 큐(STEP1/2/3_QUEUE)로 보낸다.
+                     step1/2 큐는 동시성 1(전역 직렬화), step3 큐는 동시성 2 + 액티비티
+                     내부의 웹툰 단위 락(activities._webtoon_serialized)으로 "같은 웹툰
+                     직렬화, 다른 웹툰끼리만 병렬"을 보장한다. 체인 워크플로 자체와
+                     가벼운 판정 액티비티는 ORCH_QUEUE에서 돈다.
   - 다음 ep 판정    : "이어갈지"는 모든 step 조합에서 next_chain_episode가 공통으로 결정
                      (자동=진입 step 미완료 다음 회차 / 범위=cur_ep..max_ep).
 """
@@ -20,6 +22,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
@@ -125,7 +128,7 @@ class EpisodeChainWorkflow:
 
         # 에피소드 단위 2-pass(Req 9.1): step3a(추출) → step3b(해소) → step3c(커밋).
         # LLM 스테이지는 2개(Pass-1 비전, Pass-2a 텍스트)로 한정하며, 세 액티비티 모두 STEP3_QUEUE에서
-        # 돌아 동시성 2(최대 두 에피소드의 step3가 동시에 진행 가능, worker.py 참고)로 제한된다(Req 9.2).
+        # 돈다 — 동시성 2 + 웹툰 단위 락으로 "다른 웹툰끼리만" 두 에피소드가 병렬 진행된다(Req 9.2).
         # 단계 간 데이터는 activity 반환값/입력으로 흘린다(Req 9.3): step3a의 ExtractResult dict를
         # step3b 입력으로, step3b의 ResolveResult dict를 step3c 입력으로 직접 전달한다.
         workflow.logger.info(
@@ -151,13 +154,25 @@ class EpisodeChainWorkflow:
         )
 
         # step3c: 결정론 커밋(Pass-2b, LLM 없음). resolution 결과 dict를 입력으로 thread.
-        await workflow.execute_activity(
-            activities.step3c_apply,
-            args=[ep, resolution],
-            task_queue=STEP3_QUEUE,
-            start_to_close_timeout=timedelta(minutes=15),
-            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-        )
+        # 재시도 진행 중에는 resolve run이 running으로 남는 게 진실이고(액티비티는 attempt
+        # 단위 failed 전이를 하지 않음), 재시도 소진(최종 실패) 시에만 여기서 failed로 닫는다
+        # — running 좀비 방지. 그 후 예외를 재전파해 체인은 기존대로 실패한다.
+        try:
+            await workflow.execute_activity(
+                activities.step3c_apply,
+                args=[ep, resolution],
+                task_queue=STEP3_QUEUE,
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+            )
+        except ActivityError as e:
+            await workflow.execute_activity(
+                activities.mark_resolve_run_failed,
+                args=[resolution.get("run_id"), f"step3c_apply 최종 실패(재시도 소진): {e.cause or e}"],
+                task_queue=ORCH_QUEUE,
+                start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
+            )
+            raise
         # v4.0: step3 완료 마킹은 별도 없음 — step3c가 resolve run을 succeeded로 전이하는 것이
         # 진행도의 정본이다(§17.1). _mark는 step1/2(run 원장 완료 기록)에만 쓴다.
 

@@ -2541,28 +2541,33 @@ def _commit_speaker_resolution(
     - speech/monologue 해소: character_id 유효 & confidence>=임계값인 (cut, block_index)의 region을
       찾아 source='llm' 주석의 speaker_id + resolution_status='resolved' 설정(단방향). 임계값 미만/
       무효 id는 provisional 유지(Req 10.3). source='human'은 절대 갱신 안 함(동결 — Property 4).
-    - **provisional 화자 승격(2026-07-05)**: Pass-2a가 명시 해소하지 않았지만 Pass-1이 얼굴 기반으로
-      확신해 영속한 provisional speaker_id가 남아있는 speech/monologue 블록은 그 화자로 resolved
-      승격한다. Pass-2a가 일부 블록을 빠뜨려도(전수 테이블 미준수) 얼굴 근거 화자가 유실되지 않는
-      안전망 — 종전엔 이 유실이 화자 매칭률 1~2%의 주원인이었다.
+    - **provisional 화자 승격(2026-07-05, 범위 정정 2026-07-13)**: Pass-2a(R)가 **아예 언급하지 않은**
+      speech/monologue 중 Pass-1이 얼굴 기반으로 확신해 영속한 provisional speaker_id 보유 블록만
+      그 화자로 resolved 승격한다 — R이 전수 테이블에서 행을 빠뜨려도 얼굴 근거 화자가 유실되지
+      않는 안전망(종전엔 이 유실이 화자 매칭률 1~2%의 주원인). 단 R이 **명시적으로 판정한 블록**
+      (character_id=null "판단 불가", 무효 id, 저신뢰)은 승격 대상에서 제외한다 — R의 에피소드
+      전역 맥락 기반 부정 판정(mis-ID distrust 포함)을 컷 단독 추정으로 되덮지 않기 위함(§9.6).
+      이런 블록은 provisional 유지(unresolved)로 남는다(§11.2 confidence 게이팅).
     - 화자없는 블록(narration/system/other)은 speaker 없이 resolved로 전이(명시적 화자 없음 —
       Property 6). 역시 source='llm'만.
     Returns: speaker_id가 실제 커밋된 블록 수(명시 해소 + provisional 승격).
     """
     resolved = 0
+    adjudicated_rids: set[int] = set()  # R이 명시 판정한 region(수락이든 null/저신뢰든) — 승격 제외
     with db_cursor() as cur:
         for s in speaker_resolution or []:
             cid = s.get("character_id")
             cut = s.get("cut")
             bidx = s.get("block_index")
             conf = float(s.get("confidence", 0) or 0)
-            if cid is None or cid not in valid_ids:
-                continue
-            if conf < _APPLY_SPEAKER_MIN_CONFIDENCE:
-                continue
             rid = region_map.get((cut, bidx))
             if rid is None:
                 continue
+            adjudicated_rids.add(rid)
+            if cid is None or cid not in valid_ids:
+                continue  # R 명시 "판단 불가"/무효 id — provisional 유지, 승격도 하지 않음
+            if conf < _APPLY_SPEAKER_MIN_CONFIDENCE:
+                continue  # 저신뢰 — provisional 유지
             cur.execute(
                 """
                 UPDATE analysis_text_annotation
@@ -2573,7 +2578,8 @@ def _commit_speaker_resolution(
             )
             resolved += cur.rowcount or 0
 
-        # provisional 화자 승격 — Pass-2a가 다루지 않은 speech/monologue 중 Pass-1 화자 보유 블록.
+        # provisional 화자 승격 — R이 **언급하지 않은** speech/monologue 중 Pass-1 화자 보유 블록만.
+        # (adjudicated_rids 제외: R이 null/저신뢰로 명시 판정한 블록을 컷 단독 추정으로 되덮지 않는다.)
         cur.execute(
             """
             UPDATE analysis_text_annotation ta
@@ -2586,13 +2592,14 @@ def _commit_speaker_resolution(
               AND ta.type = ANY(%s)
               AND ta.speaker_id IS NOT NULL
               AND ta.resolution_status <> 'resolved'
+              AND NOT (tr.id = ANY(%s::int[]))
             """,
-            (now, webtoon_episode_id, list(_SPEAKER_TYPES)),
+            (now, webtoon_episode_id, list(_SPEAKER_TYPES), list(adjudicated_rids)),
         )
         promoted = cur.rowcount or 0
         if promoted:
             logger.info(
-                "[step3.apply] episode %s — provisional 화자 %s블록 resolved 승격(Pass-1 얼굴 근거)",
+                "[step3.apply] episode %s — provisional 화자 %s블록 resolved 승격(Pass-1 얼굴 근거, R 미언급분)",
                 webtoon_episode_id, promoted,
             )
         resolved += promoted

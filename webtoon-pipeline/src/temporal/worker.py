@@ -6,11 +6,12 @@
 - ORCH_QUEUE  : EpisodeChainWorkflow + 가벼운 판정/메타 액티비티.
 - STEP1/2_QUEUE : 무거운 step 작업 액티비티. max_concurrent_activities=1로 제한해
                   step별 전역 동시성 1을 보장한다(개인 서버 자원 보호).
-- STEP3_QUEUE : 동시성 2(정규 체인이 다른 웹툰의 step3 처리를 오래 막지 않도록). 단,
-                같은 웹툰/에피소드를 동시에 건드리는 두 step3류 작업(예: 정규 체인의
-                apply와 그 에피소드의 regen reresolve)이 겹치면 더는 전역 큐잉으로
-                자동 직렬화되지 않으니 주의(§20 재분석은 대상 에피소드가 이미 정규
-                체인을 지난 뒤 실행하는 것이 전제).
+- STEP3_QUEUE : 동시성 2(정규 체인이 다른 웹툰의 step3 처리를 오래 막지 않도록).
+                같은 웹툰을 겹쳐 건드리는 두 step3류 작업(예: 정규 체인의 apply와
+                그 웹툰의 regen reresolve/정리 패스 심판)은 액티비티 진입 시
+                webtoon_id별 프로세스 내 락(activities._webtoon_serialized)이
+                직렬화한다 — 즉 "같은 웹툰 직렬, 다른 웹툰끼리만 병렬 2".
+                replicas=1(단일 프로세스) 전제 — 늘리려면 pg advisory lock으로 교체.
 
 액티비티가 동기 함수(블로킹 I/O)이므로 ThreadPoolExecutor로 실행한다. step1/2 워커는
 동시성 1이라 단일 스레드 executor면 충분하고, step3 워커는 동시성 2에 맞춰 스레드 2개를
@@ -79,6 +80,7 @@ async def main() -> None:
             activities.next_chain_episode,
             activities.mark_phase_complete,
             activities.is_phase3_enabled,
+            activities.mark_resolve_run_failed,
             activities.regen_begin,
             activities.consolidation_due_for_episode,
             activities.consolidation_begin,
