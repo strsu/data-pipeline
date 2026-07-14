@@ -333,11 +333,12 @@ Pass-2b (LLM 없음, 결정론적)       ── provisional → confirmed 일괄
 - **캐릭터 중요도 티어링**: `main/supporting`(풀 처리, 이름해소·로스터 반영) / `minor_functional`(기능 라벨 보존, 실명 추적 안 함) / `extra`(soft-exclude — `is_match_excluded=true`, 하드 삭제 금지·가역·human 동결 존중). Step2가 미매칭 얼굴마다 NEW_CHAR를 양산해 캐릭터 DB가 오염되는 문제를 새 LLM 콜 없이 Pass-2a 안에서 해결.
 - 출력 계약: `characters[character_id, name, significance, name_confidence, evidence, label_conflict, merge_suggestion, profile{gender, age_group, affiliation, role, personality[], traits{}}]`(**v3.6** — profile은 인물도감용 범용 메타, 장르 특이값은 free-form traits, 근거 있는 항목만), `speaker_resolution[cut, block_index→character_id, confidence, reason]`, `beats[cut_start, cut_end, hook_type, appeal_point, intensity]`, `episode{summary, appeal_point, cliffhanger, foreshadowing}`, `deceptions[cut, character_id, claim, contradicts, confidence]`, `threads[description, type, status, planted/resolved episode·cut, confidence]`.
 - **(v3.6) speaker_resolution은 "불확실 블록만"이 아니라 모든 speech/monologue의 전수 화자 테이블**: 블록의 `spk_face`/`spk_cid`(Pass-1 후보)가 맥락과 맞으면 확인(confirm), 다르면 교체(override), 진짜 판단 불가만 null. 종전 "provisional speaker가 null/불확실한 블록만" 지시는 확신 블록을 재출력하지 않게 만들어 Pass-2b가 커밋할 화자를 잃는 구조였다. Pass-2a 입력 faces에도 `confirmed` 플래그 포함(confirmed=true + prior는 동결·화자 판정에 신뢰).
+- **(2026-07-14) speaker_resolution 차분(diff) 계약으로 재개정**: 전수 테이블이 출력 비대의 주범이 됨(화산귀환 실측 — R 1콜 completion 26k~65k tok, 65,536 캡 도달 `finish=length` + json-repair 의존, 50tok/s에서 콜당 20~37분). v3.6이 두려워한 "확신 블록 미출력 시 화자 유실"은 그 사이 **provisional 화자 승격**(§9.6)이 생겨 더 이상 성립하지 않으므로, 계약을 뒤집는다: **생략=spk_cid 승인**(승격 경로가 확정), 출력은 ①hint 없는 블록(필수 판정) ②교체 ③명시 null(판단 불가 — null 행이 승격을 차단)만. v3.6의 안전성은 유지하되(null 판정 존중 §9.6 그대로) 출력이 확신 블록 수만큼 줄어든다. Stage N 입력은 종전부터 R 미언급 블록에 provisional 폴백이라 무변경.
 - **(v3.6) deception 판정 규칙 강화**: "다른 인물을 속이려는 의도가 있는 speech"만 — monologue/혼잣말/자조/한탄/수사적 표현은 deception 아님(속일 상대 부재. ep2에서 독백 "운명의 신이 날 조롱하는 기분"이 deception으로 오판된 실사례). episode.summary/appeal_point는 narration·실제 컷 사건에만 근거, 근거 없는 낙인·평가어("분탕", "배신자" 등) 금지.
 
 ### 9.6 Pass-2b — 결정론적 커밋 & 소급 전파 (LLM 없음, Step4 흡수 지점)
 - Pass-2a의 최종 이름/화자 테이블을 **LLM 호출 없이** 결정론적으로 에피소드 전체에 투영: `TextAnnotation.speaker`+`resolution_status=resolved` 커밋, 이름 테이블을 character_id 키로 전 컷에 **소급(backward) 투영**.
-- **(v3.6) provisional 화자 승격 안전망 (범위 정정 2026-07-13)**: Pass-2a가 **아예 언급하지 않은** speech/monologue 중 Pass-1이 영속한 provisional `speaker_id` 보유 블록만 그 화자로 resolved 승격 — Pass-2a가 전수 테이블을 일부 빠뜨려도 얼굴 근거 화자가 유실되지 않는다. 단 **R이 명시 판정한 블록(character_id=null "판단 불가"·무효 id·저신뢰)은 승격에서 제외**하고 provisional(unresolved)로 유지한다 — R의 에피소드 전역 맥락 기반 부정 판정(mis-ID distrust 포함)을 컷 단독 추정이 되덮지 않게(종전 구현은 이 구분 없이 전부 승격해 R의 null 판정이 무시되는 결함이 있었음).
+- **(v3.6) provisional 화자 승격 안전망 (범위 정정 2026-07-13, diff 계약으로 정식 경로 승격 2026-07-14)**: Pass-2a가 **아예 언급하지 않은** speech/monologue 중 Pass-1이 영속한 provisional `speaker_id` 보유 블록만 그 화자로 resolved 승격 — 2026-07-14 R 출력이 차분(diff) 계약(§9.5)이 되면서 이 경로가 안전망이 아니라 **정식 확정 경로**다(생략=승인). 단 **R이 명시 판정한 블록(character_id=null "판단 불가"·무효 id·저신뢰)은 승격에서 제외**하고 provisional(unresolved)로 유지한다 — R의 에피소드 전역 맥락 기반 부정 판정(mis-ID distrust 포함)을 컷 단독 추정이 되덮지 않게(종전 구현은 이 구분 없이 전부 승격해 R의 null 판정이 무시되는 결함이 있었음).
 - **(v3.6) 컷 분석 상태 마킹**: apply 성공 시 에피소드 컷 전체에 `llm_analyzed_at` 기록 + `is_stale=false` 해제. 종전엔 레거시 단일-pass 경로(죽은 코드)만 이 컬럼을 만져 2-pass 운영에서 분석 완료/stale 추적이 전무했다.
 - **(v3.6) profile 커밋(과도기)**: characters.profile을 `Character.extra['llm_profile']`에 병합 커밋(스칼라 최신 우선/personality 합집합/traits 병합, is_confirmed 동결). **이 저장 위치는 과도기** — 출처(provenance: llm/human/human-edited) 구분이 필요해 별도 `CharacterProfile` 모델로 이행 예정(§14 오픈 퀘스천, 설계 논의 중).
 - 같은 커밋 트랜잭션에서 `Character.name/significance`, `NameDiscoverySuggestion`, `EpisodeBeat`, **`EpisodeReport`**(summary/appeal_point/cliffhanger/foreshadowing/character_timeline), `NarrativeThread`, `CharacterClaim`(deceptions)을 함께 확정한다 — **즉 회차 요약(옛 "Step4")은 별도 실행 단계가 아니라 Pass-2b가 매 에피소드 처리마다 자동으로 산출·커밋**하는 부산물이다(`_commit_episode_report` 등, `apply_resolution` 내부).
@@ -356,7 +357,7 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 3. **제외(무관할 때)** — 멀리 있는 확정/human은 뺀다(정확성 리스크 0, 최종값은 동결로 보존 — 비용은 주변 해소 품질 트레이드오프뿐). 노이즈 앵커는 attention을 흐리므로("lost in the middle") 토큰 여유와 무관하게 입력 큐레이션은 필요.
 
 ### 9.9 Temporal 오케스트레이션 매핑
-`EpisodeChainWorkflow`의 step3 단계가 `step3a_extract`(STEP3_QUEUE, 컷 루프, 멀티모달, heartbeat, `start_to_close=2h`) → `step3b_resolve`(에피소드 텍스트 해소, 윈도우, `1h`) → `step3c_apply`(결정론 커밋, `15m`) 순으로 실행된다. 단계 간 데이터는 activity 반환값/입력으로 스레딩(step3a의 `ExtractResult` dict → step3b 입력, step3b의 `ResolveResult` dict → step3c 입력). `phase3_enabled` 게이트 그대로. **동시성(2026-07-13 개정)**: STEP3_QUEUE는 동시성 2 + 액티비티 진입 시 **webtoon_id별 프로세스 내 락**(`activities._webtoon_serialized`, replicas=1 전제 — 늘리려면 pg advisory lock으로 교체) — 같은 웹툰의 step3류 작업(체인 step3a/b/c·regen reresolve/profile·정리 패스 심판)은 직렬화되고 **다른 웹툰끼리만 병렬 2**. 락 대기 중에는 heartbeat 유지(대기 슬롯 점유는 감수 — 경합 시 종전 동시성 1 수준으로 강등될 뿐). step3c 최종 실패(재시도 소진) 시 워크플로가 resolve run을 failed로 닫는다(`mark_resolve_run_failed`, running-가드 — running 좀비 방지). ⚠️ 락 대기 시간은 액티비티 start_to_close에 포함된다 — 심판(수 시간)이 락을 쥐면 대기하던 step3a가 2h 타임아웃→attempt 취소(CancelledError)→재시도로 이어질 수 있으며 **무해**(2026-07-13 첫 정리 패스에서 실전 관측, 재시도가 락 획득 후 정상 진행).
+`EpisodeChainWorkflow`의 step3 단계가 `step3a_extract`(STEP3_QUEUE, 컷 루프, 멀티모달, heartbeat, `start_to_close=2h`) → `step3b_resolve`(에피소드 텍스트 해소, 윈도우, `1h`) → `step3c_apply`(결정론 커밋, `15m`) 순으로 실행된다. 단계 간 데이터는 activity 반환값/입력으로 스레딩(step3a의 `ExtractResult` dict → step3b 입력, step3b의 `ResolveResult` dict → step3c 입력). `phase3_enabled` 게이트 그대로. **동시성(2026-07-13 개정)**: STEP3_QUEUE는 동시성 2 + 액티비티 진입 시 **webtoon_id별 프로세스 내 락**(`activities._webtoon_serialized`, replicas=1 전제 — 늘리려면 pg advisory lock으로 교체) — 같은 웹툰의 step3류 작업(체인 step3a/b/c·regen reresolve/profile·정리 패스 심판)은 직렬화되고 **다른 웹툰끼리만 병렬 2**. 락 대기 중에는 heartbeat 유지(대기 슬롯 점유는 감수 — 경합 시 종전 동시성 1 수준으로 강등될 뿐). step3c 최종 실패(재시도 소진) 시 워크플로가 resolve run을 failed로 닫는다(`mark_resolve_run_failed`, running-가드 — running 좀비 방지). ⚠️ 락 대기 시간은 액티비티 start_to_close에 포함된다 — 심판(수 시간)이 락을 쥐면 대기하던 step3a가 2h 타임아웃→attempt 취소(CancelledError)→재시도로 이어질 수 있으며 **무해**(2026-07-13 첫 정리 패스에서 실전 관측, 재시도가 락 획득 후 정상 진행). **우선순위(2026-07-14 개정)**: 락 대기열은 **정규 체인(step3a/b/c) > regen/정리 패스**, 같은 순위는 FIFO(`_WebtoonLock` — Condition+heap, 취소 시 대기 항목 정리로 락 유실 방지). 근거: 2026-07-13 화산귀환 16h 백로그에서 신규 ep7이 regen 뒤에 10시간 밀림 — regen/정리는 소급 정정이라 늦어도 무해, 신규 회차 진행이 항상 먼저다.
 
 ### 9.10 구현·검증 상태 (2026-07-01)
 - **구현 완료**: service 스키마(§7 신규 테이블 전부), 코어(`extract_cut`/`extract_episode`/`resolve_episode`/`resolve_episode_windowed`/`apply_resolution`), `narrative_context.py`(`load_prior`/`fold`), Temporal 배선(§9.9), 토큰 로깅(`LLMUsage`), 재처리 경로(§11.2)까지 전부 코드화되어 운영 중.
@@ -413,7 +414,7 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
   2. **일회성 잡얼굴 → 재배정 대상 비우기(미배정)**: human FaceIdentity(appearance=NULL) = "인물 아님/미배정" 판단. ⚠️ human 레이어 동결 — 이후 자동 재매칭 안 됨(중요해지면 수동 재배정).
   3. **얼굴 오탐 → is_used=false** (§18.8-1c).
 - **미배정 얼굴 UI**: 캐릭터 상세에 미확인/확인됨/이동됨과 별개의 **"미배정" 섹션**(2026-07-12 신설 — service `human_unassigned` 필드 + webtoonmoa 섹션, 커밋 `8d893d4`/`21d1422`). 주의: 마스터 '미배정' 목록(WebtoonUnassignedFaces)은 여전히 "누구에게도 배정된 적 없음" 기준이라 human-미배정 얼굴은 안 나옴(구 캐릭터 상세의 미배정 섹션에서 보임) — 통합은 필요 시 후속.
-- **LLM 가동 중 수동 병합/이동 가능 여부 (2026-07-13 정리)**: 시스템은 안 깨진다(human 동결·soft-delete FK·apply valid_ids 스킵·수락 API의 소멸 제안 skip). 단 마찰 3종 — ①apply가 그 에피소드 pending 제안을 delete-reinsert하므로 보던 제안/심판 배지가 사라질 수 있음(수락 no-op) ②resolve 진행 중 병합하면 해당 회차 apply가 옛 cid 스냅샷 기준이라 일부 커밋 스킵/구식 — 자연 치유 없음, 그 회차 재해소 필요(§11.4 "그 사이 resolve가 돌지 않게" 원칙과 동일) ③병합 수락→profile 재도출, face_reassign 수락→reresolve(회차당 ~1.5h) 자동 훅이 웹툰 락을 놓고 체인과 경쟁해 진행이 느려짐. **권장: 큰 수술은 체인 idle 때 몰아서, 급한 정정은 "그 회차 나중에 재해소" 전제로만.**
+- **LLM 가동 중 수동 병합/이동 가능 여부 (2026-07-13 정리)**: 시스템은 안 깨진다(human 동결·soft-delete FK·apply valid_ids 스킵·수락 API의 소멸 제안 skip). 단 마찰 3종 — ①apply가 그 에피소드 pending 제안을 delete-reinsert하므로 보던 제안/심판 배지가 사라질 수 있음(수락 no-op) ②resolve 진행 중 병합하면 해당 회차 apply가 옛 cid 스냅샷 기준이라 일부 커밋 스킵/구식 — 자연 치유 없음, 그 회차 재해소 필요(§11.4 "그 사이 resolve가 돌지 않게" 원칙과 동일) ③병합 수락→profile 재도출, face_reassign 수락→reresolve 자동 훅이 웹툰 락을 놓고 체인과 경쟁해 진행이 느려짐 — **2026-07-14 완화**: 자동 훅 reresolve는 텍스트 전용(~25~35분/회차, §20.3 개정), 정리 패스 수락분은 웹툰 단위 배치로 중복 제거(§20.9), 락 대기열에서 체인이 우선(§9.9 개정)이라 신규 회차는 밀리지 않는다. **권장: 큰 수술은 체인 idle 때 몰아서, 급한 정정은 "그 회차 나중에 재해소" 전제로만.**
 
 ---
 
@@ -488,6 +489,7 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 | 날짜 | 결정 | 비고 |
 |------|------|------|
+| 2026-07-14 | **regen 증폭 구조 개선 5종 (16h 백로그 실사고 대응, 두 레포 구현 — 미배포)** — 계기: 07-13 정리 패스 수락 9건 → 캐릭터별 regen 8개 → 같은 회차 2~4회 중복 재해소(rerun_extract=True ~1.5h/회차) × 웹툰 직렬화 락 = 16시간, 신규 ep7/ep8 밀림 + 재해소가 만든 pending 33건을 다음 심판이 또 수락하는 자가 증폭 루프 노출. ①**배치 regen**(§20.9): 심판 수락 훅을 hook_collector로 모아 캐릭터별 coalesce → `RegenerateBatchWorkflow` 1개가 등장 에피소드 **합집합을 1번씩만** 재해소 ②**자동 훅 reresolve 텍스트 전용화**(§20.3 개정): `_invalidate_llm_speakers`(연루 캐릭터[from+to] 옛 llm 화자 에피소드 스코프 리셋)가 hint 재주입을 대체 — rerun_extract=True는 수동 버튼/admin 깊은 모드로만(§20.5 실측 근거: True 추가 이득 ~5% marginal) ③**수렴 가드**(§22.6): regen 산출 run에 stats.origin='regen' 마킹, 심판이 그 pending 자동판정 제외(루프 사이클 1 차단) ④**락 우선순위**(§9.9 개정): 정규 체인 > regen/정리, 같은 순위 FIFO(`_WebtoonLock`) ⑤**Stage R 화자 차분 계약**(§9.5 재개정): 생략=spk_cid 승인(승격이 정식 경로) — completion 26k~65k tok·65,536 캡 도달·콜당 20~37분 해소. 합산 효과 추정: 동일 시나리오 16h→~2h. 검증: smoke_test(배치·깊은 모드·no-op) + 락 단위테스트(우선순위/FIFO/취소) 통과. ⚠️ 배포 시 in-flight regen 워크플로 Terminate 필요(§20.9) | §9.5, §9.6, §9.9, §11.4, §17.4, §20.3, §20.9, §22.3, §22.6 |
 | 2026-07-13 | **재실행 품질 조사 + CCIP 재실측 + 정리 패스 첫 실전 (2차)** — ①품질 저하 신고('봉방' 요약·초삼 미검출) 조사: 프롬프트/모델 무변경 확인, 원인=OCR 파편 '봉방'의 vision 1콜 오판이 로스터→prior로 증폭(§18.8-8 가드 백로그화) + 재실행이 ep2 시점의 중간 상태였던 것 ②시뮬 재실측(687얼굴): **0.12×topk3 유지 확정, threshold 하향은 파편만 증가 — wipe 불필요**. 잔여 혼합의 실체=feature 판별력 한계(천마)·이름 바인딩 오류(운암)·외형 모드 파편(청명) → human 몫(§18.5 재검증) ③정리 패스 첫 실전 E2E 성공(run 697: 판정 275·자동병합 1·기각 30, mixed 가드 25 차단, §22.5 관찰 완료) ④웹툰 락 실전 검증(심판↔step3a 직렬화, 락 대기 2h 타임아웃 재시도는 무해 — §9.9) ⑤LLM 가동 중 수동 병합/이동 가이드(§11.4) | §9.9, §11.4, §18.5, §18.8, §22.5 |
 | 2026-07-13 | **PRD-코드 전수 감사 후속 3건** — ①STEP3 동시성 공식화: 동시성 2 + **webtoon_id별 프로세스 내 락**(`_webtoon_serialized`, 같은 웹툰 직렬/다른 웹툰끼리만 병렬 — 심판↔apply sid 경합·동명 승격 TOCTOU·run supersede 상호덮기 차단, replicas=1 전제) ②**승격 안전망 범위 정정**: R이 명시 판정한 블록(null/무효 id/저신뢰)은 provisional 승격 제외 — R의 전역 맥락 부정 판정을 컷 단독 추정이 되덮던 결함 수정(§9.6) ③**step3c run 좀비 수정**: attempt 단위 failed 전이 없이 재시도 소진 시 워크플로가 `mark_resolve_run_failed`(running-가드)로 닫음(§17.6). `LLM_MAX_CONCURRENCY` 운영 10 확인(R4' 종결) | §9.6, §9.9, §17.6 |
 | 2026-07-10 | **재도출 프롬프트·스키마 확정(§20.6~20.7)** — ①프롬프트 v3 확정: role=항상적 정체(회차사건 금지), **progression 신규 필드**(변천사 `[{when,change}]` 자유형 — 판타지=스탯/드라마=관계·심경, 두 장르 실측), 장르 addendum 합성(스키마 포크 X, `webtoon.genre` 버킷), 교차인물 혼동 가드 ②모델=DB glm-5.2+self-FK 통일(모델차 아니라 프롬프트차 실증: v2로 qwen=glm급, v3로 glm 최상) ③**캡 제거 필수**(`_commit_profiles` 8/12 슬라이딩윈도우=지식폐기, 질문봇 no-discard·§17.1 "재생성≠휘발"). ④구현순서 §20.7(스키마→재도출워크플로→service훅→webtoonmoa). 구현 미착수 | §20.6~20.7 |
@@ -592,7 +594,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 | Stage | 콜 | 입력 | 출력 |
 |---|---|---|---|
 | **V** 컷 비전 | 컷당 1 | 오버레이 1장 + OCR + identified_faces(confirmed 포함) | 현행 Pass-1 유지(v3.6 수정 승계: provisional 화자 영속, 1:1, 한국어) |
-| **R** 정체·화자 | 에피소드당 1 | V 트랜스크립트 + 도감 prior(profile) + confirmed 앵커 | characters(승격 제안 포함), **전수 화자 테이블**, name/merge/face_reassign/label_conflict → suggestion |
+| **R** 정체·화자 | 에피소드당 1 | V 트랜스크립트 + 도감 prior(profile) + confirmed 앵커 | characters(승격 제안 포함), **화자 차분 테이블**(2026-07-14 §9.5 — 생략=spk_cid 승인, 승격이 확정), name/merge/face_reassign/label_conflict → suggestion |
 | **N** 서사 | 에피소드당 1 | **R로 정정된 트랜스크립트**(화자 확정 상태) | beats / threads / deceptions / episode{summary, **teaser**, appeal_point, cliffhanger} / profile delta |
 | apply | 0 (결정론) | R+N 산출 | 커밋(human 동결), suggestion 적재, profile llm 행 병합 |
 | **A** 아크 종합 | 주기적(매 N화 또는 아크 경계) | 해당 구간 episode_report들 | `story_arc` — 웹툰 전체 줄거리는 아크 요약의 연결(1~30 fold 나열식 늘어짐의 근본 해법) |
@@ -770,15 +772,17 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 - **대사는 얼굴이 아니라 캐릭터에 묶인다**: `analysis_text_annotation.speaker_id`(→character)만 있고 detection 링크 없음. 화자는 Stage R이 "이 컷에 누가 있나(얼굴 정체성)"를 보고 결정.
 - 귀결: **얼굴만 옮기면 대사(speaker_id)는 따라오지 않는다.** 섞였던 인물의 대사가 옛 화자로 잔존 → 화자 재귀속은 **Stage R 재실행(re-resolve)** 으로만 된다. 얼굴 정리 후 프로필-only 재생성만 하면 옛 화자귀속을 그대로 읽어 **재오염**.
 
-### 20.3 두 모드
+### 20.3 두 모드 (2026-07-14 개정 — 자동 훅 reresolve는 텍스트 전용이 기본)
 
 | 액션 | 모드 | 이유 |
 |---|---|---|
 | **병합**(동일인 합침) | **profile** (경량 1콜) | 대사 합집합이 전부 정당 → 화자 재해소 불필요 |
-| **얼굴 이동/섞임 풀기** | **reresolve** (에피소드 재실행, `rerun_extract=True`) | 교정 얼굴 기준으로 화자 재귀속 필요 |
+| **얼굴 이동/섞임 풀기 — 자동 훅**(제안 수락) | **reresolve** (`rerun_extract=False` + **옛 화자 무효화**) | 교정 얼굴 기준 화자 재귀속 — 연루 캐릭터를 아는 경로라 무효화로 충분(회차당 ~25~35분, True 대비 ~3배 절감) |
+| **얼굴 이동/섞임 풀기 — 수동 버튼/admin** | **reresolve** (`rerun_extract=True` 깊은 모드) | 대량 수동 정리 후라 연루 캐릭터 미상(무효화 대상 특정 불가) → Pass-1부터 재실행(~1.5h/회차) |
 
-- **`rerun_extract=True` 필요 근거(코드 확인)**: `_load_faces`는 현재 face_identity(human>step2)를 fresh 읽으므로 `rerun_extract=False`(텍스트 전용)도 얼굴 자체는 반영하나, **`_load_provisional_blocks`가 옛 speaker_id를 hint(`spk_cid`)로 재주입**한다 → 섞임 화자가 되살아날 수 있음. 비전 재실행이 provisional을 교정 얼굴 기준으로 새로 산출해야 깨끗(기존 `reresolve_episode` docstring과 일치).
-- 재사용 자산: `step3.reresolve_episode(rerun_extract=)`, CLI `python -m src.tools.reresolve <src> <title> <no|stale> [--rerun-extract]` 이미 존재.
+- **(구) `rerun_extract=True` 필요 근거였던 것(코드 확인)**: `_load_faces`는 현재 face_identity(human>step2)를 fresh 읽으므로 텍스트 전용도 얼굴 자체는 반영하나, **`_load_provisional_blocks`가 옛 speaker_id를 hint(`spk_cid`)로 재주입** + §9.5 diff 계약의 생략=승인 경로로 옛 resolved 값이 잔존 → 섞임 화자가 되살아날 수 있었다.
+- **(2026-07-14 개정) 무효화가 비전 재실행을 대체**: `step3._invalidate_llm_speakers` — 재해소 전에 **연루 캐릭터(얼굴을 잃은 쪽+얻은 쪽)에 귀속된 llm 화자를 에피소드 스코프에서 NULL/unresolved로 리셋**(human 동결). hint 재주입·생략=승인 둘 다 원천 차단되고, R이 fresh 얼굴 근거로 재판정한다. "잃은 쪽"은 face_reassign 수락 시점(FaceIdentity 덮기 전)에만 알 수 있어 service 수락 경로가 `invalidate_character_ids=[from, to]`를 훅에 동반한다. §20.5 실측(True의 추가 이득 ~5% marginal, False가 un-mixing 100%)이 이 개정의 근거 — "비용 무제한이면 True 정석"은 회차 1개 전제였고, 훅이 전 회차×중복으로 곱해지는 순간(2026-07-13 16h 실사고) 성립하지 않는다.
+- 재사용 자산: `step3.reresolve_episode(rerun_extract=, invalidate_speaker_character_ids=, run_origin=)`, CLI `python -m src.tools.reresolve <src> <title> <no|stale> [--rerun-extract]`.
 
 ### 20.4 기능화 계획 (Temporal, 프론트 버튼 → celery — 2026-07-10 구현 완료, §20.7)
 
@@ -840,7 +844,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 ### 20.7 구현 내역 (2026-07-10 구현 완료 — 세 레포)
 
 1. **service 스키마**: `CharacterProfile.progression` JSONField(마이그레이션 0028, **`db_default=[]` 유지** — data-pipeline raw INSERT가 컬럼을 몰라도 안 깨지게/배포 순서 무관) + `AnalysisRunKind.PROFILE`/`LLMStage.PROFILE`(0029). 서빙 `merge_character_profile`(human 우선 병합)에 progression 포함, human patch allowed에도 추가.
-2. **data-pipeline 재도출**: 신규 **`src/core/regen.py`** — `regenerate_character_profile(character_id, absorbed_character_ids=)`: 근거수집(유효 대사 by speaker[human>llm] + 장면 by 현재 FaceIdentity[human>step2] action_summary+narration/system + prior 조각[본인 활성 + 흡수 soft-delete분]) → genre 버킷 addendum 합성(v3 프롬프트) → `resolve_llm_model(TEXT)` 1콜 → llm 행 **무캡 replace** upsert(progression 포함). usage stage='profile'. `_commit_profiles` 캡(8/12) **제거**. Temporal `RegenerateCharacterWorkflow(RegenInput{character_id, mode, absorbed_character_ids})`: profile=재도출 1콜 / reresolve=등장 에피소드(얼굴∪화자) 전부 `reresolve_episode(rerun_extract=True)` 순차 **후 프로필 재도출로 마무리**(union 재봉합은 오염 제거 불가 — §20.5). 무거운 액티비티는 STEP3_QUEUE(동시성 2 + 웹툰 단위 락 — §9.9 2026-07-13 개정). 진행표시 정본 = **umbrella run(kind=profile, episode NULL, stats.character_id/mode/episodes_total/episodes_done)** — supersede는 같은 character_id만. smoke_test.py에 오케스트레이션 검증 포함(통과).
+2. **data-pipeline 재도출**: 신규 **`src/core/regen.py`** — `regenerate_character_profile(character_id, absorbed_character_ids=)`: 근거수집(유효 대사 by speaker[human>llm] + 장면 by 현재 FaceIdentity[human>step2] action_summary+narration/system + prior 조각[본인 활성 + 흡수 soft-delete분]) → genre 버킷 addendum 합성(v3 프롬프트) → `resolve_llm_model(TEXT)` 1콜 → llm 행 **무캡 replace** upsert(progression 포함). usage stage='profile'. `_commit_profiles` 캡(8/12) **제거**. Temporal `RegenerateCharacterWorkflow(RegenInput{character_id, mode, absorbed_character_ids})`: profile=재도출 1콜 / reresolve=등장 에피소드(얼굴∪화자) 전부 `reresolve_episode(rerun_extract=True)` 순차 **후 프로필 재도출로 마무리**(union 재봉합은 오염 제거 불가 — §20.5). *(2026-07-14 개정: RegenInput에 rerun_extract/invalidate_character_ids 추가 — 자동 훅은 False+무효화, §20.3 개정·§20.9 배치 참조.)* 무거운 액티비티는 STEP3_QUEUE(동시성 2 + 웹툰 단위 락 — §9.9 2026-07-13 개정). 진행표시 정본 = **umbrella run(kind=profile, episode NULL, stats.character_id/mode/episodes_total/episodes_done)** — supersede는 같은 character_id만. smoke_test.py에 오케스트레이션 검증 포함(통과).
 3. **service 트리거/훅/API**: `send_regenerate_trigger`(temporal.py, workflow_id=`regen_char_{id}_{mode}` 멱등) + celery `trigger_character_regenerate`(재시도 백오프) + 자동 훅(`transaction.on_commit`): 병합 3경로(수동 merge API·merge 제안 수락·name 수락=동명 병합) → mode=profile(+흡수 id), **face_reassign 제안 수락** → mode=reresolve. 프론트 API `POST /character/{pk}/regenerate/`(202) + `GET /webtoon/{s}/{t}/regen-status/`(kind=profile run 최근 30건) + admin 액션 2종.
    - **결정**: 수동 얼굴 이동(FaceRecordReassign/BulkReassign)은 자동 enqueue **안 함** — 라벨링 세션에서 이동마다 수 시간짜리 재해소가 폭주하는 것 방지. 얼굴 정리 후 프론트 버튼("얼굴 정리 반영 재해소")이 의도된 트리거.
 4. **webtoonmoa**: 도감 버튼 2종("프로필 재생성"/"얼굴 정리 반영 재해소"+confirm) + 진행 배지(재해소 중 n/m화, 5초 폴링 — running 있을 때만) + 도감 **변천사(progression) 타임라인** 렌더.
@@ -859,6 +863,32 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
   작업 전 확인, superseded면 워크플로 **자기 조기 종료**(좀비의 큐 점유 원천 차단).
 - **운영 노트**: 수정 배포 전의 기존 좀비는 Temporal UI에서 수동 Terminate. umbrella run이
   running이어도 실제로는 큐 대기일 수 있음(진행표시 ≠ 실행 중 — 대기/실행 구분 표시는 후속 여지).
+
+### 20.9 웹툰 단위 배치 재분석 (2026-07-14 — 정리 패스 수락 실행의 자동 훅 전용)
+
+> **계기(실사고)**: 2026-07-13 저녁 정리 패스가 face_reassign 9건·merge 2건·name 5건을 수락 →
+> §20.4 자동 훅이 캐릭터별 개별 regen 8개를 큐잉(reresolve 3: 청명 포함) → 캐릭터별로 등장
+> 에피소드를 각자 순회하니 **겹치는 회차가 2~4회 중복 재해소**(ep6 4회·ep5 3회, vision 16 +
+> resolve 15 run) × 회차당 `rerun_extract=True` ~1.5h × 웹툰 직렬화 락 = **16시간 백로그**,
+> 신규 ep7/ep8이 그 뒤로 밀림.
+
+- **구조**: `execute_adjudication`(service)이 수락 건별 훅을 즉시 큐잉하지 않고
+  `hook_collector`로 모아 **캐릭터별 coalesce**(reresolve ⊃ profile — 재해소가 프로필 재도출로
+  끝나므로 흡수; absorbed/invalidate는 union) 후 **`RegenerateBatchWorkflow` 1개**를 발화
+  (celery `trigger_webtoon_regenerate_batch` → `send_regenerate_batch_trigger`,
+  workflow_id=`regen_batch_w{webtoon_id}_{consolidate run id}` — 판정 1회당 1배치).
+- **배치 동작**: `regen_batch_begin`(캐릭터별 umbrella run 생성 — 프론트 regen-status 계약
+  유지, reresolve run들의 episodes_total=합집합 크기) → reresolve 대상들의 **등장 에피소드
+  합집합을 회차순으로 1번씩만** `reresolve_episode(rerun_extract=False,
+  invalidate_speaker_character_ids=union, run_origin='regen')` → 항목별 `regen_profile`
+  (기존 액티비티 재사용, run_is_live로 supersede 자체 스킵).
+- **개별 워크플로(§20.4)는 존치** — 뷰 단건 수락/수동 버튼/admin 경로. 단건 수락도
+  텍스트 전용(invalidate 동반), 수동 버튼·admin만 깊은 모드(§20.3 개정 표).
+- **효과**: 같은 사고 시나리오 기준 중복 제거(~3×) × vision 생략(~3×) ≈ **16h → 2h 안팎**.
+  + 락 우선순위(§9.9 개정)로 신규 회차는 그마저도 기다리지 않는다.
+- **배포 주의**: `RegenerateCharacterWorkflow`의 액티비티 인자가 바뀌어(6개) **in-flight
+  regen 워크플로는 배포 시 replay 비결정성으로 죽을 수 있음** — 배포 전 Temporal UI에서
+  진행 중 regen/consolidate 워크플로 Terminate 권장(§20.8 운영 노트와 동일 절차).
 
 ---
 
@@ -902,7 +932,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 - **트리거**: 에피소드 번호 모듈로(%5)가 아니라 **"마지막 정리 run 이후 succeeded resolve ≥5"** — §17.1대로 컬럼 없이 `analysis_run`에서 도출(정리 패스 자체를 umbrella run으로 남김, §20.7 패턴). 예약을 1개씩 쪼개든 30개 묶든 카운트가 원장에 누적되므로 동작 동일. 잔여 <5 방치분은 **온디맨드 버튼**(웹툰 단위, §18.8-6 구상과 같은 자리)으로.
 - **훅 위치**: `EpisodeChainWorkflow` 회차 진행 지점. 무거운 실행은 STEP3_QUEUE — 같은 웹툰과는 웹툰 단위 락으로 직렬화(§9.9 2026-07-13 개정: 심판이 apply의 pending suggestion delete-reinsert와 겹치면 표결 중이던 sid가 소멸하므로 직렬화 필수). 패스는 멱등(같은 상태 재실행=no-op).
-- **패스 내용**: ①제안 판정(§22.4) ②수락분 실행 — **service 기존 수락 경로 경유**(§19 병합 시맨틱·name수락=병합·face_reassign수락, §20 자동 훅[병합→profile 재도출, 얼굴이동→reresolve]이 공짜로 따라옴) ③human 잔여는 우선순위 정렬된 검토 큐로.
+- **패스 내용**: ①제안 판정(§22.4 — 단 regen 산출 pending은 자동판정 제외, §22.6) ②수락분 실행 — **service 기존 수락 경로 경유**(§19 병합 시맨틱·name수락=병합·face_reassign수락). §20 자동 훅은 건별 큐잉이 아니라 **hook_collector로 모아 웹툰 단위 배치 1개**(§20.9, 2026-07-14 — 중복 재해소 제거)로 발화 ③human 잔여는 우선순위 정렬된 검토 큐로.
 - 연계: CCIP 경합쌍(무명↔무명)은 이 패스가 아니라 §18.8-6 "이름 없는 얼굴 CCIP 재배치"의 영역. 혼합 클러스터는 얼굴 단위 수술이라 human 큐 상위 정렬 대상.
 
 ### 22.4 결정 C — 제안검토 AI (3단 구조) + 실측 캘리브레이션 ⭐
@@ -944,3 +974,21 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 - [x] **재실행 관찰(화산귀환) — 2026-07-13 전 항목 확인**: (a) ✅ P7+CCIP v2 효과 — ep6 시점 687얼굴→클러스터 83(v1 시절 876얼굴→773 대비 대폭 개선), llm 제외는 extra 클러스터 8건뿐(named 제외 0). (b) ✅ ep5 resolve(5개째) 직후 `consolidate_webtoon_17` 자동 발화 — run 697, 30도시에 ~3h(judge 콜별 usage 적재 확인). (c) ✅ E2E — 자동수락 1건(무명 2707→청명) celery 실행→실병합(soft-delete)→§20 프로필 재도출 훅(run 700) + 자동기각 30건, run 697 stats.execution에 결과 기록·errors 0. **자동 수확이 적은 이유 = 심판 mixed 가드(25 클러스터 혼합 판정)로 차단 — 실체는 §18.5 v2 재검증 참조(threshold 문제 아님, 천마=feature 한계/운암=이름 바인딩 오류/청명=모드 파편 → human 몫). 방향: wipe 없이 ep73(1부 종료)까지 완주 후 human 큐레이션(§18.5 재검증 결론 — 7~73 체인 kick은 사용자 실행).**
 - [ ] 후속 백로그: suggestions **서버측 judge 정렬**(JSONB order_by — 현재 배지만, §22.4 주의) / 마스터 '미배정' 목록에 human-미배정 얼굴 포함 여부(§11.4 주의) / §18.8-6 CCIP 재배치(경합쌍 해소) / Stage A(아크 종합)는 여전히 미착수.
 - 참고: 파이프라인 신규 테스트(reconcile 가드 9·워크플로 오케스트레이션·P7 동기화 8케이스)는 `tests/`가 gitignore라 로컬 보관(기존 테스트 전부와 동일 관례) — 커밋엔 미포함.
+
+### 22.6 수렴 가드 — regen 산출 제안은 자동판정 제외 (2026-07-14)
+
+> **계기**: 정리 패스는 자가 증폭 루프가 열려 있었다 — 심판이 face_reassign을 수락 → §20 자동
+> 훅이 reresolve → 재해소 apply가 **새 pending suggestion을 재생성** → 다음 심판이 또 수락 →
+> 또 reresolve… (2026-07-13~14 화산귀환에서 사이클 1이 실제 관측: 재해소들이 pending 33건을
+> 새로 만들었고 다음 consolidate가 대기 중이었다). 2026-07-10의 "수동 얼굴 이동은 자동 enqueue
+> 안 함(폭주 방지)" 결정과 같은 우려를 **정리 패스 경로가 대량으로 재도입**한 셈.
+
+- **가드**: regen 재해소가 만드는 vision/resolve run에 `stats.origin='regen'` 마킹
+  (`reresolve_episode(run_origin=)` → `runs.start_run(stats=)`, `finish_run`은 merge로 보존).
+  심판(`adjudicate_webtoon`)은 **run의 origin이 regen인 pending을 자동판정에서 제외**
+  (stats.regen_held로 카운트) — 이런 제안은 human 검토 큐로만 흐른다. 루프가 사이클 1에서 끊긴다.
+- **자격 회복**: 정규 체인 resolve가 같은 에피소드를 다시 돌면 apply의 delete-reinsert가
+  제안을 새 run(origin 없음)으로 재생성하므로 그때 자동판정 자격을 회복한다 — 영구 배제가 아니라
+  "regen이 만든 신호는 한 박자 쉬고 사람이 먼저 본다".
+- 쿨다운(웹툰당 정리 패스 최소 간격) 방식과 비교해 이쪽을 채택 — 트리거 빈도를 건드리지 않고
+  증폭의 원인(regen 산출의 즉시 재소비)만 정확히 차단한다.

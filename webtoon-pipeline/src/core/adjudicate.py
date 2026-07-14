@@ -99,13 +99,20 @@ def _load_characters(webtoon_id: int) -> dict[int, dict]:
 
 
 def _load_suggestions(webtoon_id: int) -> list[dict]:
-    """pending(판정 대상) + rejected(human 블록리스트 원료) 전부."""
+    """pending(판정 대상) + rejected(human 블록리스트 원료) 전부.
+
+    regen_origin: 제안을 만든 resolve run이 regen 재해소(stats.origin='regen')였는지 —
+    수렴 가드(§22.6)가 이런 pending을 자동판정에서 제외한다(수락→reresolve→새 제안→수락…
+    자가 증폭 루프 차단; 이런 제안은 human 검토 큐로만 흐른다).
+    """
     with db_cursor() as cur:
         cur.execute(
             """
-            SELECT s.id, s.type, s.status, s.character_id, e.no, s.confidence, s.payload
+            SELECT s.id, s.type, s.status, s.character_id, e.no, s.confidence, s.payload,
+                   COALESCE(r.stats->>'origin', '') = 'regen' AS regen_origin
             FROM analysis_suggestion s
             LEFT JOIN webtoon_episode e ON e.id = s.episode_id
+            LEFT JOIN analysis_run r ON r.id = s.run_id
             WHERE s.webtoon_id = %s AND s.deleted_at IS NULL
               AND s.status IN ('pending', 'rejected')
             """,
@@ -113,7 +120,8 @@ def _load_suggestions(webtoon_id: int) -> list[dict]:
         )
         return [
             {"id": r[0], "type": r[1], "status": r[2], "cid": r[3], "ep": r[4],
-             "conf": float(r[5]) if r[5] is not None else None, "payload": r[6] or {}}
+             "conf": float(r[5]) if r[5] is not None else None, "payload": r[6] or {},
+             "regen_origin": bool(r[7])}
             for r in cur.fetchall()
         ]
 
@@ -285,7 +293,16 @@ def adjudicate_webtoon(
 
     chars = _load_characters(webtoon_id)
     all_suggs = _load_suggestions(webtoon_id)
-    pending = [s for s in all_suggs if s["status"] == "pending"]
+    # 수렴 가드(§22.6): regen 재해소가 만든 pending은 자동판정 제외(human 검토로만) —
+    # 심판 수락→자동 reresolve→새 제안→다시 수락…의 자가 증폭 루프를 사이클 1에서 끊는다
+    # (2026-07-13 화산귀환 16h 백로그 재발 방지). 정규 체인 resolve가 같은 에피소드를 다시
+    # 돌면 제안이 새 run으로 재생성되므로 그때 자동판정 자격을 회복한다.
+    pending_all = [s for s in all_suggs if s["status"] == "pending"]
+    pending = [s for s in pending_all if not s.get("regen_origin")]
+    regen_held = len(pending_all) - len(pending)
+    if regen_held:
+        logger.info("[adjudicate] w%s — regen-origin pending %d건 자동판정 보류(수렴 가드, human 검토로)",
+                    webtoon_id, regen_held)
     by_name: dict[str, int] = {}
     for c in chars.values():
         if _is_named(chars, c["id"]):
@@ -303,7 +320,8 @@ def adjudicate_webtoon(
 
     if not pending:
         return {"accept_suggestion_ids": [], "reject_suggestion_ids": [],
-                "stats": {"pending": 0, "dossiers": 0}, "error": None}
+                "stats": {"pending": 0, "dossiers": 0, "regen_held": regen_held},
+                "error": None}
 
     groups = _build_groups(chars, pending)
 
@@ -376,6 +394,7 @@ def adjudicate_webtoon(
         ],
         "mixed_clusters": sorted(mixed_flag),
         "call_errors": call_errors,
+        "regen_held": regen_held,
     }
     logger.info("[adjudicate] w%s 완료 — %s", webtoon_id, json.dumps(stats, ensure_ascii=False)[:400])
     return {"accept_suggestion_ids": decisions["accept_suggestion_ids"],

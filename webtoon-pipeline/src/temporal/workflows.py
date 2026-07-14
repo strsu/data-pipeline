@@ -28,7 +28,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import (
         ORCH_QUEUE, STEP1, STEP1_QUEUE, STEP2, STEP2_QUEUE, STEP3, STEP3_QUEUE,
-        ChainInput, ConsolidateInput, EpisodeInput, RegenInput,
+        ChainInput, ConsolidateInput, EpisodeInput, RegenBatchInput, RegenInput,
     )
 
 _RETRY = RetryPolicy(
@@ -222,8 +222,9 @@ class RegenerateCharacterWorkflow:
     """캐릭터 재분석(§20) — mode=profile(경량 1콜) / mode=reresolve(등장 에피소드 재해소).
 
     - profile  : 병합 후. 근거(귀속 대사+장면+흡수분 조각) 전량 주입 LLM 1콜 → 프로필 무캡 replace.
-    - reresolve: 얼굴 이동/섞임 풀기 후. 등장 에피소드 전부 reresolve_episode(rerun_extract=True)
-                 순차(§20.3 — 얼굴 교정 반영엔 비전 재실행 필수) 후 프로필 재도출로 마무리.
+    - reresolve: 얼굴 이동/섞임 풀기 후. 등장 에피소드 전부 순차 재해소 후 프로필 재도출로 마무리.
+                 기본은 텍스트 전용(rerun_extract=False + 옛 화자 무효화 — §20.3 개정, ~3배 절감).
+                 inp.rerun_extract=True(수동 버튼 깊은 모드)면 비전까지 재실행.
     무거운 액티비티는 STEP3_QUEUE(동시성 2)로 보내 정규 step3/LLM 작업과 함께 처리한다.
     진행표시는 umbrella run(kind=profile, stats.character_id/mode/episodes_done)이 정본.
     """
@@ -247,9 +248,10 @@ class RegenerateCharacterWorkflow:
                 )
                 out = await workflow.execute_activity(
                     activities.regen_reresolve_episode,
-                    args=[ep["episode_id"], meta["webtoon_id"], meta["run_id"], i + 1],
+                    args=[ep["episode_id"], meta["webtoon_id"], meta["run_id"], i + 1,
+                          bool(inp.rerun_extract), inp.invalidate_character_ids or []],
                     task_queue=STEP3_QUEUE,
-                    # rerun_extract=True 실측 회차당 ~1.5h(§20.5) — 넉넉히.
+                    # rerun_extract=True 실측 회차당 ~1.5h(§20.5), False는 ~25~35분 — 넉넉히.
                     start_to_close_timeout=timedelta(hours=4),
                     heartbeat_timeout=timedelta(minutes=10),
                     retry_policy=_REGEN_RETRY,
@@ -269,6 +271,66 @@ class RegenerateCharacterWorkflow:
             heartbeat_timeout=timedelta(minutes=10),
             retry_policy=_REGEN_RETRY,
         )
+
+
+@workflow.defn
+class RegenerateBatchWorkflow:
+    """웹툰 단위 배치 재분석(§20.9, 2026-07-14) — 정리 패스 수락 실행의 자동 훅 전용.
+
+    캐릭터별 개별 RegenerateCharacterWorkflow 대신: reresolve 대상 캐릭터들의 등장 에피소드
+    **합집합을 1번씩만** 텍스트 전용 재해소(옛 화자 무효화 동반)한 뒤, 항목별 프로필
+    재도출(regen_profile 재사용)로 마무리한다. 2026-07-13 화산귀환 실사고(수락 9건 →
+    개별 regen 8개 → 같은 회차 2~4회 중복 재해소 × 회차당 vision ~1.5h = 16h 백로그)의
+    구조적 해소: 중복 제거(~3×)와 vision 생략(~3×)이 곱으로 든다.
+    진행표시는 기존 계약 그대로 캐릭터별 umbrella run(kind=profile).
+    """
+
+    @workflow.run
+    async def run(self, inp: RegenBatchInput) -> None:
+        meta = await workflow.execute_activity(
+            activities.regen_batch_begin, inp,
+            task_queue=ORCH_QUEUE,
+            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
+        if meta is None:
+            return  # 유효 항목 없음 — no-op
+
+        episodes = meta.get("episodes") or []
+        items = meta.get("items") or []
+        reresolve_run_ids = [it["run_id"] for it in items if it.get("mode") == "reresolve"]
+        invalidate = meta.get("invalidate_character_ids") or []
+
+        for i, ep in enumerate(episodes):
+            workflow.logger.info(
+                "[regen-batch] webtoon=%s — ep%s 재해소 (%d/%d)",
+                inp.webtoon_id, ep["episode_no"], i + 1, len(episodes),
+            )
+            out = await workflow.execute_activity(
+                activities.regen_batch_reresolve_episode,
+                args=[ep["episode_id"], meta["webtoon_id"], reresolve_run_ids, i + 1, invalidate],
+                task_queue=STEP3_QUEUE,
+                # 텍스트 전용 재해소 실측 ~25~35분/회차 + 락 대기 여유.
+                start_to_close_timeout=timedelta(hours=3),
+                heartbeat_timeout=timedelta(minutes=10),
+                retry_policy=_REGEN_RETRY,
+            )
+            if out and out.get("superseded"):
+                workflow.logger.info("[regen-batch] webtoon=%s runs superseded — 배치 조기 종료",
+                                     inp.webtoon_id)
+                return
+
+        for it in items:
+            # regen_profile이 run_is_live로 항목별 supersede를 자체 스킵한다.
+            await workflow.execute_activity(
+                activities.regen_profile,
+                args=[RegenInput(character_id=it["character_id"], mode=it.get("mode") or "profile",
+                                 absorbed_character_ids=it.get("absorbed_character_ids") or []),
+                      meta["webtoon_id"], it["run_id"]],
+                task_queue=STEP3_QUEUE,
+                start_to_close_timeout=timedelta(hours=1),
+                heartbeat_timeout=timedelta(minutes=10),
+                retry_policy=_REGEN_RETRY,
+            )
 
 
 @workflow.defn

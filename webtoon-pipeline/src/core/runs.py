@@ -36,11 +36,14 @@ def start_run(
     *,
     llm_model_id: Optional[int] = None,
     vision_run_id: Optional[int] = None,
+    stats: Optional[dict] = None,
 ) -> int:
     """새 run(status=running)을 만들고 id를 반환한다.
 
     같은 (episode, kind)의 기존 running 행은 failed(superseded)로 정리한다 — Temporal 재시도가
     새 run을 시작할 때 이전 시도의 고아 행이 running으로 남지 않게(멱등 재시도 안전).
+    stats: 시작 시점 마킹(예: {"origin": "regen"} — 정리 패스 심판의 자동수락 제외 판별,
+    §22.6 수렴 가드). finish_run이 merge라 종료 시에도 보존된다.
     """
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
@@ -61,7 +64,8 @@ def start_run(
             VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, '', %s, %s)
             RETURNING id
             """,
-            (webtoon_id, episode_id, kind, llm_model_id, vision_run_id, now, Json({}), now, now),
+            (webtoon_id, episode_id, kind, llm_model_id, vision_run_id, now, Json(stats or {}),
+             now, now),
         )
         run_id = cur.fetchone()[0]
     logger.info("[runs] start run=%s kind=%s webtoon=%s episode=%s", run_id, kind, webtoon_id, episode_id)
@@ -75,13 +79,18 @@ def finish_run(
     stats: Optional[dict] = None,
     error: str = "",
 ) -> None:
-    """run을 종료 상태로 전이하고 stats/error를 기록한다."""
+    """run을 종료 상태로 전이하고 stats/error를 기록한다.
+
+    stats는 기존 값에 **merge**(`||`)한다 — start_run이 시작 시점에 심은 마킹
+    (예: origin='regen')을 종료 통계가 덮어 지우지 않게. 기존 호출은 전부 시작 stats가
+    빈 dict였으므로 merge == replace(동작 불변).
+    """
     now = datetime.now(timezone.utc)
     with db_cursor() as cur:
         cur.execute(
             """
             UPDATE analysis_run
-            SET status=%s, stats=%s, error=%s, finished_at=%s, updated_at=%s
+            SET status=%s, stats=COALESCE(stats, '{}'::jsonb) || %s, error=%s, finished_at=%s, updated_at=%s
             WHERE id=%s
             """,
             (status, Json(stats or {}), error or "", now, now, run_id),

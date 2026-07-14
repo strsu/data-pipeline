@@ -84,12 +84,38 @@ class RegenInput:
 
     mode:
       - "profile"  : 병합 후 경량 재도출 — 근거 전량 주입 LLM 1콜로 프로필 replace.
-      - "reresolve": 얼굴 이동/섞임 풀기 후 — 등장 에피소드 전부를
-                     reresolve_episode(rerun_extract=True)로 순차 재해소한 뒤,
+      - "reresolve": 얼굴 이동/섞임 풀기 후 — 등장 에피소드 전부를 순차 재해소한 뒤,
                      clean 근거 위에서 프로필 재도출로 마무리.
     absorbed_character_ids: 병합 훅이 넘기는 흡수 캐릭터 id들 — soft-delete된 프로필 조각
     (key_facts 등)을 재도출 근거로 회수한다(§20.4). 수동 트리거면 빈 리스트.
+    rerun_extract: reresolve 모드에서 비전(Stage V)까지 재실행할지. 기본 False —
+        옛 llm 화자 무효화(invalidate_character_ids)로 텍스트 전용 재해소가 안전해졌다
+        (§20.3 개정, ~3배 절감). True는 수동 버튼("얼굴 정리 반영 재해소")의 깊은 모드.
+    invalidate_character_ids: 얼굴 교정에 연루된 캐릭터들(잃은 쪽+얻은 쪽) — 재해소 전에
+        에피소드 스코프 옛 llm 화자를 무효화한다(§20.3 개정). 자동 훅이 채운다.
     """
     character_id: int
     mode: str = "profile"
     absorbed_character_ids: list[int] | None = None
+    rerun_extract: bool = False
+    invalidate_character_ids: list[int] | None = None
+
+
+@dataclass
+class RegenBatchInput:
+    """웹툰 단위 배치 재분석 입력 — RegenerateBatchWorkflow(§20.9, 2026-07-14).
+
+    정리 패스 심판이 수락을 일괄 실행할 때 캐릭터별 개별 워크플로 대신 이것 하나를
+    발화한다: reresolve 대상 캐릭터들의 등장 에피소드 **합집합을 1번씩만** 재해소한 뒤
+    캐릭터별 프로필 재도출로 마무리 — 겹치는 회차의 중복 재해소(2026-07-13 화산귀환
+    16시간 백로그의 주원인)를 제거한다.
+
+    items: [{"character_id", "mode"("profile"|"reresolve"), "absorbed_character_ids",
+             "invalidate_character_ids"}] — 같은 캐릭터는 호출측(service)이 coalesce
+            (reresolve ⊃ profile, absorbed/invalidate는 union).
+    batch_key: workflow_id 유니크 꼬리(보통 consolidate run id) — 배치는 멱등 재발화가
+            아니라 판정 1회당 1배치라 웹툰 단위 멱등 id를 쓰지 않는다.
+    """
+    webtoon_id: int
+    items: list[dict]
+    batch_key: str = ""

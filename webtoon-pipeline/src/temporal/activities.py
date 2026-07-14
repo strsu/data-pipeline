@@ -15,55 +15,123 @@ chromadb/boto3/psycopg2를 끌어오지 않게 해, 오케스트레이션 단위
 """
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 from contextlib import contextmanager
 
 from temporalio import activity
 
-from src.temporal.shared import STEP_RUN_KIND, ChainInput, ConsolidateInput, EpisodeInput, RegenInput
+from src.temporal.shared import (
+    STEP_RUN_KIND, ChainInput, ConsolidateInput, EpisodeInput, RegenBatchInput, RegenInput,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ── 웹툰 단위 직렬화 락 (STEP3_QUEUE 동시성 2 전제) ──────────────────────────
+# ── 웹툰 단위 직렬화 락 (STEP3_QUEUE 동시성 2 전제, 우선순위 인지) ─────────────
 #
 # STEP3_QUEUE는 동시성 2로 **서로 다른 웹툰**의 step3류 작업을 병렬 처리한다. 같은 웹툰을
 # 겹쳐 건드리는 두 작업(정규 체인 step3 ↔ regen reresolve ↔ 정리 패스 심판)은 suggestion
 # delete-reinsert 경합, 동명 승격 TOCTOU, run supersede 상호 덮어쓰기를 일으키므로,
 # 무거운 step3류 액티비티는 진입 시 webtoon_id별 락을 잡아 같은 웹툰을 직렬화한다.
-# 워커가 replicas=1(단일 프로세스)이라 프로세스 내 threading.Lock으로 충분하다 —
+# 워커가 replicas=1(단일 프로세스)이라 프로세스 내 락으로 충분하다 —
 # replicas를 늘리려면 이 락을 pg advisory lock으로 교체해야 한다.
+#
+# 우선순위(2026-07-14, §9.9 개정): 대기열에서 정규 체인(step3a/b/c) > regen/정리 패스.
+# regen 백로그가 길어도(2026-07-13 화산귀환 16h 실사고) 신규 회차 진행이 그 뒤에 통째로
+# 밀리지 않는다 — regen은 소급 정정이라 몇 시간 늦어도 무해. 같은 우선순위끼리는 FIFO.
 #
 # 대기 정책: 락을 못 잡으면 heartbeat를 보내며 블로킹 대기한다(retryable 에러로 슬롯을
 # 반납하면 _REGEN_RETRY(5회)가 긴 점유를 못 넘겨 워크플로가 죽는다). 같은 웹툰 경합 시
 # 슬롯 하나가 일시적으로 대기에 묶이는 건 감수 — 종전 동시성 1 수준으로 강등될 뿐이고,
 # 경합이 없는 평시에는 웹툰 2개가 병렬로 돈다.
 
-_webtoon_locks: dict[int, threading.Lock] = {}
+_PRIO_CHAIN = 0  # 정규 체인 step3a/b/c — 신규 회차 진행(우선)
+_PRIO_MAINT = 1  # regen/consolidate — 소급 정정(양보)
+
+
+class _WebtoonLock:
+    """우선순위 인지 직렬화 락 — 대기자 중 (priority, 도착순) 최소가 다음 획득."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._held = False
+        self._waiters: list[tuple[int, int]] = []  # (priority, seq) min-heap
+        self._seq = 0
+
+    def acquire(self, priority: int, wait_cb=None) -> bool:
+        """락 획득(블로킹). 대기했으면 True, 즉시 획득이면 False.
+
+        wait_cb: 대기 중 ~15초마다 호출(하트비트용). 예외(취소)를 던지면 대기를
+        정리하고 그대로 전파한다.
+        """
+        with self._cond:
+            if not self._held and not self._waiters:
+                self._held = True
+                return False
+            me = (priority, self._seq)
+            self._seq += 1
+            heapq.heappush(self._waiters, me)
+            try:
+                while self._held or self._waiters[0] != me:
+                    self._cond.wait(timeout=15.0)
+                    if wait_cb is not None:
+                        wait_cb()
+                heapq.heappop(self._waiters)
+                self._held = True
+                return True
+            except BaseException:
+                # 취소/예외 — 내 대기 항목을 치우고 다른 대기자를 깨운다(락 유실 방지).
+                self._waiters.remove(me)
+                heapq.heapify(self._waiters)
+                self._cond.notify_all()
+                raise
+
+    def release(self) -> None:
+        with self._cond:
+            self._held = False
+            self._cond.notify_all()
+
+
+_webtoon_locks: dict[int, _WebtoonLock] = {}
 _webtoon_locks_guard = threading.Lock()
 
 
-def _get_webtoon_lock(webtoon_id: int) -> threading.Lock:
+def _get_webtoon_lock(webtoon_id: int) -> _WebtoonLock:
     with _webtoon_locks_guard:
         lock = _webtoon_locks.get(webtoon_id)
         if lock is None:
-            lock = _webtoon_locks[webtoon_id] = threading.Lock()
+            lock = _webtoon_locks[webtoon_id] = _WebtoonLock()
         return lock
+
+
+def _lock_priority(what: str) -> int:
+    """액티비티 종류 → 락 우선순위. 정규 체인(step3a/b/c)만 우선, 나머지(regen/정리)는 양보."""
+    return _PRIO_CHAIN if (what or "").startswith("step3") else _PRIO_MAINT
 
 
 @contextmanager
 def _webtoon_serialized(webtoon_id: int, what: str = ""):
     """같은 웹툰의 step3류 작업을 프로세스 내에서 직렬화한다(위 주석 참조).
 
-    대기 중에는 15초마다 heartbeat를 보내 heartbeat_timeout을 넘기지 않는다.
+    대기 중에는 ~15초마다 heartbeat를 보내 heartbeat_timeout을 넘기지 않는다.
     액티비티가 취소되면 heartbeat가 CancelledError를 던져 대기 스레드도 정리된다.
+    대기열은 우선순위(정규 체인 > regen/정리) + 같은 순위 FIFO.
     """
     lock = _get_webtoon_lock(webtoon_id)
-    if not lock.acquire(blocking=False):
-        logger.info("[webtoon-lock] webtoon=%s 대기 시작 (%s) — 같은 웹툰 작업 진행 중", webtoon_id, what)
-        while not lock.acquire(timeout=15.0):
-            activity.heartbeat(f"webtoon-lock:wait:{what}")
+    priority = _lock_priority(what)
+
+    def _wait_cb() -> None:
+        activity.heartbeat(f"webtoon-lock:wait:{what}")
+
+    with lock._cond:
+        contended = lock._held or bool(lock._waiters)
+    if contended:
+        logger.info("[webtoon-lock] webtoon=%s 대기 시작 (%s, prio=%s) — 같은 웹툰 작업 진행 중",
+                    webtoon_id, what, priority)
+    waited = lock.acquire(priority, wait_cb=_wait_cb)
+    if waited or contended:
         logger.info("[webtoon-lock] webtoon=%s 획득 (%s)", webtoon_id, what)
     try:
         yield
@@ -468,13 +536,18 @@ def regen_begin(inp: RegenInput) -> dict | None:
 
 @activity.defn
 def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
-                            run_id: int, episodes_done: int) -> dict:
-    """등장 에피소드 1개 재해소 — reresolve_episode(rerun_extract=True)(§20.3 두 모드).
+                            run_id: int, episodes_done: int,
+                            rerun_extract: bool = False,
+                            invalidate_character_ids: list[int] | None = None) -> dict:
+    """등장 에피소드 1개 재해소(§20.3 개정, 2026-07-14).
 
-    rerun_extract=True 필수 근거: 텍스트 전용 재해소는 `_load_provisional_blocks`가 옛
-    speaker_id를 hint로 재주입해 섞임 화자가 되살아날 수 있다(§20.3) — 비전 재실행이
-    provisional을 교정 얼굴 기준으로 새로 산출해야 깨끗하다. 에피소드당 자체 vision/resolve
-    run을 만들며(진행도/stale 정본), umbrella run stats.episodes_done도 갱신한다.
+    기본은 **텍스트 전용**(rerun_extract=False) — 옛 llm 화자 무효화
+    (invalidate_character_ids: 얼굴 교정에 연루된 캐릭터들의 화자를 에피소드 스코프에서
+    NULL/unresolved로 리셋)가 hint 재주입 문제를 대체해, 비전 재실행 없이도 섞임 화자가
+    되살아나지 않는다(~3배 절감; §20.5 실측 — True의 추가 이득은 ~5% marginal).
+    rerun_extract=True는 수동 버튼("얼굴 정리 반영 재해소")의 깊은 모드로만 쓴다.
+    에피소드당 자체 (vision/)resolve run을 만들며(진행도/stale 정본, stats.origin='regen'
+    마킹 — §22.6 수렴 가드), umbrella run stats.episodes_done도 갱신한다.
     LLM 콜이 회차당 1시간을 넘을 수 있어 서브스레드 + 주기 하트비트로 감싼다.
     """
     from src.core import regen, step3
@@ -490,10 +563,103 @@ def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
         out = _run_with_heartbeat(
             step3.reresolve_episode,
             args=(webtoon_episode_id,),
-            kwargs=dict(rerun_extract=True, webtoon_id=webtoon_id),
+            kwargs=dict(rerun_extract=rerun_extract, webtoon_id=webtoon_id,
+                        invalidate_speaker_character_ids=invalidate_character_ids or [],
+                        run_origin="regen"),
             detail="regen:reresolve",
         )
         regen.bump_profile_run_progress(run_id, episodes_done)
+    return {"webtoon_episode_id": webtoon_episode_id,
+            "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
+
+
+# ── 웹툰 단위 배치 재분석(§20.9, 2026-07-14) ─────────────────────────────────
+# RegenerateBatchWorkflow가 사용. 정리 패스 심판의 수락 실행이 캐릭터별 개별 워크플로 대신
+# 배치 하나를 발화한다 — reresolve 대상들의 등장 에피소드 **합집합을 1번씩만** 재해소한 뒤
+# 캐릭터별 프로필 재도출(regen_profile 재사용)로 마무리. 겹치는 회차의 중복 재해소 제거.
+
+
+@activity.defn
+def regen_batch_begin(inp: RegenBatchInput) -> dict | None:
+    """배치 대상 해석 + 캐릭터별 umbrella run 시작. 유효 항목이 없으면 None(no-op).
+
+    반환: {"webtoon_id", "episodes": [{"episode_id","episode_no"}...(reresolve 합집합, 회차순)],
+           "items": [{"character_id","mode","absorbed_character_ids","run_id"}...],
+           "invalidate_character_ids": [...(items의 invalidate union)]}.
+    umbrella run은 캐릭터별(kind=profile, stats.character_id/mode)로 만들어 프론트
+    regen-status 표시 계약을 유지한다. reresolve run의 episodes_total은 합집합 크기.
+    """
+    from src.core import regen
+    from src.operators.llm_resolver import TEXT, resolve_llm_model
+
+    valid_items: list[dict] = []
+    invalidate: set[int] = set()
+    episodes_by_id: dict[int, dict] = {}
+    for item in inp.items or []:
+        cid = int(item.get("character_id") or 0)
+        mode = item.get("mode") or "profile"
+        if regen._character_info(cid) is None:
+            logger.warning("[regen-batch] character=%s 없음/삭제됨 — 항목 건너뜀", cid)
+            continue
+        if mode == "reresolve":
+            for ep in regen.character_episode_ids(cid):
+                episodes_by_id[ep["episode_id"]] = ep
+        for i in item.get("invalidate_character_ids") or []:
+            if i:
+                invalidate.add(int(i))
+        valid_items.append({
+            "character_id": cid, "mode": mode,
+            "absorbed_character_ids": [int(i) for i in (item.get("absorbed_character_ids") or []) if i],
+        })
+    if not valid_items:
+        logger.warning("[regen-batch] webtoon=%s 유효 항목 없음 — no-op", inp.webtoon_id)
+        return None
+
+    episodes = sorted(episodes_by_id.values(), key=lambda e: e["episode_no"])
+    ctx = resolve_llm_model(inp.webtoon_id, TEXT)
+    for item in valid_items:
+        item["run_id"] = regen.begin_profile_run(
+            inp.webtoon_id, item["character_id"], item["mode"],
+            llm_model_id=ctx.get("id"),
+            episodes_total=len(episodes) if item["mode"] == "reresolve" else 0,
+        )
+    logger.info(
+        "[regen-batch] webtoon=%s begin — items=%d(reresolve=%d) episodes(합집합)=%d invalidate=%s",
+        inp.webtoon_id, len(valid_items),
+        sum(1 for i in valid_items if i["mode"] == "reresolve"), len(episodes), sorted(invalidate),
+    )
+    return {"webtoon_id": inp.webtoon_id, "episodes": episodes, "items": valid_items,
+            "invalidate_character_ids": sorted(invalidate)}
+
+
+@activity.defn
+def regen_batch_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
+                                  run_ids: list[int], episodes_done: int,
+                                  invalidate_character_ids: list[int] | None = None) -> dict:
+    """배치 재해소 1에피소드 — 텍스트 전용 + 옛 화자 무효화(regen_reresolve_episode와 동일 시맨틱).
+
+    run_ids: 배치의 reresolve umbrella run들 — 전부 superseded면 배치 종료 신호(superseded=True),
+    살아있는 run들만 진행도(episodes_done)를 갱신한다.
+    """
+    from src.core import regen, step3
+
+    with _webtoon_serialized(webtoon_id, "regen:batch"):
+        live = [r for r in (run_ids or []) if regen.run_is_live(r)]
+        if run_ids and not live:
+            logger.info("[regen-batch] runs=%s 전부 superseded — ep%s 재해소 건너뜀(배치 종료 신호)",
+                        run_ids, webtoon_episode_id)
+            return {"superseded": True, "webtoon_episode_id": webtoon_episode_id}
+
+        out = _run_with_heartbeat(
+            step3.reresolve_episode,
+            args=(webtoon_episode_id,),
+            kwargs=dict(rerun_extract=False, webtoon_id=webtoon_id,
+                        invalidate_speaker_character_ids=invalidate_character_ids or [],
+                        run_origin="regen"),
+            detail="regen:batch",
+        )
+        for r in live:
+            regen.bump_profile_run_progress(r, episodes_done)
     return {"webtoon_episode_id": webtoon_episode_id,
             "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
 

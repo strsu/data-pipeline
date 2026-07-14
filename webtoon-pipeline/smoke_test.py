@@ -14,9 +14,11 @@ from temporalio.testing import WorkflowEnvironment
 
 from src.temporal.shared import (
     ORCH_QUEUE, STEP1_QUEUE, STEP2_QUEUE, STEP3_QUEUE,
-    ChainInput, EpisodeInput, RegenInput,
+    ChainInput, EpisodeInput, RegenBatchInput, RegenInput,
 )
-from src.temporal.workflows import EpisodeChainWorkflow, RegenerateCharacterWorkflow
+from src.temporal.workflows import (
+    EpisodeChainWorkflow, RegenerateBatchWorkflow, RegenerateCharacterWorkflow,
+)
 
 # 호출 순서 추적
 calls: list[str] = []
@@ -100,8 +102,11 @@ async def regen_begin(inp: RegenInput):
 
 
 @activity.defn(name="regen_reresolve_episode")
-async def regen_reresolve_episode(episode_id: int, webtoon_id: int, run_id: int, done: int):
-    calls.append(f"regen_reresolve:ep{episode_id}:done{done}")
+async def regen_reresolve_episode(episode_id: int, webtoon_id: int, run_id: int, done: int,
+                                  rerun_extract: bool = False,
+                                  invalidate_character_ids: list[int] | None = None):
+    calls.append(f"regen_reresolve:ep{episode_id}:done{done}:rerun{int(rerun_extract)}"
+                 f":inv{invalidate_character_ids or []}")
     return {"webtoon_episode_id": episode_id, "resolve_error": None, "run_id": 900 + episode_id}
 
 
@@ -111,19 +116,49 @@ async def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int):
     return {"character_id": inp.character_id, "error": None}
 
 
+# ── 웹툰 단위 배치 재분석(§20.9) stub ─────────────────────────────────────────
+
+@activity.defn(name="regen_batch_begin")
+async def regen_batch_begin(inp: RegenBatchInput):
+    calls.append(f"batch_begin:w{inp.webtoon_id}:items{len(inp.items)}:key{inp.batch_key}")
+    if not inp.items:
+        return None
+    # 등장 에피소드 "합집합"(중복 제거) + 캐릭터별 umbrella run — 실제 액티비티 반환 shape 미러.
+    return {
+        "webtoon_id": inp.webtoon_id,
+        "episodes": [{"episode_id": 11, "episode_no": 1}, {"episode_id": 13, "episode_no": 3}],
+        "items": [
+            {"character_id": 21, "mode": "reresolve", "absorbed_character_ids": [], "run_id": 801},
+            {"character_id": 22, "mode": "profile", "absorbed_character_ids": [5], "run_id": 802},
+        ],
+        "invalidate_character_ids": [21, 30],
+    }
+
+
+@activity.defn(name="regen_batch_reresolve_episode")
+async def regen_batch_reresolve_episode(episode_id: int, webtoon_id: int, run_ids: list[int],
+                                        done: int, invalidate_character_ids: list[int] | None = None):
+    calls.append(f"batch_reresolve:ep{episode_id}:done{done}:runs{run_ids}"
+                 f":inv{invalidate_character_ids or []}")
+    return {"webtoon_episode_id": episode_id, "resolve_error": None, "run_id": 950 + episode_id}
+
+
 async def main() -> None:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         workers = [
             Worker(env.client, task_queue=ORCH_QUEUE,
-                   workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow],
+                   workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow,
+                              RegenerateBatchWorkflow],
                    activities=[resolve_episode_for_chain, next_chain_episode,
-                               mark_phase_complete, is_phase3_enabled, regen_begin]),
+                               mark_phase_complete, is_phase3_enabled, regen_begin,
+                               regen_batch_begin]),
             Worker(env.client, task_queue=STEP1_QUEUE,
                    activities=[prepare_episode, step1_episode]),
             Worker(env.client, task_queue=STEP2_QUEUE, activities=[face_identify_episode]),
             Worker(env.client, task_queue=STEP3_QUEUE,
                    activities=[step3a_extract, step3b_resolve, step3c_apply,
-                               regen_reresolve_episode, regen_profile]),
+                               regen_reresolve_episode, regen_batch_reresolve_episode,
+                               regen_profile]),
         ]
         async with contextlib.AsyncExitStack() as stack:
             for w in workers:
@@ -146,10 +181,26 @@ async def main() -> None:
                 RegenInput(character_id=1883, mode="reresolve"),
                 id="regen-1883-reresolve", task_queue=ORCH_QUEUE,
             )
+            # 깊은 모드(수동 버튼) — rerun_extract=True + invalidate 전파 검증.
+            await env.client.execute_workflow(
+                RegenerateCharacterWorkflow.run,
+                RegenInput(character_id=1884, mode="reresolve", rerun_extract=True,
+                           invalidate_character_ids=[7, 8]),
+                id="regen-1884-reresolve-deep", task_queue=ORCH_QUEUE,
+            )
             await env.client.execute_workflow(
                 RegenerateCharacterWorkflow.run,
                 RegenInput(character_id=404, mode="profile"),
                 id="regen-404", task_queue=ORCH_QUEUE,
+            )
+            # 웹툰 단위 배치(§20.9) — 합집합 1회 재해소 + 항목별 프로필 재도출.
+            await env.client.execute_workflow(
+                RegenerateBatchWorkflow.run,
+                RegenBatchInput(webtoon_id=17, items=[
+                    {"character_id": 21, "mode": "reresolve", "invalidate_character_ids": [21, 30]},
+                    {"character_id": 22, "mode": "profile", "absorbed_character_ids": [5]},
+                ], batch_key="r735"),
+                id="regen-batch-w17-r735", task_queue=ORCH_QUEUE,
             )
 
     # ── 불변식 검증 ──────────────────────────────────────────────────────────
@@ -177,13 +228,31 @@ async def main() -> None:
         "regen_begin:1858:profile",
         "regen_profile:1858:run777:absorbed[1862]",       # profile 모드 = 재도출 1콜만
         "regen_begin:1883:reresolve",
-        "regen_reresolve:ep11:done1",                     # 등장 에피소드 순차 재해소 후
-        "regen_reresolve:ep13:done2",
+        "regen_reresolve:ep11:done1:rerun0:inv[]",        # 자동 훅 기본 = 텍스트 전용(§20.3 개정)
+        "regen_reresolve:ep13:done2:rerun0:inv[]",
         "regen_profile:1883:run777:absorbedNone",         # 마지막에 프로필 재도출
+        "regen_begin:1884:reresolve",
+        "regen_reresolve:ep11:done1:rerun1:inv[7, 8]",    # 수동 깊은 모드 = 비전 재실행 + 무효화 전파
+        "regen_reresolve:ep13:done2:rerun1:inv[7, 8]",
+        "regen_profile:1884:run777:absorbedNone",
         "regen_begin:404:profile",                        # 캐릭터 없음 → begin만(no-op)
+        "regen_profile:21:run801:absorbed[]",             # 배치(§20.9) 마무리 — 항목별 프로필 재도출
+        "regen_profile:22:run802:absorbed[5]",
     ], f"재분석 호출 이상: {regen}"
 
-    print(f"SMOKE PASSED — step1={step1} identify={identify} prepare={prepares} regen={len(regen)}")
+    # ── 배치 재분석(§20.9) 불변식 ──────────────────────────────────────────
+    batch = [c for c in calls if c.startswith("batch")]
+    assert batch == [
+        "batch_begin:w17:items2:keyr735",
+        "batch_reresolve:ep11:done1:runs[801]:inv[21, 30]",  # 합집합 1번씩만 + 무효화 동반
+        "batch_reresolve:ep13:done2:runs[801]:inv[21, 30]",
+    ], f"배치 재해소 호출 이상: {batch}"
+    # 배치 마무리 프로필 재도출 — 항목별 run으로.
+    assert "regen_profile:21:run801:absorbed[]" in calls, f"배치 프로필(21) 누락: {calls[-6:]}"
+    assert "regen_profile:22:run802:absorbed[5]" in calls, f"배치 프로필(22) 누락: {calls[-6:]}"
+
+    print(f"SMOKE PASSED — step1={step1} identify={identify} prepare={prepares} "
+          f"regen={len(regen)} batch={len(batch)}")
 
 
 if __name__ == "__main__":

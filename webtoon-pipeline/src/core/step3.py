@@ -908,12 +908,16 @@ _RESOLVE_SYSTEM_PROMPT = (
     "label_conflict(얼굴 라벨과 대사/맥락이 충돌하면 'Step2는 X로 인식했으나 대사상 Y' 식 설명, 없으면 null), "
     "merge_suggestion([같은 인물로 보이는 다른 character_id들])}. "
     "병합은 **제안만**(확신 있을 때만).\n"
-    "2) speaker_resolution: **모든 speech/monologue 블록에 대한 전수 화자 테이블** → "
-    "[{cut, block_index, character_id(또는 null), confidence, reason}]. "
-    "블록의 spk_face/spk_cid(Pass-1 얼굴 기반 후보)가 맥락과 맞으면 그 인물로 **확인**하고, "
-    "앞뒤 맥락·대화 흐름상 다른 인물이면 **교체**하라(교차 대화에서 말풍선 꼬리가 없는 블록은 "
-    "직전/직후 발화자와의 문답 관계로 추론). 진짜 판단 불가일 때만 character_id null. "
-    "**speech/monologue 블록을 빠뜨리지 마라.**\n"
+    "2) speaker_resolution: 화자 판정 테이블 — **차분(diff) 방식**으로 출력한다 → "
+    "[{cut, block_index, character_id(또는 null), confidence, reason(한 구절로 짧게)}]. "
+    "블록의 spk_cid(Pass-1 얼굴 기반 화자 후보)가 앞뒤 맥락·대화 흐름과 **맞으면 그 블록은 "
+    "출력하지 마라**(생략=승인 — 시스템이 spk_cid로 확정한다). 출력해야 하는 행: "
+    "① spk_cid가 없거나 null인 speech/monologue 블록(반드시 판정하라 — 교차 대화에서 말풍선 "
+    "꼬리가 없는 블록은 직전/직후 발화자와의 문답 관계로 추론) "
+    "② spk_cid가 맥락상 틀렸다고 판단해 다른 인물로 **교체**하는 블록 "
+    "③ spk_cid가 의심되지만 진짜 판단 불가인 블록 — character_id=null로 **명시** 출력하라"
+    "(null 행이 있어야 시스템이 그 spk_cid의 자동 확정을 막는다). "
+    "spk_cid 승인을 일일이 나열하지 마라 — 출력이 짧을수록 좋다.\n"
     "3) face_reassignments: confirmed=false 얼굴 중 **그 컷의 대사/호칭/맥락상 현재 cid 배정이 "
     "명백히 틀린 얼굴**만 → [{cut, face(그 컷의 F라벨), "
     "to_character_id(올바른 인물의 character_id — 로스터에 실재하는 id만, 누군지 모르면 null), "
@@ -2541,10 +2545,11 @@ def _commit_speaker_resolution(
     - speech/monologue 해소: character_id 유효 & confidence>=임계값인 (cut, block_index)의 region을
       찾아 source='llm' 주석의 speaker_id + resolution_status='resolved' 설정(단방향). 임계값 미만/
       무효 id는 provisional 유지(Req 10.3). source='human'은 절대 갱신 안 함(동결 — Property 4).
-    - **provisional 화자 승격(2026-07-05, 범위 정정 2026-07-13)**: Pass-2a(R)가 **아예 언급하지 않은**
-      speech/monologue 중 Pass-1이 얼굴 기반으로 확신해 영속한 provisional speaker_id 보유 블록만
-      그 화자로 resolved 승격한다 — R이 전수 테이블에서 행을 빠뜨려도 얼굴 근거 화자가 유실되지
-      않는 안전망(종전엔 이 유실이 화자 매칭률 1~2%의 주원인). 단 R이 **명시적으로 판정한 블록**
+    - **provisional 화자 승격(2026-07-05, 범위 정정 2026-07-13, diff 계약 승격 2026-07-14)**:
+      Pass-2a(R)가 **언급하지 않은** speech/monologue 중 provisional speaker_id 보유 블록을
+      그 화자로 resolved 승격한다. R 프롬프트가 차분(diff) 방식(생략=spk_cid 승인)이 되면서
+      이 경로가 **정식 확정 경로**다(종전엔 R 전수 테이블의 행 누락 안전망 — 그 유실이 화자
+      매칭률 1~2%의 주원인이었고, 지금은 의도된 대량 경로). 단 R이 **명시적으로 판정한 블록**
       (character_id=null "판단 불가", 무효 id, 저신뢰)은 승격 대상에서 제외한다 — R의 에피소드
       전역 맥락 기반 부정 판정(mis-ID distrust 포함)을 컷 단독 추정으로 되덮지 않기 위함(§9.6).
       이런 블록은 provisional 유지(unresolved)로 남는다(§11.2 confidence 게이팅).
@@ -2578,7 +2583,8 @@ def _commit_speaker_resolution(
             )
             resolved += cur.rowcount or 0
 
-        # provisional 화자 승격 — R이 **언급하지 않은** speech/monologue 중 Pass-1 화자 보유 블록만.
+        # provisional 화자 승격 — R이 **언급하지 않은** speech/monologue 중 Pass-1 화자 보유 블록.
+        # diff 계약(생략=승인)에서 이것이 정식 확정 경로다.
         # (adjudicated_rids 제외: R이 null/저신뢰로 명시 판정한 블록을 컷 단독 추정으로 되덮지 않는다.)
         cur.execute(
             """
@@ -2599,7 +2605,7 @@ def _commit_speaker_resolution(
         promoted = cur.rowcount or 0
         if promoted:
             logger.info(
-                "[step3.apply] episode %s — provisional 화자 %s블록 resolved 승격(Pass-1 얼굴 근거, R 미언급분)",
+                "[step3.apply] episode %s — provisional 화자 %s블록 resolved 승격(Pass-1 얼굴 근거, R 생략=승인분)",
                 webtoon_episode_id, promoted,
             )
         resolved += promoted
@@ -3217,6 +3223,39 @@ def _load_resolve_result_from_db(webtoon_episode_id: int, webtoon_id: int) -> "R
 
 # ── 재처리 진입점 ─────────────────────────────────────────────────────────────
 
+def _invalidate_llm_speakers(webtoon_episode_id: int, character_ids: list[int]) -> int:
+    """에피소드 스코프에서 지정 캐릭터들에게 귀속된 **llm** 화자를 무효화한다(§20.3 개정).
+
+    얼굴 이동/섞임 풀기 후 텍스트 전용 재해소(rerun_extract=False)의 선결 조치: 이전 run이
+    확정/영속한 speaker_id가 ①payload hint(spk_cid) 재주입과 ②diff 계약의 생략=승인 경로로
+    되살아나는 것을 막는다. speaker_id=NULL + unresolved로 되돌려 R이 교정 얼굴(fresh
+    _load_faces) 근거로 다시 판정하게 한다. source='human'은 절대 건드리지 않는다(동결).
+    반환: 무효화된 어노테이션 수.
+    """
+    if not character_ids:
+        return 0
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE analysis_text_annotation ta
+            SET speaker_id = NULL, resolution_status = 'unresolved', updated_at = %s
+            FROM analysis_text_region tr
+            JOIN webtoon_cut wc ON tr.cut_id = wc.id
+            WHERE ta.region_id = tr.id AND wc.episode_id = %s
+              AND ta.source = 'llm' AND ta.speaker_id = ANY(%s)
+            """,
+            (now, webtoon_episode_id, [int(c) for c in character_ids]),
+        )
+        n = cur.rowcount or 0
+    if n:
+        logger.info(
+            "[step3.reresolve] episode %s — 캐릭터 %s 귀속 llm 화자 %d건 무효화(재판정 대상)",
+            webtoon_episode_id, character_ids, n,
+        )
+    return n
+
+
 def reresolve_episode(
     webtoon_episode_id: int,
     *,
@@ -3225,6 +3264,8 @@ def reresolve_episode(
     token_budget: Optional[int] = None,
     heartbeat_cb=None,
     webtoon_id: Optional[int] = None,
+    invalidate_speaker_character_ids: Optional[list[int]] = None,
+    run_origin: Optional[str] = None,
 ) -> dict:
     """에피소드 단위 재해소(Req 10.1) — human 수정 후 R→N→apply를 새 run으로 재실행(v4.0).
 
@@ -3236,8 +3277,16 @@ def reresolve_episode(
 
     rerun_extract=False(기본): 비전(Stage V)을 재실행하지 **않고** 영속 provisional 레코드를
         `_load_pass1_records_from_db`로 재구성해 R부터 재해소한다(비용/시간 절감).
-    rerun_extract=True: 비전까지 재실행(새 vision run) — OCR/얼굴 입력 자체가 바뀐 경우
-        (**human이 얼굴↔캐릭터 매칭을 고친 경우 필수** — identified_faces 입력이 바뀜).
+        얼굴 교정 반영도 이 경로로 안전하다 — 단 `invalidate_speaker_character_ids`로 교정에
+        연루된 캐릭터(얼굴을 잃은 쪽+얻은 쪽)를 넘겨 옛 llm 화자를 무효화해야 한다(§20.3 개정:
+        종전 "얼굴 교정엔 rerun_extract=True 필수"의 근거였던 hint 재주입을 무효화가 대체).
+    rerun_extract=True: 비전까지 재실행(새 vision run) — cut_summary/블록 타입 등 Pass-1 산출
+        자체를 다시 뽑고 싶은 경우(수동 버튼 "얼굴 정리 반영 재해소"의 깊은 모드, ~3배 비쌈).
+
+    invalidate_speaker_character_ids: 위 참조 — 지정 시 재해소 전에 그 캐릭터 귀속 llm 화자를
+        에피소드 스코프에서 NULL/unresolved로 되돌린다(human 동결).
+    run_origin: run stats 마킹(예: 'regen') — 정리 패스 심판이 이 run 산출 suggestion을
+        자동판정에서 제외하는 수렴 가드(§22.6)의 판별 키.
 
     Returns: 재해소 요약 dict(records 수, 해소 에러 여부, run_id, episode_meta).
     """
@@ -3251,10 +3300,18 @@ def reresolve_episode(
     text_model_id = text_ctx.get("id")
     vision_model_id = resolve_llm_model(webtoon_id, VISION).get("id")
 
+    origin_stats = {"origin": run_origin} if run_origin else None
+
+    # 얼굴 교정 연루 캐릭터의 옛 llm 화자 무효화 — 레코드 로딩 **전**에 수행해야
+    # _load_provisional_blocks가 무효화된 hint를 싣지 않는다. rerun_extract=True면
+    # extract가 provisional을 새로 upsert하므로 불필요하지만 실행해도 무해(멱등).
+    if invalidate_speaker_character_ids:
+        _invalidate_llm_speakers(webtoon_episode_id, invalidate_speaker_character_ids)
+
     vision_run_id = None
     if rerun_extract:
         vision_run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_VISION,
-                                       llm_model_id=vision_model_id)
+                                       llm_model_id=vision_model_id, stats=origin_stats)
         ext = extract_episode(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True,
                               run_id=vision_run_id)
         runs.finish_run(vision_run_id, stats={
@@ -3270,7 +3327,8 @@ def reresolve_episode(
         prior_context = narrative_context.load_prior(webtoon_id, info["episode_no"])
 
     run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_RESOLVE,
-                            llm_model_id=text_model_id, vision_run_id=vision_run_id)
+                            llm_model_id=text_model_id, vision_run_id=vision_run_id,
+                            stats=origin_stats)
     result = resolve_and_narrate(
         webtoon_episode_id, prior_context,
         records=records, webtoon_id=webtoon_id, ctx=text_ctx,
