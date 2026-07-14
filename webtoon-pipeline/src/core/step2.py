@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 from psycopg2.extras import Json
 
-from src.config.chroma import get_face_collection
+from src.config.chroma import chroma_retry, get_face_collection
 from src.config.db import db_cursor
 from src.config.r2 import fetch_face_crop
 from src.operators.embedding import embed_for
@@ -52,6 +52,14 @@ def get_webtoon_info(webtoon_episode_id: int) -> dict:
 
 
 def _load_face_records(webtoon_episode_id: int) -> list[dict]:
+    """메인 루프 처리 대상 얼굴 — human 정체 행이 있는 얼굴은 제외한다(human 동결).
+
+    human이 배정/배정해제(appearance NULL 확정)한 얼굴을 메인 루프가 다시 매칭하면
+    시딩(is_confirmed=True)·퍼지(doc 삭제)를 같은 런에서 즉시 되덮어 무효화한다
+    (2026-07-14 리뷰 — 같은 에피소드 재실행 시 배정해제 doc이 부활하는 마그넷 모드).
+    human 확정 얼굴의 Chroma 투영은 시딩/퍼지/T3가 전담하고, step2 정체 행도 human
+    동결 원칙상 재계산할 이유가 없다.
+    """
     with db_cursor() as cur:
         cur.execute(
             """
@@ -62,6 +70,12 @@ def _load_face_records(webtoon_episode_id: int) -> list[dict]:
             JOIN webtoon_cut wc ON fr.cut_id = wc.id
             WHERE wc.episode_id = %s
               AND fr.is_used = true
+              AND fr.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM analysis_face_identity fi
+                WHERE fi.detection_id = fr.id AND fi.source = 'human'
+                  AND fi.deleted_at IS NULL
+              )
             ORDER BY wc.cut_number, fr.face_idx
             """,
             (webtoon_episode_id,),
@@ -232,7 +246,8 @@ def _seed_confirmed_faces(
             """
             SELECT fr.id, fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
                    fr.conf, fi.appearance_id, wc.cut_number, we.no AS episode_no,
-                   ca.label AS appearance_label, c.name AS character_name, fe.chroma_doc_id
+                   ca.label AS appearance_label, c.id AS character_pk,
+                   c.name AS character_name, fe.chroma_doc_id
             FROM analysis_face_detection fr
             JOIN analysis_face_identity fi ON fi.detection_id = fr.id
                  AND fi.source = 'human' AND fi.deleted_at IS NULL
@@ -252,9 +267,10 @@ def _seed_confirmed_faces(
         )
         rows = cur.fetchall()
 
+    hb = (lambda: heartbeat_cb(heartbeat_value)) if heartbeat_cb else None
     for row in rows:
         (face_id, face_idx, x1, y1, x2, y2, conf, appearance_id, cut_number,
-         episode_no, appearance_label, character_name, chroma_doc_id) = row
+         episode_no, appearance_label, character_pk, character_name, chroma_doc_id) = row
         doc_id = chroma_doc_id or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
         crop_bytes = fetch_face_crop(face_id, source, title_id)
         if crop_bytes is None:
@@ -262,11 +278,16 @@ def _seed_confirmed_faces(
                 heartbeat_cb(heartbeat_value)
             continue
         embedding = embed_for(metric_type, crop_bytes)
-        collection.upsert(
+        chroma_retry(
+            "seed_upsert", collection.upsert, heartbeat=hb,
             ids=[doc_id], embeddings=[embedding],
             metadatas=[{
                 "webtoon_id": webtoon_id, "episode": episode_no, "cut": cut_number,
-                "face_idx": face_idx, "character_id": character_name, "appearance_id": appearance_id,
+                "face_idx": face_idx,
+                # character_id는 표시용 라벨 관례(메인 루프와 동일: 이름 or cluster#id) —
+                # 매칭이 실제로 쓰는 키는 appearance_id뿐이다.
+                "character_id": character_name or f"cluster#{character_pk}",
+                "appearance_id": appearance_id,
                 "appearance_label": appearance_label, "character_name": character_name,
                 "is_confirmed": True, "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
                 "conf": conf or 0.0, "created_at": datetime.now(timezone.utc).isoformat(),
@@ -275,6 +296,239 @@ def _seed_confirmed_faces(
         if heartbeat_cb:
             heartbeat_cb(heartbeat_value)
     return len(rows)
+
+
+def _purge_human_negated_docs(webtoon_id: int, model_name: str, collection,
+                              heartbeat=None) -> int:
+    """human이 부정한 얼굴의 Chroma doc 제거 — 시딩(`_seed_confirmed_faces`)의 반대 방향.
+
+    시딩은 human이 "이 캐릭터"라고 확정한 얼굴만 upsert하므로, human이 부정한 얼굴의
+    step2 doc은 옛 캐릭터 밑에 잔존해 다음 에피소드에서 비슷한 얼굴을 그 캐릭터로
+    끌어들인다(예: 주연에 섞였던 행인을 배정 해제해도 그 앵커가 주연 밑에 남음).
+    대상: ① 배정 해제(human 정체 행의 appearance IS NULL) ② X 제외(is_used=false)
+    ③ 탐지 삭제. 다른 캐릭터로의 "이동"은 시딩 upsert가 같은 doc_id를 덮어쓰므로
+    여기 대상이 아니다. doc_id가 결정론적이라 Chroma에 없는 id 삭제는 무해(멱등).
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fr.id, fr.face_idx, wc.cut_number, we.no AS episode_no, fe.chroma_doc_id
+            FROM analysis_face_detection fr
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            JOIN webtoon_episode we ON wc.episode_id = we.id
+            LEFT JOIN analysis_face_embedding fe
+                   ON fe.detection_id = fr.id AND fe.embedding_model = %s
+            WHERE we.webtoon_id = %s
+              AND (
+                fr.deleted_at IS NOT NULL
+                OR fr.is_used = false
+                OR EXISTS (
+                  SELECT 1 FROM analysis_face_identity fi
+                  WHERE fi.detection_id = fr.id AND fi.source = 'human'
+                    AND fi.deleted_at IS NULL AND fi.appearance_id IS NULL
+                )
+              )
+            """,
+            (model_name, webtoon_id),
+        )
+        rows = cur.fetchall()
+
+    doc_ids = sorted({
+        chroma_doc_id or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
+        for _face_id, face_idx, cut_number, episode_no, chroma_doc_id in rows
+    })
+    for i in range(0, len(doc_ids), 500):
+        chroma_retry("purge_delete", collection.delete, heartbeat=heartbeat,
+                     ids=doc_ids[i:i + 500])
+    if doc_ids:
+        logger.info(
+            "[step2] human 부정 얼굴 Chroma doc 정리: webtoon_id=%s — 대상 id %d개 delete 요청"
+            "(배정해제/제외/탐지삭제 — upsert된 적 없는 id 포함 가능, 미존재 삭제는 무해)",
+            webtoon_id, len(doc_ids),
+        )
+    return len(doc_ids)
+
+
+def _restore_missing_step2_docs(
+    webtoon_id: int, source: str, title_id: str, model_name: str, metric_type: str,
+    collection, heartbeat=None,
+) -> int:
+    """활성 step2 얼굴인데 Chroma doc이 없는 것을 재임베딩 upsert — 복원 방향 안전망.
+
+    시딩(human 확정)·퍼지(human 부정)는 doc을 만들거나 지우는 방향만 커버한다. 제외했다
+    복원(is_used false→true)한 step2-only 얼굴은 T3(sync_face_doc)가 실패하면 어느 배치
+    경로도 doc을 되살리지 않아 앵커 공백이 영구화된다(2026-07-14 리뷰 — "배치가 안전망"
+    명제가 삭제 방향만 참이던 비대칭 해소). 평시에는 존재 확인(get ids)만 하고 끝나며,
+    누락분만 재임베딩하므로 비용은 누락 수에 비례한다(Chroma만 초기화된 드리프트 복구도
+    이 경로로 수렴).
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fr.id, fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
+                   fr.conf, fi.appearance_id, wc.cut_number, we.no AS episode_no,
+                   ca.label AS appearance_label, c.id AS character_pk,
+                   c.name AS character_name, fe.chroma_doc_id
+            FROM analysis_face_detection fr
+            JOIN analysis_face_identity fi ON fi.detection_id = fr.id
+                 AND fi.source = 'step2' AND fi.deleted_at IS NULL
+                 AND fi.appearance_id IS NOT NULL
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            JOIN webtoon_episode we ON wc.episode_id = we.id
+            JOIN analysis_character_appearance ca ON ca.id = fi.appearance_id
+                 AND ca.deleted_at IS NULL
+            JOIN analysis_character c ON c.id = ca.character_id AND c.deleted_at IS NULL
+            LEFT JOIN analysis_face_embedding fe
+                   ON fe.detection_id = fr.id AND fe.embedding_model = %s
+            WHERE we.webtoon_id = %s
+              AND fr.is_used = true AND fr.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM analysis_face_identity h
+                WHERE h.detection_id = fr.id AND h.source = 'human' AND h.deleted_at IS NULL
+              )
+            """,
+            (model_name, webtoon_id),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return 0
+
+    by_doc = {}
+    for row in rows:
+        doc_id = row[13] or f"{webtoon_id}_{row[9]}_{row[8]}_F{row[1]}"
+        by_doc[doc_id] = row
+
+    existing: set[str] = set()
+    all_ids = sorted(by_doc)
+    for i in range(0, len(all_ids), 500):
+        got = chroma_retry("restore_check_get", collection.get, heartbeat=heartbeat,
+                           ids=all_ids[i:i + 500], include=[])
+        existing.update(got.get("ids") or [])
+    missing = [d for d in all_ids if d not in existing]
+    if not missing:
+        return 0
+
+    logger.info("[step2] step2 doc 누락 %d개 발견(T3 실패/드리프트) — 재임베딩 복원 시작", len(missing))
+    restored = 0
+    for doc_id in missing:
+        (face_id, face_idx, x1, y1, x2, y2, conf, appearance_id, cut_number,
+         episode_no, appearance_label, character_pk, character_name, _doc) = by_doc[doc_id]
+        crop_bytes = fetch_face_crop(face_id, source, title_id)
+        if heartbeat:
+            heartbeat()
+        if crop_bytes is None:
+            continue
+        embedding = embed_for(metric_type, crop_bytes)
+        chroma_retry(
+            "restore_upsert", collection.upsert, heartbeat=heartbeat,
+            ids=[doc_id], embeddings=[embedding],
+            metadatas=[{
+                "webtoon_id": webtoon_id, "episode": episode_no, "cut": cut_number,
+                "face_idx": face_idx,
+                "character_id": character_name or f"cluster#{character_pk}",
+                "appearance_id": appearance_id,
+                "appearance_label": appearance_label, "character_name": character_name,
+                "is_confirmed": False, "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
+                "conf": conf or 0.0, "created_at": datetime.now(timezone.utc).isoformat(),
+            }],
+        )
+        restored += 1
+    logger.info("[step2] step2 doc 복원 완료: %d/%d (crop 없음 %d)",
+                restored, len(missing), len(missing) - restored)
+    return restored
+
+
+def sync_face_doc(face_detection_id: int) -> dict:
+    """human 교정 1건의 실시간 Chroma 투영(T3, prd §10) — 시딩/퍼지의 단건 즉시판.
+
+    detection의 현재 유효 상태(human > step2)를 읽어 원하는 상태를 그대로 적용한다:
+      - 탐지 삭제 / is_used=false / human 배정 해제(appearance NULL) → doc 삭제
+      - 유효 정체의 캐릭터가 활성 → crop 재임베딩 후 그 캐릭터로 upsert
+        (bbox 재크롭 후 재임베딩도 이 경로가 흡수 — DB 진실의 재투영이므로 멱등)
+      - 정체 행이 아예 없음 → doc 삭제(멱등 — doc이 원래 없으면 no-op). 캐릭터 삭제로
+        identity가 일괄 제거된 얼굴의 잔존 doc까지 이 경로가 청소한다.
+    라벨링과 체인 동시 진행 시 "다음 step2 시딩까지 반영 지연" 레이스(2026-07-14
+    바바리안 2881 실측 — 매 에피소드 마그넷 부활)를 없애는 실시간 경로. 배치
+    시딩/퍼지/복원은 안전망으로 유지된다.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fr.face_idx, fr.is_used, fr.deleted_at IS NOT NULL AS det_deleted,
+                   fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2, fr.conf,
+                   wc.cut_number, we.no AS episode_no,
+                   w.id AS webtoon_id, w.source, w.title_id,
+                   eff.source AS ident_source, eff.appearance_id,
+                   ca.label, (ca.id IS NOT NULL AND ca.deleted_at IS NULL) AS app_alive,
+                   c.id AS char_pk, c.name,
+                   (c.id IS NOT NULL AND c.deleted_at IS NULL) AS char_alive
+            FROM analysis_face_detection fr
+            JOIN webtoon_cut wc ON wc.id = fr.cut_id
+            JOIN webtoon_episode we ON we.id = wc.episode_id
+            JOIN webtoon w ON w.id = we.webtoon_id
+            LEFT JOIN LATERAL (
+                SELECT fi.source, fi.appearance_id
+                FROM analysis_face_identity fi
+                WHERE fi.detection_id = fr.id AND fi.deleted_at IS NULL
+                ORDER BY (fi.source = 'human') DESC
+                LIMIT 1
+            ) eff ON true
+            LEFT JOIN analysis_character_appearance ca ON ca.id = eff.appearance_id
+            LEFT JOIN analysis_character c ON c.id = ca.character_id
+            WHERE fr.id = %s
+            """,
+            (face_detection_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"action": "skip", "reason": "detection 없음"}
+    (face_idx, is_used, det_deleted, x1, y1, x2, y2, conf, cut_number, episode_no,
+     webtoon_id, source, title_id, ident_source, appearance_id,
+     app_label, app_alive, char_pk, char_name, char_alive) = row
+
+    ctx = resolve_embedding_model(webtoon_id)
+    model_name, metric_type = ctx["name"], ctx["metric_type"]
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT chroma_doc_id FROM analysis_face_embedding WHERE detection_id = %s AND embedding_model = %s",
+            (face_detection_id, model_name),
+        )
+        fe = cur.fetchone()
+    doc_id = (fe[0] if fe and fe[0] else None) or f"{webtoon_id}_{episode_no}_{cut_number}_F{face_idx}"
+    collection = get_face_collection(source, title_id, model_name)
+
+    # 부정(삭제 방향): 탐지 삭제 / 제외 / human 배정해제 / 소멸 캐릭터 / 정체 행 전무.
+    # "정체 없음→삭제"는 no-op이던 종전과 달리 캐릭터 삭제(identity 일괄 제거) 잔존 doc과
+    # 하드 리셋 잔재까지 청소한다 — doc이 원래 없으면 미존재 id 삭제라 무해(멱등).
+    negated = det_deleted or not is_used or appearance_id is None \
+        or not (app_alive and char_alive)
+    if negated:
+        chroma_retry("t3_delete", collection.delete, ids=[doc_id])
+        logger.info("[t3-sync] face=%s doc=%s 삭제 (used=%s, ident=%s/%s)",
+                    face_detection_id, doc_id, is_used, ident_source, appearance_id)
+        return {"action": "delete", "doc_id": doc_id}
+
+    crop_bytes = fetch_face_crop(face_detection_id, source, title_id)
+    if crop_bytes is None:
+        logger.warning("[t3-sync] face=%s crop 없음 — 투영 생략", face_detection_id)
+        return {"action": "skip", "reason": "crop 없음"}
+    embedding = embed_for(metric_type, crop_bytes)
+    char_label = char_name or f"cluster#{char_pk}"  # 표시용 라벨 관례(메인 루프와 동일)
+    chroma_retry(
+        "t3_upsert", collection.upsert,
+        ids=[doc_id], embeddings=[embedding],
+        metadatas=[{
+            "webtoon_id": webtoon_id, "episode": episode_no, "cut": cut_number,
+            "face_idx": face_idx, "character_id": char_label, "appearance_id": appearance_id,
+            "appearance_label": app_label or "기본", "character_name": char_name,
+            "is_confirmed": ident_source == "human",
+            "bbox_x1": x1, "bbox_y1": y1, "bbox_x2": x2, "bbox_y2": y2,
+            "conf": conf or 0.0, "created_at": datetime.now(timezone.utc).isoformat(),
+        }],
+    )
+    logger.info("[t3-sync] face=%s doc=%s → '%s'(app=%s, %s) upsert",
+                face_detection_id, doc_id, char_label, appearance_id, ident_source)
+    return {"action": "upsert", "doc_id": doc_id, "appearance_id": appearance_id}
 
 
 def _fetch_and_embed(face: dict, source: str, title_id: str, metric_type: str) -> Optional[list[float]]:
@@ -447,10 +701,20 @@ def identify_episode_faces(
     metric_type = ctx["metric_type"]
     threshold = ctx["threshold"]
 
-    collection = get_face_collection(source, title_id, model_name)
+    # 순차 루프 진입 전 구간용 heartbeat(같은 resume 값 재전송 — 타이머 갱신만).
+    hb_pre = (lambda: heartbeat_cb(resume_from)) if heartbeat_cb else None
+
+    collection = get_face_collection(source, title_id, model_name, heartbeat=hb_pre)
     _seed_confirmed_faces(
         webtoon_id, source, title_id, collection, model_name, metric_type,
         heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
+    )
+    # 시딩(확정 upsert)과 짝: human이 부정한 얼굴의 잔존 doc 제거 — anchor 적재 전에
+    # 실행해야 이번 에피소드 매칭 후보에서 확실히 빠진다.
+    _purge_human_negated_docs(webtoon_id, model_name, collection, heartbeat=hb_pre)
+    # 복원 방향 안전망: 활성 step2 얼굴인데 doc이 없는 것(T3 실패한 복원 등) 재투영.
+    _restore_missing_step2_docs(
+        webtoon_id, source, title_id, model_name, metric_type, collection, heartbeat=hb_pre,
     )
     # 리스트로 고정 — 아래에서 유령 appearance_id를 발견할 때마다 append해 이후 쿼리에서도
     # 제외되게 한다(list는 참조로 넘겨지므로 find_match 재호출 시 갱신된 내용이 그대로 반영됨).
@@ -465,7 +729,8 @@ def identify_episode_faces(
     # ccip는 anchor 전체를 브루트포스로 비교해야 해서(§matching.py) 얼굴마다
     # collection.get()으로 전체 재조회하지 않도록 에피소드당 1회만 적재해 캐시한다.
     # 새로 추가되는 얼굴(매칭/신규 캐릭터)은 루프 중 캐시에 직접 append해 갱신.
-    ccip_anchors = load_ccip_anchors(collection, excluded_appearance_ids) if metric_type == "ccip" else None
+    ccip_anchors = (load_ccip_anchors(collection, excluded_appearance_ids, heartbeat=hb_pre)
+                    if metric_type == "ccip" else None)
 
     if ccip_anchors is not None:
         stale = [a for a in ccip_anchors if a["meta"]["appearance_id"] not in valid_appearance_ids]
@@ -504,10 +769,12 @@ def identify_episode_faces(
             continue
 
         doc_id = f"{webtoon_id}_{episode_no}_{face['cut_number']}_F{face['face_idx']}"
+        # 이 얼굴 처리 중의 chroma_retry 대기용 — 직전 완료 인덱스를 재전송(재개 지점 보존).
+        hb_loop = (lambda: heartbeat_cb(resume_from + i)) if heartbeat_cb else None
 
         match = find_match(
             collection, feature, metric_type, threshold, excluded_appearance_ids,
-            ccip_anchors=ccip_anchors,
+            ccip_anchors=ccip_anchors, heartbeat=hb_loop,
         )
         if match is not None and match["meta"]["appearance_id"] not in valid_appearance_ids:
             # cosine 경로는 Chroma를 직접 쿼리해 사전 필터(위 ccip_anchors 필터링)를
@@ -557,7 +824,8 @@ def identify_episode_faces(
             "bbox_x1": b[0], "bbox_y1": b[1], "bbox_x2": b[2], "bbox_y2": b[3],
             "conf": face["conf"], "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        collection.upsert(ids=[doc_id], embeddings=[feature], metadatas=[meta_doc])
+        chroma_retry("upsert", collection.upsert, heartbeat=hb_loop,
+                     ids=[doc_id], embeddings=[feature], metadatas=[meta_doc])
         if ccip_anchors is not None and match is None:
             # 같은 에피소드 내 다음 얼굴이 방금 만든 신규 캐릭터와 매칭될 수 있어 캐시에 반영.
             ccip_anchors.append({"embedding": feature, "meta": meta_doc})

@@ -9,7 +9,7 @@
     오기입·rename으로 병합 우회 실측) — 판정은 suggestion_ids로 수집하고 액션 의미는
     suggestion 원본에서 복원한다.
   - rename-to-기존이름 = 병합으로 정규화(§19.3과 동일 시맨틱).
-  - 자동 수락 가드(전부 만족): 무명 클러스터→named 방향 / 어떤 도시에서도 혼합(mixed)
+  - 자동 수락 가드(전부 만족): 무명 클러스터→named 방향 / 어떤 서류철에서도 혼합(mixed)
     플래그 없음 / 다대상 accept 없음 / human reject 블록리스트 아님 /
     **표결 accept >= 2×(reject+needs_human)** (GT: 오병합 0·참병합 9 유일 규칙군 —
     단순 다수결은 오병합 27%).
@@ -17,14 +17,15 @@
     블록리스트 가드가 ai 기각을 human 판단으로 오인하지 않게).
   - 그 외 판정은 payload['judge'] 권고로 영속 — human 검토 큐 정렬/배지용.
 
-의도적 중복 배치: 한 클러스터를 관련 named 인물 도시에마다 노출시켜 다관점 표결을
-얻는다(모순이 표결로 드러남 — c1712 조걸자칭 vs 청명 실측). 도시에 크기는 캡으로 제한
-(88k자 도시에가 게이트웨이 재시도로 2h+ 걸린 실측 — 분할이 정답).
+의도적 중복 배치: 한 클러스터를 관련 named 인물 서류철마다 노출시켜 다관점 표결을
+얻는다(모순이 표결로 드러남 — c1712 조걸자칭 vs 청명 실측). 서류철 크기는 캡으로 제한
+(88k자 서류철이 게이트웨이 재시도로 2h+ 걸린 실측 — 분할이 정답).
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -38,11 +39,11 @@ from src.operators.llm_resolver import TEXT, resolve_llm_model
 logger = logging.getLogger(__name__)
 
 _JUDGE_STAGE = "judge"
-# 도시에당 제안 상한 — 초과 시 분할(대형 도시에 1콜이 게이트웨이 재시도 지옥 실측).
+# 서류철당 제안 상한 — 초과 시 분할(대형 서류철 1콜이 게이트웨이 재시도 지옥 실측).
 _MAX_SUGGESTIONS_PER_DOSSIER = 60
 _EVIDENCE_SNIPPET = 500          # 제안 근거 전문 상한(자)
 _ACCEPT_MULTIPLIER = 2.0         # accept >= MULT × (reject+needs_human)
-_JUDGE_RETRIES = 2               # 도시에 콜 실패 시 재시도(콜 내부 재시도와 별개)
+_JUDGE_RETRIES = 2               # 서류철 콜 실패 시 재시도(콜 내부 재시도와 별개)
 
 JUDGE_SYSTEM = (
     "너는 웹툰 인물 정체성 데이터의 '제안 검토 심판'이다. Step2(얼굴 임베딩 매칭)가 만든 얼굴 클러스터와 "
@@ -59,7 +60,7 @@ JUDGE_SYSTEM = (
     "5) 확신이 없으면 accept가 아니라 needs_human. 잘못된 병합은 되돌릴 수 없다. 반대로 근거가 명백히 무효인 제안은 "
     "needs_human이 아니라 reject로 큐에서 제거하라.\n"
     "6) rename 제안은 기존 이름이 오명(다른 인물 이름)인 근거가 여러 회차에서 일관될 때만 accept.\n"
-    "한국어. 마지막에 JSON만 출력. cluster_id/target_id는 반드시 도시에에 등장한 숫자 id(cXXXX의 XXXX)만 사용:\n"
+    "한국어. 마지막에 JSON만 출력. cluster_id/target_id는 반드시 서류철에 등장한 숫자 id(cXXXX의 XXXX)만 사용:\n"
     '{"decisions":[{"suggestion_ids":[..],"cluster_id":0,"action":"merge|rename|promote|face_reassign",'
     '"target_id":0또는null,"target_name":"","verdict":"accept|reject|needs_human","confidence":0.0,"reason":""}],'
     '"cluster_notes":[{"cluster_id":0,"mixed":true,"note":"혼합/단일 판단과 권고"}]}'
@@ -162,12 +163,12 @@ def _suggestion_pairs(chars: dict, by_name: dict, s: dict) -> list[tuple]:
     return out
 
 
-# ── 도시에 구성 ────────────────────────────────────────────────────────────────
+# ── 서류철 구성 ────────────────────────────────────────────────────────────────
 
 def _build_groups(chars: dict, pending: list[dict]) -> dict[str, dict]:
-    """named 인물별 + 대형/다경합 클러스터 전용 + 신규명명 배치 도시에(§22.4).
+    """named 인물별 + 대형/다경합 클러스터 전용 + 신규명명 배치 서류철(§22.4).
 
-    의도적 중복(한 클러스터가 여러 named 도시에에 등장)은 교차 검증 장치.
+    의도적 중복(한 클러스터가 여러 named 서류철에 등장)은 교차 검증 장치.
     """
     by_name: dict[str, int] = {}
     for c in chars.values():
@@ -273,40 +274,247 @@ def _dossier_text(chars: dict, group_ids: set, related_ids: set, suggs: list[dic
 
 
 # ── 심판 실행 + 교차대조 ──────────────────────────────────────────────────────
+# 패스는 3단계로 분해돼 각각 별도 Temporal 액티비티로 돈다(중간 저장 — 완료된 서류철
+# 판정은 재시작/배포에도 재실행되지 않는다):
+#   plan_webtoon(계획 스냅샷) → judge_dossier(서류철 1개=콜 1개) × N → reconcile_pass(취합).
+# 단계 간 데이터는 JSON 직렬화 가능해야 한다(set 금지, 정렬 list 사용).
+#
+# 표(votes)는 워크플로 히스토리가 아니라 suggestion payload['judge_votes'] 스크래치로
+# 흐른다 — 대형 패스(서류철 수십 × 표 수십 × 한글 reason)를 reconcile 입력 페이로드
+# 하나로 모으면 Temporal 단일 페이로드 한도(2MB)를 초과할 수 있다(ensure_ascii로 한글이
+# 자당 6바이트, 2026-07-14 리뷰 실측 산술 3.7MB). judge가 서류철 단위로 영속(키 교체
+# 멱등)하고 reconcile이 pending에서 취합 후 스크래치를 청소한다. 소멸한 sid의 표는
+# 행이 사라지므로 자연 탈락(스냅샷 가드와 동일 시맨틱).
 
-def adjudicate_webtoon(
-    webtoon_id: int,
-    run_id: Optional[int] = None,
-    heartbeat: Optional[Callable[[str], None]] = None,
-) -> dict:
-    """웹툰 단위 심판 1패스 — 판정만 하고 실행은 하지 않는다(실행은 service).
-
-    반환: {"accept_suggestion_ids", "reject_suggestion_ids", "stats", "error"}
-    부수효과: 판정 요약을 pending suggestion payload['judge']에 영속(권고/정렬용),
-              심판 콜마다 llm_usage(stage='judge') 적재.
-    """
-    from src.core.step3 import _insert_llm_usage, _pass2_ctx  # 지연 import(무거운 모듈)
-
-    def beat(msg: str) -> None:
-        if heartbeat:
-            heartbeat(msg)
-
-    chars = _load_characters(webtoon_id)
-    all_suggs = _load_suggestions(webtoon_id)
-    # 수렴 가드(§22.6): regen 재해소가 만든 pending은 자동판정 제외(human 검토로만) —
-    # 심판 수락→자동 reresolve→새 제안→다시 수락…의 자가 증폭 루프를 사이클 1에서 끊는다
-    # (2026-07-13 화산귀환 16h 백로그 재발 방지). 정규 체인 resolve가 같은 에피소드를 다시
-    # 돌면 제안이 새 run으로 재생성되므로 그때 자동판정 자격을 회복한다.
+def _pending_and_held(all_suggs: list[dict]) -> tuple[list[dict], int]:
+    """수렴 가드(§22.6): regen 재해소가 만든 pending은 자동판정 제외(human 검토로만) —
+    심판 수락→자동 reresolve→새 제안→다시 수락…의 자가 증폭 루프를 사이클 1에서 끊는다
+    (2026-07-13 화산귀환 16h 백로그 재발 방지). 정규 체인 resolve가 같은 에피소드를 다시
+    돌면 제안이 새 run으로 재생성되므로 그때 자동판정 자격을 회복한다."""
     pending_all = [s for s in all_suggs if s["status"] == "pending"]
     pending = [s for s in pending_all if not s.get("regen_origin")]
-    regen_held = len(pending_all) - len(pending)
+    return pending, len(pending_all) - len(pending)
+
+
+def _by_name(chars: dict) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for c in chars.values():
+        if _is_named(chars, c["id"]):
+            out.setdefault(c["name"], c["id"])
+    return out
+
+
+def _clear_judge_votes_scratch(webtoon_id: int) -> int:
+    """payload['judge_votes'] 스크래치 일괄 제거 — plan(직전 패스 크래시 잔재)과
+    reconcile(취합 완료 후)이 호출한다. 잔재를 안 지우면 다음 패스의 취합에 이전 패스
+    표가 섞인다."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE analysis_suggestion
+            SET payload = payload - 'judge_votes', updated_at = %s
+            WHERE webtoon_id = %s AND payload ? 'judge_votes'
+            """,
+            (datetime.now(timezone.utc), webtoon_id),
+        )
+        return cur.rowcount
+
+
+def _persist_dossier_votes(gname: str, votes: list[list], snapshot_sids: list[int]) -> int:
+    """서류철 1개의 표를 pending payload['judge_votes'][서류철명]에 영속(모듈 주석 참조).
+
+    재실행(Temporal attempt 재시도) 멱등은 **서류철 단위**: 먼저 계획 스냅샷의 전체 sid에서
+    이 서류철 키를 지우고 새 표를 쓴다 — sid 단위 교체만 하면 attempt1이 표를 남긴 sid에
+    attempt2가 표를 안 냈을 때 attempt1 잔표가 섞인다(2026-07-14 라운드2 리뷰).
+    status='pending' 가드로 판정 도중 소멸/처리된 sid에는 쓰지 않는다.
+    """
+    by_sid: dict[int, list] = defaultdict(list)
+    for sid, _gname, action, verdict, conf, reason in votes:
+        by_sid[sid].append([action, verdict, conf, reason])
+    now = datetime.now(timezone.utc)
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE analysis_suggestion
+            SET payload = jsonb_set(payload, '{judge_votes}', (payload->'judge_votes') - %s),
+                updated_at = %s
+            WHERE id = ANY(%s) AND status = 'pending'
+              AND jsonb_typeof(payload->'judge_votes') = 'object'
+              AND payload->'judge_votes' ? %s
+            """,
+            (gname, now, list(snapshot_sids), gname),
+        )
+        if by_sid:
+            cur.executemany(
+                """
+                UPDATE analysis_suggestion
+                SET payload = jsonb_set(payload, '{judge_votes}',
+                                        COALESCE(payload->'judge_votes', '{}'::jsonb) || %s::jsonb),
+                    updated_at = %s
+                WHERE id = %s AND status = 'pending'
+                """,
+                [(Json({gname: v}), now, sid) for sid, v in by_sid.items()],
+            )
+    return len(by_sid)
+
+
+def _load_scratch_votes(pending: list[dict]) -> dict[int, list]:
+    """pending payload['judge_votes'] → votes 취합. 형식: sid -> [(group, action, verdict, conf, reason)]."""
+    votes: dict[int, list] = defaultdict(list)
+    for s in pending:
+        jv = s["payload"].get("judge_votes") or {}
+        if not isinstance(jv, dict):
+            continue
+        for gname, vlist in jv.items():
+            for v in vlist if isinstance(vlist, list) else []:
+                if isinstance(v, list) and len(v) >= 4:
+                    votes[s["id"]].append((gname, v[0], v[1], v[2], v[3]))
+    return votes
+
+
+def plan_webtoon(webtoon_id: int) -> dict:
+    """1단계 — 서류철 계획 스냅샷. LLM 콜 없음, DB 조회만.
+
+    반환(JSON 직렬화): {"dossiers": [{"name", "group_ids", "related_ids", "sids"}...],
+                        "pending": n, "regen_held": n}
+    sids를 계획 시점에 고정해두면, 패스 도중 apply가 pending을 재생성해도 각 서류철은
+    자기 스냅샷 기준으로 판정한다(소멸 sid는 판정/취합 단계 가드가 버린다).
+    부수효과: 직전 패스가 취합 전에 죽으며 남긴 judge_votes 스크래치를 청소한다.
+    """
+    cleared = _clear_judge_votes_scratch(webtoon_id)
+    if cleared:
+        logger.info("[adjudicate] w%s — 직전 패스 judge_votes 잔재 %d건 청소", webtoon_id, cleared)
+    chars = _load_characters(webtoon_id)
+    pending, regen_held = _pending_and_held(_load_suggestions(webtoon_id))
     if regen_held:
         logger.info("[adjudicate] w%s — regen-origin pending %d건 자동판정 보류(수렴 가드, human 검토로)",
                     webtoon_id, regen_held)
-    by_name: dict[str, int] = {}
-    for c in chars.values():
-        if _is_named(chars, c["id"]):
-            by_name.setdefault(c["name"], c["id"])
+    if not pending:
+        return {"dossiers": [], "pending": 0, "regen_held": regen_held}
+
+    groups = _build_groups(chars, pending)
+
+    # 서류철 크기 캡 — 초과 그룹은 제안 청크로 분할(도감 컨텍스트는 공유).
+    dossiers: list[dict] = []
+
+    def _spec(name: str, spec: dict, suggs: list[dict]) -> dict:
+        return {"name": name,
+                "group_ids": sorted(spec["group_ids"]),
+                "related_ids": sorted(spec["related_ids"]),
+                "sids": sorted(s["id"] for s in suggs)}
+
+    for gname, spec in groups.items():
+        suggs = _group_suggestions(chars, pending, spec["group_ids"], spec["group_names"])
+        if not suggs:
+            continue
+        if len(suggs) <= _MAX_SUGGESTIONS_PER_DOSSIER:
+            dossiers.append(_spec(gname, spec, suggs))
+        else:
+            suggs = sorted(suggs, key=lambda x: (x["ep"] or 0, x["id"]))
+            for i in range(0, len(suggs), _MAX_SUGGESTIONS_PER_DOSSIER):
+                dossiers.append(_spec(f"{gname}_p{i // _MAX_SUGGESTIONS_PER_DOSSIER + 1}",
+                                      spec, suggs[i:i + _MAX_SUGGESTIONS_PER_DOSSIER]))
+
+    logger.info(
+        "[adjudicate] w%s 심판 계획 — 인물 %d, pending %d건(regen 보류 %d), 그룹 %d개 → 서류철 %d개",
+        webtoon_id, len(chars), len(pending), regen_held, len(groups), len(dossiers),
+    )
+    return {"dossiers": dossiers, "pending": len(pending), "regen_held": regen_held}
+
+
+def judge_dossier(webtoon_id: int, run_id: Optional[int], dossier: dict,
+                  index: int, total: int) -> dict:
+    """2단계 — 서류철 1개 = LLM 심판 콜 1개. 텍스트는 DB에서 재구성(히스토리 비대 방지).
+
+    표는 payload['judge_votes']에 영속하고(모듈 주석 — 2MB 페이로드 한도 회피),
+    반환은 소형 요약만: {"dossier", "votes": n, "mixed_cluster_ids": [...]}.
+    실패는 예외로 전파 — Temporal 재시도가 처리하고, 소진되면 워크플로가 call_error로
+    기록하고 다음 서류철로 넘어간다(한 콜 실패가 패스를 죽이지 않음).
+    """
+    from src.core.step3 import _insert_llm_usage, _pass2_ctx  # 지연 import(무거운 모듈)
+
+    gname = dossier["name"]
+    chars = _load_characters(webtoon_id)
+    pending, _held = _pending_and_held(_load_suggestions(webtoon_id))
+    sid_set = set(dossier["sids"])
+    suggs = [s for s in pending if s["id"] in sid_set]
+    if not suggs:
+        # 계획 이후 apply/human 처리로 sid가 전부 소멸 — 콜 없이 빈 판정.
+        logger.info("[adjudicate] w%s 서류철 %d/%d %s — sid 전부 소멸, 건너뜀", webtoon_id, index, total, gname)
+        return {"dossier": gname, "votes": 0, "mixed_cluster_ids": []}
+
+    text = _dossier_text(chars, set(dossier["group_ids"]), set(dossier["related_ids"]), suggs)
+    ctx = resolve_llm_model(webtoon_id, TEXT)
+    call_ctx = _pass2_ctx(ctx)
+    logger.info("[adjudicate] w%s 서류철 %d/%d %s — 제안 %d건(계획 %d), %d자, model=%s — 심판 콜 시작",
+                webtoon_id, index, total, gname, len(suggs), len(sid_set), len(text), ctx.get("name"))
+
+    call_t0 = time.perf_counter()
+    last_exc: Exception = RuntimeError("unreachable")
+    result = None
+    for attempt in range(1, _JUDGE_RETRIES + 1):
+        try:
+            call = call_llm_json(call_ctx, JUDGE_SYSTEM, text, [])
+            result = call.result if isinstance(call.result, dict) else {}
+            _insert_llm_usage(webtoon_id, None, None, ctx.get("id"), call.usage or {},
+                              stage=_JUDGE_STAGE, image_count=None, run_id=run_id,
+                              extra={"dossier": gname})
+            break
+        except Exception as e:  # noqa: BLE001
+            # 콜 성공 후 usage 적재가 실패한 경우까지 포함해 이번 attempt 결과를 버린다
+            # (리셋 없이는 attempt1의 절반 성공 상태로 진행해 usage 행이 누락된다).
+            result = None
+            last_exc = e
+            logger.warning("[adjudicate] w%s %s 콜 실패(attempt %d/%d, %.0fs 경과): %s",
+                           webtoon_id, gname, attempt, _JUDGE_RETRIES,
+                           time.perf_counter() - call_t0, e)
+    if result is None:
+        raise last_exc
+
+    valid_sids = {s["id"] for s in suggs}
+    votes: list[list] = []
+    vcount = {"accept": 0, "reject": 0, "needs_human": 0}
+    for d in result.get("decisions", []):
+        v = d.get("verdict")
+        if v in vcount:
+            vcount[v] += 1
+        for sid in (d.get("suggestion_ids") or []):
+            if isinstance(sid, int) and sid in valid_sids:
+                votes.append([sid, gname, d.get("action"), d.get("verdict"),
+                              d.get("confidence"), str(d.get("reason") or "")[:300]])
+    mixed_ids = sorted({
+        note["cluster_id"] for note in result.get("cluster_notes", [])
+        if isinstance(note.get("cluster_id"), int) and note["cluster_id"] in chars and note.get("mixed")
+    })
+    persisted = _persist_dossier_votes(gname, votes, dossier["sids"])
+    logger.info(
+        "[adjudicate] w%s 서류철 %d/%d %s 완료 — %.0fs (판정 %d건: accept %d/reject %d/"
+        "needs_human %d, 유효 sid 표 %d — %d sid 영속, mixed %d)",
+        webtoon_id, index, total, gname, time.perf_counter() - call_t0,
+        len(result.get("decisions", []) or []), vcount["accept"], vcount["reject"],
+        vcount["needs_human"], len(votes), persisted, len(mixed_ids),
+    )
+    return {"dossier": gname, "votes": len(votes), "mixed_cluster_ids": mixed_ids}
+
+
+def reconcile_pass(webtoon_id: int, run_id: Optional[int], plan: dict,
+                   summaries: list[Optional[dict]], call_errors: list[str]) -> dict:
+    """3단계 — 표결 취합 → 쌍 단위 교차대조/가드 → 권고 영속 → 결과/stats.
+
+    반환 계약은 종전 adjudicate_webtoon과 동일:
+    {"accept_suggestion_ids", "reject_suggestion_ids", "stats", "error"}.
+    표는 pending payload['judge_votes'] 스크래치에서 취합한다(모듈 주석 — summaries에는
+    mixed 플래그/카운트 요약만 온다). pending은 취합 시점 기준으로 다시 읽으므로 계획
+    이후 소멸한 sid의 표는 행과 함께 자연 소멸하고, 남은 표도 smap 가드가 거른다.
+    ⚠️ 스크래치 청소는 여기서 하지 않는다 — 청소 커밋 후 액티비티 완료 보고 전에 워커가
+    죽으면 재시도가 빈 표를 읽어 이번 패스 실행분이 통째로 noop이 된다(라운드2 리뷰).
+    청소는 결과가 워크플로 히스토리에 실린 뒤(consolidation_finish) 또는 합성 경로의
+    reconcile 직후(adjudicate_webtoon)가 담당하고, 남은 잔재는 다음 plan이 치운다.
+    """
+    chars = _load_characters(webtoon_id)
+    all_suggs = _load_suggestions(webtoon_id)
+    pending, _held = _pending_and_held(all_suggs)
+    by_name = _by_name(chars)
 
     # human reject 블록리스트. 주의: 판정 권고(payload.judge)는 human행 제안에도 남으므로
     # "judge가 봤는가"가 아니라 "누가 기각했는가"로 갈라야 한다 — ai 자동 기각만
@@ -318,73 +526,21 @@ def adjudicate_webtoon(
                 if p[0] == "pair":
                     human_reject_pairs.add((p[1], p[2]))
 
-    if not pending:
-        return {"accept_suggestion_ids": [], "reject_suggestion_ids": [],
-                "stats": {"pending": 0, "dossiers": 0, "regen_held": regen_held},
-                "error": None}
-
-    groups = _build_groups(chars, pending)
-
-    # 도시에 크기 캡 — 초과 그룹은 제안 청크로 분할(도감 컨텍스트는 공유).
-    dossiers: list[tuple[str, set, set, list[dict]]] = []
-    for gname, spec in groups.items():
-        suggs = _group_suggestions(chars, pending, spec["group_ids"], spec["group_names"])
-        if not suggs:
-            continue
-        if len(suggs) <= _MAX_SUGGESTIONS_PER_DOSSIER:
-            dossiers.append((gname, spec["group_ids"], spec["related_ids"], suggs))
-        else:
-            suggs = sorted(suggs, key=lambda x: (x["ep"] or 0, x["id"]))
-            for i in range(0, len(suggs), _MAX_SUGGESTIONS_PER_DOSSIER):
-                dossiers.append((f"{gname}_p{i // _MAX_SUGGESTIONS_PER_DOSSIER + 1}",
-                                 spec["group_ids"], spec["related_ids"],
-                                 suggs[i:i + _MAX_SUGGESTIONS_PER_DOSSIER]))
-
-    ctx = resolve_llm_model(webtoon_id, TEXT)
-    call_ctx = _pass2_ctx(ctx)
-
-    votes: dict[int, list] = defaultdict(list)        # sid -> [(group, action, verdict, conf, reason)]
+    votes = _load_scratch_votes(pending)              # sid -> [(group, action, verdict, conf, reason)]
     mixed_flag: dict[int, list] = defaultdict(list)   # cluster -> [group]
-    call_errors: list[str] = []
-
-    for di, (gname, group_ids, related_ids, suggs) in enumerate(dossiers, 1):
-        text = _dossier_text(chars, group_ids, related_ids, suggs)
-        beat(f"judge {di}/{len(dossiers)} {gname}")
-        logger.info("[adjudicate] w%s 도시에 %d/%d %s — 제안 %d건, %d자",
-                    webtoon_id, di, len(dossiers), gname, len(suggs), len(text))
-        result = None
-        for _ in range(_JUDGE_RETRIES):
-            try:
-                call = call_llm_json(call_ctx, JUDGE_SYSTEM, text, [])
-                result = call.result if isinstance(call.result, dict) else {}
-                _insert_llm_usage(webtoon_id, None, None, ctx.get("id"), call.usage or {},
-                                  stage=_JUDGE_STAGE, image_count=None, run_id=run_id,
-                                  extra={"dossier": gname})
-                break
-            except Exception as e:  # noqa: BLE001 — 도시에 단위 격리(한 콜 실패가 패스를 죽이지 않음)
-                logger.warning("[adjudicate] w%s %s 콜 실패: %s", webtoon_id, gname, e)
-                result = None
-        if result is None:
-            call_errors.append(gname)
+    for r in summaries:
+        if not r:
             continue
-
-        valid_sids = {s["id"] for s in suggs}
-        for d in result.get("decisions", []):
-            for sid in (d.get("suggestion_ids") or []):
-                if isinstance(sid, int) and sid in valid_sids:
-                    votes[sid].append((gname, d.get("action"), d.get("verdict"),
-                                       d.get("confidence"), str(d.get("reason") or "")[:300]))
-        for note in result.get("cluster_notes", []):
-            ncid = note.get("cluster_id")
-            if isinstance(ncid, int) and ncid in chars and note.get("mixed"):
-                mixed_flag[ncid].append(gname)
+        for ncid in r.get("mixed_cluster_ids", []):
+            mixed_flag[ncid].append(r.get("dossier", "_"))
 
     decisions = _reconcile(chars, by_name, pending, votes, mixed_flag, human_reject_pairs)
     _persist_advisory(pending, votes, mixed_flag, decisions, run_id)
 
     smap = {s["id"]: s for s in pending}
     stats = {
-        "pending": len(pending), "dossiers": len(dossiers), "judged_sids": len(votes),
+        "pending": plan.get("pending", len(pending)), "dossiers": len(plan.get("dossiers", [])),
+        "judged_sids": len(votes),
         "auto_accept": len(decisions["accept_suggestion_ids"]),
         "auto_reject": len(decisions["reject_suggestion_ids"]),
         "auto_accept_pairs": [
@@ -394,12 +550,42 @@ def adjudicate_webtoon(
         ],
         "mixed_clusters": sorted(mixed_flag),
         "call_errors": call_errors,
-        "regen_held": regen_held,
+        "regen_held": plan.get("regen_held", 0),
     }
     logger.info("[adjudicate] w%s 완료 — %s", webtoon_id, json.dumps(stats, ensure_ascii=False)[:400])
     return {"accept_suggestion_ids": decisions["accept_suggestion_ids"],
             "reject_suggestion_ids": decisions["reject_suggestion_ids"],
             "stats": stats, "error": None}
+
+
+def adjudicate_webtoon(
+    webtoon_id: int,
+    run_id: Optional[int] = None,
+    heartbeat: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """웹툰 단위 심판 1패스(단일 프로세스 합성) — plan→judge×N→reconcile.
+
+    프로덕션 경로는 ConsolidateWebtoonWorkflow가 3단계를 각각 액티비티로 돌리지만
+    (중간 저장), 드라이런/구버전 액티비티(consolidation_adjudicate) 호환용으로 유지한다.
+    """
+    plan = plan_webtoon(webtoon_id)
+    if not plan["dossiers"]:
+        return {"accept_suggestion_ids": [], "reject_suggestion_ids": [],
+                "stats": {"pending": plan["pending"], "dossiers": 0,
+                          "regen_held": plan["regen_held"]},
+                "error": None}
+    summaries: list[Optional[dict]] = []
+    call_errors: list[str] = []
+    for di, dossier in enumerate(plan["dossiers"], 1):
+        if heartbeat:
+            heartbeat(f"judge {di}/{len(plan['dossiers'])} {dossier['name']}")
+        try:
+            summaries.append(judge_dossier(webtoon_id, run_id, dossier, di, len(plan["dossiers"])))
+        except Exception:  # noqa: BLE001 — 서류철 단위 격리
+            call_errors.append(dossier["name"])
+    result = reconcile_pass(webtoon_id, run_id, plan, summaries, call_errors)
+    _clear_judge_votes_scratch(webtoon_id)  # 합성 경로는 결과를 손에 쥔 뒤라 즉시 청소 안전
+    return result
 
 
 def _reconcile(chars, by_name, pending, votes, mixed_flag, human_reject_pairs) -> dict:
@@ -448,9 +634,11 @@ def _reconcile(chars, by_name, pending, votes, mixed_flag, human_reject_pairs) -
         )
         accept_sids.append(cand[0]["id"])
 
-    # 만장일치 reject → 자동 기각(ai 마커는 실행측이 남김).
+    # 만장일치 reject → 자동 기각(ai 마커는 실행측이 남김). smap 필터: 취합 전에 소멸한
+    # sid가 실행 목록에 실리지 않게(실행측 PENDING 필터가 있어도 여기서 거르는 게 정본).
     reject_sids = [sid for sid, vs in votes.items()
-                   if vs and all(v == "reject" for _g, _a, v, _c, _r in vs)
+                   if sid in smap and vs
+                   and all(v == "reject" for _g, _a, v, _c, _r in vs)
                    and sid not in set(accept_sids)]
     return {"accept_suggestion_ids": accept_sids, "reject_suggestion_ids": reject_sids}
 

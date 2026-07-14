@@ -388,6 +388,13 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
 - 배포: `oci-croma.prup.xyz:8000`(운영, OCI 호스팅 — k3s 클러스터 밖) / docker-compose(개발). 토큰 인증. env `CHROMA_HOST/PORT/AUTH_TOKEN`.
 - metadata: webtoon_id, episode, cut, face_idx, character_id, appearance_id, appearance_label, character_name, is_confirmed, bbox, conf, created_at.
 - **⚠️ v1 REST API는 서버에서 완전히 제거됨(2026-07 실측 확인, `HTTP 410 "The v1 API is deprecated. Please use /v2 apis"`)**. `data-pipeline`은 공식 `chromadb==1.5.9` 클라이언트로 이미 v2(tenant/database 경로, `default_tenant`/`default_database`)를 쓰지만, `service` 쪽 수기 REST 호출은 v1을 쓰고 있었다가 2026-07-03에 v2로 이관(`prd-history.md` §H4.3). **앞으로 Chroma REST를 직접 호출하는 코드를 새로 짤 때는 반드시 v2(`/api/v2/tenants/{tenant}/databases/{database}/collections/...`)를 쓸 것** — v1은 404가 아니라 410을 반환하므로 "존재 안 함"과 오인하기 쉽다.
+- **클라이언트 타임아웃 + 재시도 (2026-07-14, step2 무한 행 사고 → 구현, 같은 날 리뷰 후속 보강)**: chromadb 클라이언트는 내부 httpx 세션을 `timeout=None`으로 하드코딩(`chromadb/api/fastapi.py`) — 원격 Chroma(인터넷 경유) 커넥션 스톨 시 **영구 행**. 수정(`src/config/chroma.py`): ①`FastAPI.__init__` 몽키패치로 세션 생성 직후 `Timeout(30s, connect=5s)` 설정(read timeout은 바이트 간 무응답 한도라 대용량 get도 안전; **생성자 내부 tenant 검증 콜까지 보호** — 사후 주입은 2차 방어선으로 유지) ②세션 response 훅이 5xx를 chromadb의 예외 변환보다 먼저 `HTTPStatusError`로 승격 — chromadb는 비정형 5xx(프록시/게이트웨이 HTML 바디 502/503/524)를 일반 Exception으로 바꿔버려 훅 없이는 재시도 판별 불가(리뷰 발견) ③전 호출(`upsert/get/query/delete/get_or_create_collection`)을 `chroma_retry`로 래핑 — §16.2 공통 규칙과 동일(transport/5xx만 10회 지수 백오프 1s→8s, 4xx 즉시 전파) ④`chroma_retry(heartbeat=...)` 콜백을 액티비티 경로 전 지점에 플럼빙 — 재시도 누적(최악 ~7분)이 heartbeat_timeout(2분)을 넘겨 attempt가 잘리던 낭비 제거(콜백은 자기 resume 값을 재전송해 재개 지점 보존). prod Chroma 실측 검증 완료(패치·훅 주입, 존재확인 get 패턴).
+- **human 레이어의 Chroma 투영 — 실시간(T3) + 배치 안전망, 2026-07-14 완성**:
+  - **실시간(T3 구현됨)**: service 교정 API(재배정/배정해제/제외/복원/bbox 재크롭, bulk 포함)가 `send_face_chroma_sync(_bulk)` → **`FaceChromaSyncWorkflow`**(ORCH 큐, 얼굴당 수 초)를 발화. 액티비티(`step2.sync_face_doc`)가 detection의 현재 유효 정체(human>step2)를 읽어 **이동=crop 재임베딩 upsert / 부정(배정해제·제외·삭제·소멸 캐릭터)=doc 삭제**를 즉시 적용. 웹툰 락은 의도적으로 안 잡음(단건 doc 조작은 원자적, 락 대기는 "즉시"를 죽임). 계기: 라벨링과 체인 동시 진행 시 "다음 step2 시딩까지 반영 지연" 레이스 — 바바리안 2881 실측(이동이 매번 다음 회차 시딩 스냅샷보다 3~5분 늦어 에피소드마다 마그넷 부활: ep7 20개→ep8 16개→ep9 24개→ep10 16개, 에피소드 내 자기강화 포함).
+  - **배치 안전망(매 step2 실행 시작 시, 3방향)**: ①긍정 — `_seed_confirmed_faces`가 같은 doc_id로 upsert ②부정 — `_purge_human_negated_docs`가 doc 삭제 ③**복원 — `_restore_missing_step2_docs`**(활성 step2 얼굴인데 doc 없는 것 재임베딩 — 제외→복원 얼굴을 T3가 놓치면 어느 경로도 안 되살리던 비대칭 해소, 평시엔 존재확인 get만). 전부 앵커 적재 전 실행. T3가 놓친/실패한 교정을 다음 step2가 수렴시킨다.
+  - **step2 메인 루프는 human 정체 행 있는 얼굴을 스킵**(`_load_face_records` NOT EXISTS, 2026-07-14 리뷰): 안 하면 같은 에피소드 재실행 시 메인 루프가 purge 직후 그 얼굴을 재매칭·재upsert해 배정해제 doc이 부활(마그넷 모드)하고, human 확정 얼굴의 시딩 doc도 `is_confirmed=False`로 되덮었다. human 얼굴의 Chroma 투영은 시딩/퍼지/복원/T3 전담.
+  - **T3 세부**: bulk는 워크플로가 청크 25개씩 액티비티 분할(완료 청크 히스토리 보존 — 수백 장 bulk도 타임아웃 불가) + 얼굴 단위 실패 격리(전건 실패만 Temporal 재시도). "정체 행 전무"는 skip이 아니라 **doc 삭제**(멱등) — 캐릭터 삭제(identity 일괄 제거)·하드 리셋 잔재까지 청소. service 발화 지점에 캐릭터 삭제·**정리 패스 face_reassign 자동 수락**(`suggestion_adjudication` on_commit)·`SyncFaceEmbeddingsAPIView`(청크 bulk 전환) 추가.
+  - `send_face_rematch`/`send_reembed_trigger`는 여전히 no-op 스텁(잔여 T3).
 
 ---
 
@@ -413,7 +420,7 @@ Step2 얼굴인식·Pass-1 단독 판단이 서사 결론으로 그대로 전파
   1. **재등장 예상 인물 → 새 캐릭터 생성 후 이동(추천)**: 이름은 인상착의 서술명(시스템 관례 — '복면 노인', '현지 거지 두목'). CCIP 앵커가 생겨 이후 회차 얼굴이 자동 귀속, 실명 확인 시 rename 1회.
   2. **일회성 잡얼굴 → 재배정 대상 비우기(미배정)**: human FaceIdentity(appearance=NULL) = "인물 아님/미배정" 판단. ⚠️ human 레이어 동결 — 이후 자동 재매칭 안 됨(중요해지면 수동 재배정).
   3. **얼굴 오탐 → is_used=false** (§18.8-1c).
-- **미배정 얼굴 UI**: 캐릭터 상세에 미확인/확인됨/이동됨과 별개의 **"미배정" 섹션**(2026-07-12 신설 — service `human_unassigned` 필드 + webtoonmoa 섹션, 커밋 `8d893d4`/`21d1422`). 주의: 마스터 '미배정' 목록(WebtoonUnassignedFaces)은 여전히 "누구에게도 배정된 적 없음" 기준이라 human-미배정 얼굴은 안 나옴(구 캐릭터 상세의 미배정 섹션에서 보임) — 통합은 필요 시 후속.
+- **미배정 얼굴 UI**: 캐릭터 상세에 미확인/확인됨/이동됨과 별개의 **"미배정" 섹션**(2026-07-12 신설 — service `human_unassigned` 필드 + webtoonmoa 섹션, 커밋 `8d893d4`/`21d1422`). ~~주의: 마스터 '미배정' 목록(WebtoonUnassignedFaces)은 여전히 "누구에게도 배정된 적 없음" 기준이라 human-미배정 얼굴은 안 나옴(구 캐릭터 상세의 미배정 섹션에서 보임) — 통합은 필요 시 후속.~~ **2026-07-14 해소**: `WebtoonUnassignedFacesAPIView`의 배정 판정을 "소스 무관 appearance 존재" → **effective-identity(human>step2)** 기준으로 교체 — 미배정 = `human이 appearance 미지정` AND `(human 판단 존재[=NULL 확정] OR step2도 미배정)`. human이 미배정 확정한 얼굴은 옛 step2 정체가 잔존해도 마스터 목록에 나온다. `RematchFacesAPIView`의 유사 쿼리는 human 동결(§11.4 아래 ⚠) 규칙상 그대로 둔다(human-미배정 얼굴 자동 재매칭 금지). **같은 날 리뷰 후속**: 배정 판정에 appearance/character soft-delete 필터 추가 — 빈 클러스터 자동 삭제로 소멸한 캐릭터를 가리키는 잔존 step2 정체가 "배정됨"으로 오판돼 미배정 목록에도 캐릭터 UI에도 안 나오는 유령 얼굴이 되던 것(§18.8-9와 동근원, 이 목록 한정 선해결). **2026-07-14 추가(webtoonmoa)**: X 제외(is_used=false) 얼굴은 미확인이 아니라 별도 **"삭제됨" 섹션**으로 분리(복원 ↺ 유지), 선택 표시는 진한 오버레이 대신 옅은 틴트+구석 체크(얼굴 식별 가림 해소).
 - **LLM 가동 중 수동 병합/이동 가능 여부 (2026-07-13 정리)**: 시스템은 안 깨진다(human 동결·soft-delete FK·apply valid_ids 스킵·수락 API의 소멸 제안 skip). 단 마찰 3종 — ①apply가 그 에피소드 pending 제안을 delete-reinsert하므로 보던 제안/심판 배지가 사라질 수 있음(수락 no-op) ②resolve 진행 중 병합하면 해당 회차 apply가 옛 cid 스냅샷 기준이라 일부 커밋 스킵/구식 — 자연 치유 없음, 그 회차 재해소 필요(§11.4 "그 사이 resolve가 돌지 않게" 원칙과 동일) ③병합 수락→profile 재도출, face_reassign 수락→reresolve 자동 훅이 웹툰 락을 놓고 체인과 경쟁해 진행이 느려짐 — **2026-07-14 완화**: 자동 훅 reresolve는 텍스트 전용(~25~35분/회차, §20.3 개정), 정리 패스 수락분은 웹툰 단위 배치로 중복 제거(§20.9), 락 대기열에서 체인이 우선(§9.9 개정)이라 신규 회차는 밀리지 않는다. **권장: 큰 수술은 체인 idle 때 몰아서, 급한 정정은 "그 회차 나중에 재해소" 전제로만.**
 
 ---
@@ -489,6 +496,8 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 | 날짜 | 결정 | 비고 |
 |------|------|------|
+| 2026-07-14 | **(2차) step2 무한 행 사고 대응 + Chroma human 투영 완성(T3 실시간) + 심판 서류철 분해 (두 레포 구현 — 미배포)** — 계기 2건(바바리안 w23 수동 라벨링 테스트 중): ①ep6 step2가 Chroma upsert에서 **무한 행**(chromadb 클라이언트 `timeout=None` 하드코딩 × 원격 커넥션 스톨) → heartbeat 중단 → Temporal이 attempt를 실패 처리했으나 **좀비 스레드가 유일 슬롯(max_concurrent_activities=1) 점유 → 재시도 배차 불가 교착**(§16.2 규칙 신설) ②human 이동의 Chroma 반영이 "다음 step2 시딩"뿐이라 라벨링↔체인 동시 진행 시 매번 레이스로 짐 — 클러스터 2881이 에피소드마다 부활(이동 완료가 항상 다음 시딩 스냅샷보다 3~5분 늦음: ep7 20→ep8 16→ep9 24→ep10 16개, 에피소드 내 자기강화 포함). 조치: ⓐChroma 세션 타임아웃 주입 + 전 호출 `chroma_retry`(§10) ⓑ배치 투영 완성 — 시딩 upsert(긍정) + `_purge_human_negated_docs`(부정: 배정해제/제외/삭제 doc 제거) ⓒ**T3 실시간 투영 구현** — service 교정 API 전 지점(재배정·배정해제·제외/복원·bbox 재크롭·bulk)이 `FaceChromaSyncWorkflow` 발화(§10) ⓓ심판 패스 **서류철당 액티비티 분해 = 중간 저장**(완료 서류철은 재시작/배포에도 LLM 콜 보존) + 락 세분화 + 관측 로깅 + "도시에"→"서류철" 개칭(§22.7) ⓔwebtoonmoa: X 제외 얼굴 "삭제됨" 섹션 분리 + 선택 표시 투명화(§11.4). 백로그 신설: 빈 클러스터 effective 판정 버그(§18.8-9)·엑스트라 일괄 정리/merge 제안 위생(§18.8-10). ~~⚠️ 배포 시 in-flight `consolidate_*` terminate(§22.7)~~ → 3차에서 `workflow.patched` 분기로 해소(terminate 불필요). 배포 후 step2 1회 실행으로 잔존 doc 일괄 수렴 권장 | §10, §11.4, §16.2, §18.8, §22.7 |
+| 2026-07-14 | **(3차) 2차 staged 전량 리뷰(에이전트 4방향) → 발견 10건 전부 수정 (두 레포 — 미커밋)** — HIGH ①reconcile 표 페이로드 2MB 초과 위험 → **표를 `payload['judge_votes']` DB 스크래치로**(judge 영속→reconcile 취합·청소, §22.7) ②배포 시 in-flight consolidate 리플레이 비결정성 → **`workflow.patched` 분기**(terminate 불필요, §22.7). MED ③같은 에피소드 재실행 시 purge 무효화(메인 루프 재upsert) → **step2 메인 루프가 human 정체 행 얼굴 스킵**(§10) ④비정형 5xx 비재시도 → 세션 5xx 훅(§10) ⑤chroma_retry 최악 ~7분 vs heartbeat 2분 → heartbeat 콜백 플럼빙(§10) ⑥복원 방향 안전망 부재 → `_restore_missing_step2_docs`(§10) ⑦T3 bulk 타임아웃 → 워크플로 청크 25 분할 + 얼굴 단위 격리(§10) ⑧`SyncFaceEmbeddingsAPIView` 얼굴당 워크플로 N개 → 청크 bulk 전환 ⑨정리 패스 face_reassign 자동 수락에 T3 발화 누락 → on_commit 발화 ⑩미배정 목록 soft-deleted appearance 오판(유령 얼굴) → 필터(§11.4). 소소: 생성자 무보호 봉합(`FastAPI.__init__` 패치), 정체 전무=doc 삭제(캐릭터 삭제 경로 발화 추가), `_start` RPCError 전량 삼킴 → ALREADY_EXISTS만 skip, reject 목록 smap 필터, judge 재시도 result 리셋, 합성 경로 stats, purge 로그 문구, bulk 웹툰별 try 분리, character_id 메타 라벨 관례 통일. 검증: 스위트 전체 + prod Chroma/DB 실측(SQL·jsonb 문법 롤백 검증) | §10, §11.4, §16.2, §18.8, §22.7 |
 | 2026-07-14 | **regen 증폭 구조 개선 5종 (16h 백로그 실사고 대응, 두 레포 구현 — 미배포)** — 계기: 07-13 정리 패스 수락 9건 → 캐릭터별 regen 8개 → 같은 회차 2~4회 중복 재해소(rerun_extract=True ~1.5h/회차) × 웹툰 직렬화 락 = 16시간, 신규 ep7/ep8 밀림 + 재해소가 만든 pending 33건을 다음 심판이 또 수락하는 자가 증폭 루프 노출. ①**배치 regen**(§20.9): 심판 수락 훅을 hook_collector로 모아 캐릭터별 coalesce → `RegenerateBatchWorkflow` 1개가 등장 에피소드 **합집합을 1번씩만** 재해소 ②**자동 훅 reresolve 텍스트 전용화**(§20.3 개정): `_invalidate_llm_speakers`(연루 캐릭터[from+to] 옛 llm 화자 에피소드 스코프 리셋)가 hint 재주입을 대체 — rerun_extract=True는 수동 버튼/admin 깊은 모드로만(§20.5 실측 근거: True 추가 이득 ~5% marginal) ③**수렴 가드**(§22.6): regen 산출 run에 stats.origin='regen' 마킹, 심판이 그 pending 자동판정 제외(루프 사이클 1 차단) ④**락 우선순위**(§9.9 개정): 정규 체인 > regen/정리, 같은 순위 FIFO(`_WebtoonLock`) ⑤**Stage R 화자 차분 계약**(§9.5 재개정): 생략=spk_cid 승인(승격이 정식 경로) — completion 26k~65k tok·65,536 캡 도달·콜당 20~37분 해소. 합산 효과 추정: 동일 시나리오 16h→~2h. 검증: smoke_test(배치·깊은 모드·no-op) + 락 단위테스트(우선순위/FIFO/취소) 통과. ⚠️ 배포 시 in-flight regen 워크플로 Terminate 필요(§20.9) | §9.5, §9.6, §9.9, §11.4, §17.4, §20.3, §20.9, §22.3, §22.6 |
 | 2026-07-13 | **재실행 품질 조사 + CCIP 재실측 + 정리 패스 첫 실전 (2차)** — ①품질 저하 신고('봉방' 요약·초삼 미검출) 조사: 프롬프트/모델 무변경 확인, 원인=OCR 파편 '봉방'의 vision 1콜 오판이 로스터→prior로 증폭(§18.8-8 가드 백로그화) + 재실행이 ep2 시점의 중간 상태였던 것 ②시뮬 재실측(687얼굴): **0.12×topk3 유지 확정, threshold 하향은 파편만 증가 — wipe 불필요**. 잔여 혼합의 실체=feature 판별력 한계(천마)·이름 바인딩 오류(운암)·외형 모드 파편(청명) → human 몫(§18.5 재검증) ③정리 패스 첫 실전 E2E 성공(run 697: 판정 275·자동병합 1·기각 30, mixed 가드 25 차단, §22.5 관찰 완료) ④웹툰 락 실전 검증(심판↔step3a 직렬화, 락 대기 2h 타임아웃 재시도는 무해 — §9.9) ⑤LLM 가동 중 수동 병합/이동 가이드(§11.4) | §9.9, §11.4, §18.5, §18.8, §22.5 |
 | 2026-07-13 | **PRD-코드 전수 감사 후속 3건** — ①STEP3 동시성 공식화: 동시성 2 + **webtoon_id별 프로세스 내 락**(`_webtoon_serialized`, 같은 웹툰 직렬/다른 웹툰끼리만 병렬 — 심판↔apply sid 경합·동명 승격 TOCTOU·run supersede 상호덮기 차단, replicas=1 전제) ②**승격 안전망 범위 정정**: R이 명시 판정한 블록(null/무효 id/저신뢰)은 provisional 승격 제외 — R의 전역 맥락 부정 판정을 컷 단독 추정이 되덮던 결함 수정(§9.6) ③**step3c run 좀비 수정**: attempt 단위 failed 전이 없이 재시도 소진 시 워크플로가 `mark_resolve_run_failed`(running-가드)로 닫음(§17.6). `LLM_MAX_CONCURRENCY` 운영 10 확인(R4' 종결) | §9.6, §9.9, §17.6 |
@@ -537,13 +546,14 @@ API base `/v1/toon/webtoon/`, source 필드(kakao/naver)로 통합. `imageBaseFo
 
 > 아래 규칙들이 나온 장애별 원인·수정 경위(2026-07-03~04: Step1 비멱등성, Chroma v1/유령 벡터 드리프트, Step2 자기-런 스냅샷 회귀, Step3 워커 미등록, fold 캐시 불일치, model-api 이벤트루프 블로킹 등)는 `prd-history.md` §H4.
 
-- **외부 HTTP 호출 공통 재시도 규칙**: 5xx(Cloudflare 520~526 포함) + `httpx.TransportError`(커넥션/타임아웃)만 최대 10회 지수 백오프(1s→8s 캡), **4xx는 즉시 실패**(우리 쪽 문제를 숨기면 안 됨) — `ocr_yolo_client.py`/`llm_client.py` 공통 패턴. 새로 짜는 외부 호출 코드도 이 패턴을 따를 것.
+- **외부 HTTP 호출 공통 재시도 규칙**: 5xx(Cloudflare 520~526 포함) + `httpx.TransportError`(커넥션/타임아웃)만 최대 10회 지수 백오프(1s→8s 캡), **4xx는 즉시 실패**(우리 쪽 문제를 숨기면 안 됨) — `ocr_yolo_client.py`/`llm_client.py`/`config/chroma.py`(`chroma_retry`, 2026-07-14 편입 — ChromaError `.code()>=500` + 세션 5xx 훅으로 비정형 5xx까지 커버, 액티비티 경로는 `heartbeat=` 콜백 필수) 공통 패턴. 새로 짜는 외부 호출 코드도 이 패턴을 따를 것.
 - **LLM 콜**: 스트리밍 호출(Cloudflare 터널 idle timeout 회피) + 전역 세마포어(`LLM_MAX_CONCURRENCY`, 코드 기본 1 — **운영은 10으로 상향 가동 중**, 2026-07-13 확인 → §13 R4' 종결) + primary 재시도 소진 시 **fallback 모델 런타임 전환**(§18.4). max_tokens는 기본 미전송(§18.3).
 - **Step1 멱등성**: resume(커밋된 region/face에서 복원, heartbeat_details 전달) + `ON CONFLICT DO NOTHING` 안전망(human 리뷰 필드 보호를 위해 DO UPDATE 금지).
 - **Step2 방어**: `_get_valid_appearance_ids` 유령 appearance 방어(앵커 필터+루프 내 재검증) — 단 같은 런에서 만든 신규 캐릭터는 즉시 반영. DB/Chroma 리셋은 **비원자적**이므로 "리셋이 완벽했다"고 가정하지 말 것.
 - **Temporal heartbeat**: 긴 텍스트 콜(roster/R/N)과 대용량 apply는 서브스레드 + 30초 주기 heartbeat(`_run_with_heartbeat`, §18.4) — heartbeat_timeout 초과로 인한 재시도 루프 방지. step1은 백오프 총 소요(<~55초/콜)가 heartbeat 5분보다 짧게 설계됨.
 - **model-api**: 전 라우터 동기 추론을 `run_in_threadpool`로 오프로드(이벤트루프 블로킹 해소). 클라이언트 동시 요청은 서버 워커 수에 맞춤(`_EMBED_WORKERS=2`). `HF_HUB_OFFLINE=1`은 미적용(§13 R1). PaddleOCR 주기 재시작(--max-requests)은 의도된 동작 — 재시작 윈도우의 502는 정상.
 - **Chroma REST 직접 호출은 반드시 v2**(`/api/v2/tenants/{tenant}/databases/{database}/...`) — v1은 404가 아니라 **410**을 반환해 "존재 안 함"과 오인하기 쉽다(§10).
+- **워커 내 블로킹 I/O는 유한 타임아웃 필수 — 무한 행은 durable execution 전체를 무력화 (2026-07-14 step2 실사고)**: Chroma upsert가 `timeout=None`으로 무한 행 → heartbeat 중단 → Temporal 서버는 heartbeat_timeout(2분)으로 attempt를 실패 처리하고 재시도를 스케줄했으나, **행 걸린 스레드는 다음 `activity.heartbeat()` 호출 시점에야 취소를 인지하므로 영원히 살아서 `max_concurrent_activities=1` 슬롯을 점유** → 워커가 폴링을 멈춰 재시도가 배차되지 못하는 교착(6화 얼굴 10/55에서 정지, 같은 파드의 다른 큐는 정상이라 로그만 봐선 "그냥 조용"). 재시도 정책이 아무리 관대해도 소용없다 — 타임아웃(§10) + 재시도 래핑이 근본 수정.
 - **프롬프트**: 자연어 출력은 한국어 강제(⚠️ 강조 지시). Pass-1 병렬화는 `PASS1_WORKERS`(configmap 노출), 실질 동시성 상한은 `LLM_MAX_CONCURRENCY`.
 
 ---
@@ -712,6 +722,8 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 6. **이름 없는 얼굴만 CCIP 재배치(2026-07-10 논의, 의견만·미착수)**: step2 소스(비확정) 얼굴 풀만 **현재 confirmed/named 앵커에 재매칭** → 확신 매치면 흡수, 아니면 클러스터 유지(human FaceIdentity 불가침). 효과: 대표 하나만 명명하면 나머지 이름 없는 파편이 그 앵커로 흡수돼 **과분할 청소**. **전제: CCIP v2 매칭(§18.5) 필수**(현행 min+strict 룰로 재매칭하면 magnet/과분할 재생산). **한계**: 외형 모드(측/후면) 파편은 임베딩 거리가 멀어 앵커에 안 붙음 → 여전히 human 병합. **안전**: 자동 흡수는 보수적 threshold+margin, 경계값은 `suggestion`(merge/face_reassign) 경유(§18.5 ambiguous 발행 재사용). **워크플로 위치**: 재도출(§20) **앞단** 정체성 정리 레버, 웹툰 단위 온디맨드 버튼.
 7. 이월: 재해소 Temporal 자동 트리거(§11.2) → **§20.4로 설계 정식화(구현 미착수)**, Stage N 로컬 16K 절단 실측(§13 S1), `LLM_MAX_CONCURRENCY` 실측(§13 R4'), `HF_HUB_OFFLINE`(§13 R1), 죽은 코드 정리(§13 R5).
 8. **로스터 이름 채택 가드 (2026-07-13 실사고 '봉방')**: 재실행 ep1 cut86의 OCR 파편 '봉방'(왕초 대사 조각이 별도 region으로 검출 — 1(b) 파편 dedup의 실사례)을 vision 콜 1회가 주인공 이름으로 오해석 → `name_evidence` 영속 → **로스터가 몸의 이름으로 채택** → ep1 리포트·프로필·prior로 전파, ep2 로스터도 aliases로 승계(정답 '초삼'은 ep2에서 병기됨). 같은 컷을 처리한 이전 런 4회는 전부 대사로 처리 — 프롬프트/모델 결함이 아니라 **확률적 오판 1회가 로스터→prior 체인으로 증폭**되는 구조 문제. 단일 컷 name_evidence만으로 로스터 이름 채택을 막는 가드 없음 → "이름 채택은 복수 컷 증거 또는 명시적 호명 문맥 필수" 프롬프트/결정론 가드 필요. 이미 커밋된 ep1 리포트는 정리 후 재해소로 수습(§11.2).
+9. **빈 클러스터 자동 삭제가 effective 기준이 아님 (2026-07-14 실측, 바바리안 w23 — service)**: `_delete_empty_auto_characters`가 "활성 FaceIdentity 행 존재"로 빈 것을 판정하는데, human이 딴 캐릭터로 재배정/배정해제한 얼굴은 **step2 행이 설계상 보존**돼 옛 클러스터를 계속 가리킴 → 0-effective 껍데기 클러스터가 영구 잔존(w23 실측 34개 — 사이드바에 `#id 0`으로 계속 표시). 얼굴 제외(is_used=false) 경로만 정상 삭제됨. 수정 방향: 목록 카운트와 같은 **effective(human>step2) 기준**으로 판정 교체 + 기존 껍데기 일괄 백필 + 클러스터 삭제 시 그 참조 pending suggestion 정리(§19.2 병합 이관과 동형). (부분 선해결 2026-07-14: 마스터 미배정 목록 쿼리는 soft-deleted appearance/character를 배정으로 안 침 — §11.4. 본 백로그의 `_delete_empty_auto_characters` 판정 교체·백필은 여전히 미착수.)
+10. **수동 라벨링 웹툰의 정리 UX — 엑스트라 일괄 처리 + merge 제안 위생 (2026-07-14 논의, 미착수)**: 사람이 전량 분류하는 웹툰에서 ①1~2얼굴 무명 클러스터 수십 개를 일괄 "행인 처리"(미배정 확정 + 클러스터 삭제 — RAG 정보 보존상 is_used=false보다 이쪽) + 사이드바 소형 클러스터 접기 ②pending 제안 일괄 거부 API/버튼(현재 단건 PATCH뿐, w23 실측 pending 47) ③step2가 human 확정 얼굴의 매칭 경합으로는 merge 제안을 만들지 않게(생성 억제) + 참조 캐릭터 소멸/0-effective 시 제안 자동 정리. 9번(빈 클러스터 판정)이 ①의 전제.
 
 ### 18.9 새 세션 주의사항
 
@@ -939,18 +951,18 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 
 **구조**: 결정론 가드(차단 전용) + LLM 심판(부피 처리) + human(심판이 넘긴 것만 — "억지 자동화 금지" 사용자 원칙).
 
-**LLM 심판 계약** (glm-5.2, 도시에=대상 인물 1명+관련 클러스터+제안 전문+도감 prior — 2라운드 실측에서 확정):
+**LLM 심판 계약** (glm-5.2, 서류철(dossier)=대상 인물 1명+관련 클러스터+제안 전문+도감 prior — 2라운드 실측에서 확정):
 - **판정은 suggestion_ids 기반으로 수집이 정본** — 심판의 cluster_id 필드는 신뢰 불가(묶음 판정 시 대상 id 오기입, rename으로 병합 우회 실측). sid→쌍 복원 후 가드 적용.
 - **rename-to-기존이름 = 병합으로 정규화**(§19.3과 동일 시맨틱). accept된 rename/promote 간 **이름 충돌 가드**(실측: c1731 promote '현종' vs c1659 rename '현종' 동시 accept).
-- **도시에 의도적 중복 배치 = 다관점 검증**(같은 클러스터를 후보 대상별 도시에에 중복 노출 → 모순이 표결로 드러남. 실측: c1712 조걸자칭 vs 청명 모순 검출). 도시에당 제안 수 캡 필요(88k자 도시에 3콜이 게이트웨이 재시도로 2h+ — 분할 시 웹툰당 ~40분/4-way).
+- **서류철 의도적 중복 배치 = 다관점 검증**(같은 클러스터를 후보 대상별 서류철에 중복 노출 → 모순이 표결로 드러남. 실측: c1712 조걸자칭 vs 청명 모순 검출). 서류철당 제안 수 캡 필요(88k자 서류철 3콜이 게이트웨이 재시도로 2h+ — 분할 시 웹툰당 ~40분/4-way).
 - 프롬프트 필수 규칙: named 통째 병합 accept 금지(근거가 '일부 얼굴 오식'이면 face_reassign으로), CCIP-only 근거 accept 금지, 혼합 클러스터 통째 처리 금지, 무효 제안은 needs_human이 아니라 reject(큐 제거).
 
 **결정론 가드(자동 실행 조건)** — 전부 만족 시에만:
 1. 방향 **무명 클러스터 → named** 한정 (named↔named는 항상 human — 눈검증 8쌍 중 7쌍이 '다른 인물', 유일한 같은 인물=복면 노인=청명 변장으로 정확히 human 안건이었음).
-2. 어떤 도시에서도 **혼합(mixed) 플래그 없음** / **다대상 accept 없음** / 과거 human reject 쌍 아님.
+2. 어떤 서류철에서도 **혼합(mixed) 플래그 없음** / **다대상 accept 없음** / 과거 human reject 쌍 아님.
 3. **표결 `accept ≥ 2×(reject+needs_human)`** ⭐ — GT 캘리브레이션 확정값. 화산귀환 자동후보 22건 눈검증(같은 14/다른 6/모름 2)에서 **오병합 0·참병합 9**인 유일 규칙군. 비교: 단순 다수결(acc>rej)은 오병합 6(27%) — needs_human 표를 무시한 게 원인(오판 전건이 hum≈acc 또는 hum≫acc). strict(rej==0)도 오병합 4. 놓친 참병합 5건은 human 큐에서 고표결 순으로 노출(빠른 수동 승인).
 
-**전체 큐 드라이런 성적(w17, 35도시에)**: pending 749 중 731 판정 — 자동병합(최종 규칙) 9 + 만장일치 reject 328 = **큐 45% 자동 해소, 오병합 0**. human 잔여 ~292의 실체는 혼합 클러스터 29개(얼굴 수술 영역, 텍스트로 축소 불가) + named↔named 변장/오식 판단.
+**전체 큐 드라이런 성적(w17, 서류철 35개)**: pending 749 중 731 판정 — 자동병합(최종 규칙) 9 + 만장일치 reject 328 = **큐 45% 자동 해소, 오병합 0**. human 잔여 ~292의 실체는 혼합 클러스터 29개(얼굴 수술 영역, 텍스트로 축소 불가) + named↔named 변장/오식 판단.
 
 ### 22.5 구현 순서 / 상태
 
@@ -959,7 +971,7 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
    - **백필은 마이그레이션 없이 사용자가 prod에 직접 실행**(2026-07-12): llm 몫 제외 중 named 또는 sig≠extra 해제 — 실행 후 실측 규칙위반 잔존 0(남은 제외는 전 웹툰 extra 클러스터뿐, w17은 49→24).
    - data-pipeline: `step3._sync_match_exclusion`(순수 규칙: 양방향 동기화/named 금지/human 동결) + `_project_characters` 재배선(승격 시 즉시 해제 포함) + `tests/test_match_exclusion_sync.py` 8케이스. 스위트 84 passed(orchestration 1건은 테스트서버 기동 플레이크 — 단독 재실행 통과). 커밋됨 — **배포만 남음**(컬럼·백필 모두 prod 반영돼 배포 순서 제약 없음).
 2. 정리 패스 + 심판(§22.3~22.4) — ✅ **구현 완료(2026-07-12, 세 레포 — 미배포)**:
-   - **data-pipeline**: `src/core/adjudicate.py`(도시에 구성→glm-5.2 심판(순차, 도시에당 제안 60 캡 분할)→sid 기반 교차대조+가드→`payload['judge']` 권고 영속, usage stage='judge') / `ConsolidateWebtoonWorkflow`(begin→adjudicate[STEP3_QUEUE, heartbeat]→finish) / 체인 훅(step3c 후 `consolidation_due` 판정→자식 워크플로, `consolidate_webtoon_{id}` 멱등+ABANDON, env `CONSOLIDATE_EVERY_N_RESOLVES` 기본 5) / `service_bus.send_service_task`(celery send_task — **의존성 celery[redis] 추가, 이미지 재빌드 필요**). 테스트: reconcile 가드 9케이스 + 워크플로 오케스트레이션.
+   - **data-pipeline**: `src/core/adjudicate.py`(서류철 구성→glm-5.2 심판(순차, 서류철당 제안 60 캡 분할)→sid 기반 교차대조+가드→`payload['judge']` 권고 영속, usage stage='judge') / `ConsolidateWebtoonWorkflow`(begin→adjudicate[STEP3_QUEUE, heartbeat]→finish) / 체인 훅(step3c 후 `consolidation_due` 판정→자식 워크플로, `consolidate_webtoon_{id}` 멱등+ABANDON, env `CONSOLIDATE_EVERY_N_RESOLVES` 기본 5) / `service_bus.send_service_task`(celery send_task — **의존성 celery[redis] 추가, 이미지 재빌드 필요**). 테스트: reconcile 가드 9케이스 + 워크플로 오케스트레이션.
    - **service**: 수락 로직을 뷰에서 `service/suggestion_adjudication.py`로 추출(`apply_suggestion_status` — 뷰/celery 공용, §19/§19.3/§20 훅 그대로) + `execute_adjudication`(건별 격리, 병합 primary=named 쪽 명시, 결과를 run stats.execution에 기록) / celery `execute_consolidation`(pipeline이 send_task)·`trigger_webtoon_consolidation` / `send_consolidation_trigger`(temporal.py) / API `POST consolidate/`·`GET consolidate-status/` / admin 액션 "제안 정리 패스 실행" / `AnalysisRunKind.CONSOLIDATE`+`LLMStage.JUDGE`(마이그레이션 `0034`, choices-only).
    - **webtoonmoa**: suggestions 페이지 — 심판 배지(payload.judge: 자동수락/자동기각/권고/사람판단, 표결·사유 툴팁) + "제안 정리 패스 실행" 버튼 + 최근 run 상태(5초 폴링, running일 때만). 서버측 judge 정렬은 후속(JSONB order_by — §22.4 주의 참조).
    - **배포 요건**: ①service 먼저(0034 migrate) ②data-pipeline 이미지 재빌드(celery dep) + **워커 env `BROKER_URL_`/`BROKER_PORT_`/`BROKER_PASSWORD` 추가 필요(proxmox-configuration pipeline_repo — 미노출 시 판정·권고까지만 되고 실행 위임이 enqueue_failed로 run failed, 수동 수습 가능)** ③webtoonmoa.
@@ -971,8 +983,8 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
 완료(같은 날): ~~좀비 Terminate~~(사용자 수동 종료) / ~~P7 push·배포~~(`de022ce` 이미지 가동 확인) / ~~P7 백필~~(사용자 prod 직접 실행, 위반 잔존 0) / ~~정리 패스+심판 구현~~(§22.5-2 ✅). **화산귀환은 사용자가 분석데이터 초기화 → 새 이미지(P7 v2+CCIP v2)로 전량 재실행 중** — §18.5 트랙C wipe 검증 겸함. 조걸↔윤종 스왑·프로필 재생성 등 human 노동분은 wipe로 증발(§11.4 가이드는 유효).
 
 - [x] **정리 패스 배포 (2026-07-13 실측 확인, ①~③ 완료)**: ①pipeline_repo env — `BROKER_PASSWORD`(infisical-secret) + `BROKER_URL_`/`BROKER_PORT_`/`CONSOLIDATE_EVERY_N_RESOLVES`(configmap) 노출 확인 ②service 0034 migrate 적용 확인(prod django_migrations, 07-12 10:13 UTC) ③pipeline 배포 태그 `13a796e`(=0b7d6e0 celery dep 포함) 확인. ④webtoonmoa `23eb0ad`(심판 배지 UI)만 배포 여부 미확인 — 비차단. ⚠️ 배포 이미지에 동시성 2가 포함되나 웹툰 락(`1679b03`)은 미포함 — 정리 패스 첫 발동(resolve 5개) 전에 락 커밋 배포 권장(심판↔apply pending suggestion sid 경합 방지, §9.9).
-- [x] **재실행 관찰(화산귀환) — 2026-07-13 전 항목 확인**: (a) ✅ P7+CCIP v2 효과 — ep6 시점 687얼굴→클러스터 83(v1 시절 876얼굴→773 대비 대폭 개선), llm 제외는 extra 클러스터 8건뿐(named 제외 0). (b) ✅ ep5 resolve(5개째) 직후 `consolidate_webtoon_17` 자동 발화 — run 697, 30도시에 ~3h(judge 콜별 usage 적재 확인). (c) ✅ E2E — 자동수락 1건(무명 2707→청명) celery 실행→실병합(soft-delete)→§20 프로필 재도출 훅(run 700) + 자동기각 30건, run 697 stats.execution에 결과 기록·errors 0. **자동 수확이 적은 이유 = 심판 mixed 가드(25 클러스터 혼합 판정)로 차단 — 실체는 §18.5 v2 재검증 참조(threshold 문제 아님, 천마=feature 한계/운암=이름 바인딩 오류/청명=모드 파편 → human 몫). 방향: wipe 없이 ep73(1부 종료)까지 완주 후 human 큐레이션(§18.5 재검증 결론 — 7~73 체인 kick은 사용자 실행).**
-- [ ] 후속 백로그: suggestions **서버측 judge 정렬**(JSONB order_by — 현재 배지만, §22.4 주의) / 마스터 '미배정' 목록에 human-미배정 얼굴 포함 여부(§11.4 주의) / §18.8-6 CCIP 재배치(경합쌍 해소) / Stage A(아크 종합)는 여전히 미착수.
+- [x] **재실행 관찰(화산귀환) — 2026-07-13 전 항목 확인**: (a) ✅ P7+CCIP v2 효과 — ep6 시점 687얼굴→클러스터 83(v1 시절 876얼굴→773 대비 대폭 개선), llm 제외는 extra 클러스터 8건뿐(named 제외 0). (b) ✅ ep5 resolve(5개째) 직후 `consolidate_webtoon_17` 자동 발화 — run 697, 서류철 30개 ~3h(judge 콜별 usage 적재 확인). (c) ✅ E2E — 자동수락 1건(무명 2707→청명) celery 실행→실병합(soft-delete)→§20 프로필 재도출 훅(run 700) + 자동기각 30건, run 697 stats.execution에 결과 기록·errors 0. **자동 수확이 적은 이유 = 심판 mixed 가드(25 클러스터 혼합 판정)로 차단 — 실체는 §18.5 v2 재검증 참조(threshold 문제 아님, 천마=feature 한계/운암=이름 바인딩 오류/청명=모드 파편 → human 몫). 방향: wipe 없이 ep73(1부 종료)까지 완주 후 human 큐레이션(§18.5 재검증 결론 — 7~73 체인 kick은 사용자 실행).**
+- [ ] 후속 백로그: suggestions **서버측 judge 정렬**(JSONB order_by — 현재 배지만, §22.4 주의) / ~~마스터 '미배정' 목록에 human-미배정 얼굴 포함 여부(§11.4 주의)~~ → **2026-07-14 구현**(§11.4) / §18.8-6 CCIP 재배치(경합쌍 해소) / Stage A(아크 종합)는 여전히 미착수.
 - 참고: 파이프라인 신규 테스트(reconcile 가드 9·워크플로 오케스트레이션·P7 동기화 8케이스)는 `tests/`가 gitignore라 로컬 보관(기존 테스트 전부와 동일 관례) — 커밋엔 미포함.
 
 ### 22.6 수렴 가드 — regen 산출 제안은 자동판정 제외 (2026-07-14)
@@ -992,3 +1004,44 @@ Pass-2a 한 콜(정체+화자+비트+요약+떡밥+책략)의 attention 분산�
   "regen이 만든 신호는 한 박자 쉬고 사람이 먼저 본다".
 - 쿨다운(웹툰당 정리 패스 최소 간격) 방식과 비교해 이쪽을 채택 — 트리거 빈도를 건드리지 않고
   증폭의 원인(regen 산출의 즉시 재소비)만 정확히 차단한다.
+
+### 22.7 심판 패스 서류철 액티비티 분해 — 중간 저장 (2026-07-14 구현, 배포 대기)
+
+> **용어**: 기존 "도시에"(dossier 음차)를 **"서류철"** 로 개칭(코드 로그/주석/프롬프트/prd 일괄,
+> 2026-07-14) — 영문 식별자(`_MAX_SUGGESTIONS_PER_DOSSIER`, stats 키 `dossiers`, 그룹명
+> `char_{id}_p{n}`)는 코드 계약이라 유지.
+
+- **계기**: 심판 패스가 서류철 37개 × 콜 수 분(완성 3만+ 토큰 관측) = 2~4시간인데, 단일
+  액티비티라 워커 재시작/배포마다 LLM 콜 전량 재실행. 개발기(배포 잦음)에 시간 손실이 큼.
+  또 웹툰 락을 패스 전체(수 시간) 동안 점유해 같은 웹툰 step3c apply가 통째로 대기했다.
+- **구조**: `ConsolidateWebtoonWorkflow` = begin → **plan**(서류철 계획 스냅샷, DB만)
+  → **judge_dossier × N**(서류철 1개=액티비티 1개=LLM 콜 1개, 순차) → **reconcile**(표결
+  취합→교차대조/가드→`payload['judge']` 영속) → finish. 코어는 `adjudicate.py`의
+  `plan_webtoon`/`judge_dossier`/`reconcile_pass` 3분할(단계 간 데이터는 JSON 직렬화 —
+  서류철 텍스트는 히스토리 비대 방지를 위해 judge가 DB에서 재구성).
+- **중간 저장의 본체**: 완료된 서류철 판정은 재시작/배포에도 재실행되지 않는다. 서류철
+  하나의 최종 실패(_REGEN_RETRY 5회 소진)는 call_error로 격리하고 패스는 계속(종전 인라인
+  2회 재시도보다 강화).
+- **표(votes)는 워크플로 히스토리가 아니라 DB 스크래치로 (2026-07-14 리뷰 후속)**: 전 서류철
+  표를 reconcile 입력 페이로드 하나로 모으면 **Temporal 단일 페이로드 한도 2MB 초과**
+  가능(ensure_ascii로 한글 reason 자당 6바이트 — 서류철 35×표 60×300자 = 3.7MB 산술 확인;
+  전 LLM 콜 소진 후 취합 직전에 패스가 영구 정지하는 최악 실패 지점). judge가
+  `payload['judge_votes'][서류철명]`에 영속(**서류철 단위 멱등** — 스냅샷 sid 전체에서
+  해당 서류철 키 제거 후 재기입, attempt 재시도 잔표 섞임 방지 / pending 가드)하고
+  reconcile이 pending에서 취합, **청소는 finish가**(reconcile 안에서 지우면 청소 커밋↔완료
+  보고 사이 크래시 시 재시도가 빈 표로 noop — 취합 재시도 멱등 보존), plan이 직전 패스
+  크래시 잔재 청소. 워크플로에는 소형 요약(mixed/카운트)만 흐른다. 만장일치 reject 목록도
+  smap(생존 sid) 필터 추가. ⚠️ 운영 주의: 패스 진행 중 `_suggest_dryrun.py`류로
+  `plan_webtoon`을 수동 실행하면 진행 중인 표를 지운다.
+- **락 세분화(부수 개선)**: 락이 서류철 사이마다 풀려 정규 체인 apply가 끼어들 수 있다.
+  그 틈에 apply의 delete-reinsert로 소멸한 sid는 계획 스냅샷 기준 judge/reconcile 가드가
+  버린다 — 정합성 훼손이 아니라 수확 감소로 수렴(다음 정리 패스가 새 pending으로 재판정).
+- **관측성(같은 날)**: 계획 요약(인물/pending/그룹→서류철 수/모델), 서류철별 콜 시작·완료
+  라인(소요초, 판정 수, accept/reject/needs_human 분포, mixed 수), 실패 attempt 번호.
+- **호환/배포**: 구 `consolidation_adjudicate` 액티비티 등록 유지 + **워크플로가
+  `workflow.patched("consolidate-dossier-split")` 분기**(2026-07-14 리뷰 후속) — 배포 시점에
+  돌던 `consolidate_webtoon_{id}`는 구 경로로 리플레이되고 신규 실행만 3분할을 탄다.
+  **in-flight terminate 불필요**(액티비티 등록 유지만으로는 리플레이 비결정성을 못 구한다는
+  리뷰 지적의 해소). 다음 대청소 때 patch를 deprecate → 제거하는 2단계 수순은 선택.
+- 테스트: 오케스트레이션 순서(begin→plan→judge×2→reconcile→finish) + 서류철 실패 격리
+  (`tests/test_workflow_orchestration.py`).

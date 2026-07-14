@@ -79,6 +79,18 @@ class ConsolidateInput:
 
 
 @dataclass
+class FaceChromaSyncInput:
+    """human 얼굴 교정의 실시간 Chroma 투영(T3, prd §10) 입력 — service가 발화.
+
+    face_detection_ids: 단건 교정은 1개, bulk 재배정은 여러 개(워크플로 1개로 묶음 —
+    호출당 Temporal 커넥션 비용을 얼굴 수만큼 내지 않기 위해)."""
+    source: str
+    title_id: str
+    webtoon_id: int
+    face_detection_ids: list[int]
+
+
+@dataclass
 class RegenInput:
     """캐릭터 재분석(재도출) 입력 — RegenerateCharacterWorkflow(§20).
 

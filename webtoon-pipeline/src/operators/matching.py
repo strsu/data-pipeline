@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from typing import Optional, TypedDict
 
+from src.config.chroma import chroma_retry
 from src.operators.embedding import ccip_compare
 
 # ── 과병합(magnet)·과분할(파편화) 방지 파라미터 (env로 튜닝, 코드 하드코딩 없음) ──────
@@ -39,13 +40,15 @@ def load_ccip_anchors(
     collection,
     excluded_appearance_ids: Optional[list[int]] = None,
     max_per_appearance: int = _MAX_ANCHORS_PER_APPEARANCE,
+    heartbeat=None,
 ) -> list[CcipAnchor]:
     """ccip 매칭용 anchor 캐시를 1회 적재(에피소드 처리 시작 시 한 번).
 
     인물(appearance_id)당 앵커를 conf 상위 `max_per_appearance`개로 제한한다(magnet 방지).
-    max_per_appearance<=0이면 무제한(옛 동작).
+    max_per_appearance<=0이면 무제한(옛 동작). heartbeat는 chroma_retry 대기 중 콜백.
     """
-    got = collection.get(include=["embeddings", "metadatas"])
+    got = chroma_retry("anchors_get", collection.get, heartbeat=heartbeat,
+                       include=["embeddings", "metadatas"])
     embeddings = got.get("embeddings")
     embeddings = [] if embeddings is None else list(embeddings)
     metadatas = got.get("metadatas")
@@ -77,14 +80,17 @@ def find_match(
     threshold: float,
     excluded_appearance_ids: Optional[list[int]] = None,
     ccip_anchors: Optional[list[CcipAnchor]] = None,
+    heartbeat=None,
 ) -> Optional[dict]:
     if metric_type == "ccip":
         return _find_match_ccip(feature, threshold, ccip_anchors or [])
-    return _find_match_cosine(collection, feature, threshold, excluded_appearance_ids)
+    return _find_match_cosine(collection, feature, threshold, excluded_appearance_ids,
+                              heartbeat=heartbeat)
 
 
 def _find_match_cosine(
-    collection, feature: list[float], threshold: float, excluded_appearance_ids: Optional[list[int]] = None
+    collection, feature: list[float], threshold: float,
+    excluded_appearance_ids: Optional[list[int]] = None, heartbeat=None,
 ) -> Optional[dict]:
     try:
         if collection.count() == 0:
@@ -92,7 +98,9 @@ def _find_match_cosine(
     except Exception:
         pass
     where = {"appearance_id": {"$nin": excluded_appearance_ids}} if excluded_appearance_ids else None
-    qr = collection.query(
+    qr = chroma_retry(
+        "query", collection.query,
+        heartbeat=heartbeat,
         query_embeddings=[feature],
         n_results=1,
         where=where,
