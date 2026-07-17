@@ -37,7 +37,7 @@ from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.r2 import delete_face_crop, upload_face_crop
 from src.config.s3 import fetch_cut_image
-from src.operators.cut_merger import _content_intervals
+from src.operators.cut_merger import _content_intervals, split_tall_interval
 from src.operators.ocr_yolo_client import run_ocr, run_yolo
 
 logger = logging.getLogger(__name__)
@@ -500,6 +500,19 @@ def _iter_episode_segments(
             forced=forced,
         )
 
+    def _emit(arr: np.ndarray, y0: int, y1: int, *, forced: bool):
+        """구간 [y0,y1)을 방출한다 — **OCR이 못 읽을 만큼 크면 먼저 쪼갠다**(2026-07-17).
+
+        여백 밴드가 없어 `_content_intervals`가 못 끊은 구간은 수천 px로 자라고, 통짜로 OCR에
+        넣으면 리사이즈에서 글자가 뭉개져 거의 못 읽는다(실측 690x7965 → 4개 vs 컷단위 33개;
+        `segment-oversize-2026-07-17.md`). 방출 경로가 3곳(hard cap/final flush/terminated)이라
+        **여기 한 군데에서** 분할해 셋 다 덮는다. seg_index는 호출부에서 증가시킨다.
+        """
+        nonlocal seg_index
+        for (a, b) in split_tall_interval(arr, y0, y1):
+            yield _make_segment(arr, a, b, seg_index, forced=forced)
+            seg_index += 1
+
     # ── 윈도우 메인 루프 ──────────────────────────────────────────────────────
     # 한 번의 반복: 리필 → 분할 → (하드 캡 강제 방출: Task 4.3) → (최종 flush / 방출·이월:
     # Task 4.2) → 폐기. 하드 캡 검사는 최종 flush보다 **먼저** 수행한다(Req 4.1) — 마지막 컷이
@@ -535,8 +548,7 @@ def _iter_episode_segments(
         #   마지막 컷이 컷을 소진하면서 동시에 cap을 넘겨도, 여기서 forced 분할 후 잔여가 아래
         #   최종 flush로 forced=False 방출된다.
         if single_unterminated and buf.height >= cap_px:
-            yield _make_segment(arr, 0, cap_px, seg_index, forced=True)
-            seg_index += 1
+            yield from _emit(arr, 0, cap_px, forced=True)
             buf.discard_before(cap_px)
             continue
 
@@ -547,8 +559,7 @@ def _iter_episode_segments(
         #    이어 처리한다.
         if not _cuts_remaining() and buf.height <= arr.shape[0]:
             for (y0, y1) in intervals:
-                yield _make_segment(arr, y0, y1, seg_index, forced=False)
-                seg_index += 1
+                yield from _emit(arr, y0, y1, forced=False)
             buf.discard_before(buf.height)  # 버퍼 비움 → 루프 종료
             continue
 
@@ -562,8 +573,7 @@ def _iter_episode_segments(
         # 안전하게 방출한다(Req 2.2). 마지막 구간은 종료가 진짜 공백 밴드 때문인지 버퍼가
         # 거기서 잘렸기 때문인지 알 수 없으므로 항상 미확정으로 보고 이월한다(Req 2.3).
         for (y0, y1) in terminated:
-            yield _make_segment(arr, y0, y1, seg_index, forced=False)
-            seg_index += 1
+            yield from _emit(arr, y0, y1, forced=False)
 
         # ── 단일 미종료 블록이 아직 cap_px 미만이면 다음 컷을 적재해 cap_px를 향해 성장한다
         #    (단일 미종료 블록은 budget_px에 묶이지 않고 MAX_BUFFER_PX까지 성장해야 강제 방출
