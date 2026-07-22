@@ -39,6 +39,12 @@ SPLIT_SEARCH_RATIO = 0.15
 # 목표를 이 배수 이내로 넘는 구간은 쪼개지 않는다(자투리 세그먼트 방지).
 SPLIT_SLACK = 1.2
 
+# ── 세그먼트 하한 (2026-07-22 추가, split의 대칭) ─────────────────────────────
+# 여백 갭이 잦은 연출(대사 몇 개 + 넓은 여백)에서는 콘텐츠 구간이 수십 px로 파편화된다(실측:
+# 3px 세그먼트도 존재). 너무 작은 세그먼트는 OCR·분석 문맥이 부족하고 세그먼트 수만 늘린다.
+# MAX(split)의 대칭으로, MIN 아래 구간은 이웃과 병합해(사이 여백 갭 포함) 적정 크기로 만든다.
+MIN_SEGMENT_PX = 300
+
 
 def _is_near_uniform_block(block: np.ndarray, tol: int, ratio: float) -> bool:
     """블록(픽셀 N×채널)의 ratio 이상이 대표색(채널 중앙값)에 tol 이내로 가까우면
@@ -92,6 +98,31 @@ def split_tall_interval(
         s = cut
     out.append((s, y1))
     return out
+
+
+def merge_short_intervals(
+    intervals: list[tuple[int, int]], min_h: int = MIN_SEGMENT_PX, max_h: int = MAX_SEGMENT_PX,
+) -> list[tuple[int, int]]:
+    """MIN_SEGMENT_PX 미만 콘텐츠 구간을 이웃과 병합(split의 대칭).
+
+    파편(예 3px)을 인접 구간에 흡수해 적정 크기(문맥 확보·세그먼트 수 감소)로 만든다. 병합은 사이
+    여백 갭을 포함하지만(OCR엔 무해) max_h는 넘기지 않는다(넘기면 split_tall_interval이 뒤에서 재분할).
+    forward 병합: 짧은 구간을 다음 구간과 합친다. 마지막이 짧으면 직전과 합친다. 반환은 읽기순.
+    """
+    if not intervals:
+        return intervals
+    out: list[list[int]] = [list(intervals[0])]
+    for y0, y1 in intervals[1:]:
+        prev = out[-1]
+        if (prev[1] - prev[0]) < min_h and (y1 - prev[0]) <= max_h:
+            prev[1] = y1          # 짧은 prev를 현재까지 확장(갭 포함)
+        else:
+            out.append([y0, y1])
+    # 꼬리 구간이 짧으면 직전과 병합(max_h 이내일 때만).
+    if len(out) >= 2 and (out[-1][1] - out[-1][0]) < min_h and (out[-1][1] - out[-2][0]) <= max_h:
+        out[-2][1] = out[-1][1]
+        out.pop()
+    return [(a, b) for a, b in out]
 
 
 def _content_intervals(

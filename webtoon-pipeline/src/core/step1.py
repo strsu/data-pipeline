@@ -37,7 +37,7 @@ from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.r2 import delete_face_crop, upload_face_crop
 from src.config.s3 import fetch_cut_image
-from src.operators.cut_merger import _content_intervals, split_tall_interval
+from src.operators.cut_merger import _content_intervals, merge_short_intervals, split_tall_interval
 from src.operators.ocr_yolo_client import run_ocr, run_yolo
 
 logger = logging.getLogger(__name__)
@@ -534,6 +534,9 @@ def _iter_episode_segments(
         # 블록(종료 구간 없음 + 블록이 버퍼 맨 앞 0에서 시작)인지 판정한다.
         if intervals:
             *terminated, last = intervals
+            # 파편(MIN_SEGMENT_PX 미만) 완결 구간을 이웃과 병합(split의 대칭). carry-over(last)는
+            # 다음 윈도우에서 성장할 수 있으므로 병합 대상 아님 — 완결된 terminated에만 적용.
+            terminated = merge_short_intervals(terminated)
             carry_start = last[0]  # 이월(Carry_Over_Block) 블록의 버퍼 로컬 시작
         else:
             terminated, last, carry_start = [], None, None
