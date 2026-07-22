@@ -223,9 +223,26 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
             )
 
     if face_ids:
+        fids = list(face_ids)
         with db_cursor() as cur:
-            cur.execute("DELETE FROM analysis_face_embedding WHERE detection_id = ANY(%s)", (list(face_ids),))
-            cur.execute("DELETE FROM analysis_face_detection WHERE id = ANY(%s)", (list(face_ids),))
+            # 재탐지는 이 detection들을 무효화하므로, detection을 참조하는 파생 행을 먼저 정리한다
+            # (안 그러면 FK 위반으로 삭제 실패). 제안(AI 검토 큐)·step2 정체·임베딩은 재생성 가능한
+            # 기계 산출물이라 삭제 안전. **human 정체(source='human')는 남긴다** — 삭제하면 수동
+            # 라벨이 소멸하므로, 남겨두면 detection FK가 걸려 라벨 있는 회차의 파괴적 재실행을
+            # 막는 가드로 작동한다(라벨 회차 재실행은 명시적 라벨 처리 후에만).
+            cur.execute("DELETE FROM analysis_suggestion WHERE detection_id = ANY(%s)", (fids,))
+            cur.execute(
+                "DELETE FROM analysis_face_identity WHERE detection_id = ANY(%s) AND source <> 'human'",
+                (fids,),
+            )
+            # 대표 crop 참조(flow-first 슬롯 필드)는 재탐지로 무효 → NULL(SET_NULL 의도, DB는 NO ACTION).
+            cur.execute(
+                "UPDATE analysis_character_appearance SET representative_detection_id = NULL "
+                "WHERE representative_detection_id = ANY(%s)",
+                (fids,),
+            )
+            cur.execute("DELETE FROM analysis_face_embedding WHERE detection_id = ANY(%s)", (fids,))
+            cur.execute("DELETE FROM analysis_face_detection WHERE id = ANY(%s)", (fids,))
 
 
 def prepare_episode_yolo(webtoon_episode_id: int, source: str, title_id: str) -> None:
