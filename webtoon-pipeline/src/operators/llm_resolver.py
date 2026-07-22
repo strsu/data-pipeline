@@ -57,6 +57,8 @@ def _row_to_ctx(row) -> dict:
         "model_id": row[3],
         "params": _parse_params(row[4]),
         "supports_vision": bool(row[5]),
+        # row[6]=fallback_id(호출부가 직접 사용), row[7]=collect_io(teacher 입출력 수집).
+        "collect_io": bool(row[7]) if len(row) > 7 else False,
     }
 
 
@@ -69,7 +71,7 @@ def _resolve_fallback(cur, fallback_id) -> Optional[dict]:
         return None
     cur.execute(
         """
-        SELECT id, name, provider, model_id, params, supports_vision
+        SELECT id, name, provider, model_id, params, supports_vision, NULL AS fallback_id, collect_io
         FROM config_llm_model
         WHERE id = %s AND is_active = true AND deleted_at IS NULL
         """,
@@ -99,7 +101,7 @@ def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
             # 1) role 기본 모델(도출): is_default·is_active·supports_vision 일치.
             cur.execute(
                 """
-                SELECT id, name, provider, model_id, params, supports_vision, fallback_id
+                SELECT id, name, provider, model_id, params, supports_vision, fallback_id, collect_io
                 FROM config_llm_model
                 WHERE is_default = true AND is_active = true
                   AND supports_vision = %s AND deleted_at IS NULL
@@ -113,7 +115,7 @@ def resolve_llm_model(webtoon_id: int, role: str = VISION) -> dict:
                 # 2) 강등: modality 무관 아무 활성 기본(시드 전/롤백 경로 — 오늘 동작 유지).
                 cur.execute(
                     """
-                    SELECT id, name, provider, model_id, params, supports_vision, fallback_id
+                    SELECT id, name, provider, model_id, params, supports_vision, fallback_id, collect_io
                     FROM config_llm_model
                     WHERE is_default = true AND is_active = true AND deleted_at IS NULL
                     ORDER BY id ASC

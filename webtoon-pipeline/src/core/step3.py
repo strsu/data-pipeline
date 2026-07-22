@@ -25,6 +25,7 @@ from psycopg2.extras import Json
 from src.config.db import db_cursor
 from src.config.s3 import fetch_cut_image
 from src.operators import narrative_context
+from src.operators.hangul import canonical_of, name_match
 from src.operators.llm_client import call_llm_json
 from src.operators.llm_resolver import TEXT, VISION, resolve_llm_model
 from src.operators.overlay import overlay_faces
@@ -645,6 +646,15 @@ def extract_cut(
 
     result = _sanitize_pass1(raw_result, regions)
 
+    # teacher 입출력 수집(collect_io 모델만) — 원문 raw_text/오버레이 컷 참조.
+    _record_llm_sample(
+        call_ctx, stage=_PASS1_STAGE, system_prompt=_PASS1_SYSTEM_PROMPT, user_text=user_text,
+        image_refs=[{"cut_id": cut_id, "kind": "pass1_overlay"}],
+        raw_output=getattr(call, "raw_text", "") or "", repaired=getattr(call, "repaired", False),
+        finish_reason=(usage or {}).get("finish_reason"),
+        webtoon_id=webtoon_id, episode_id=webtoon_episode_id, cut_id=cut_id, run_id=run_id,
+    )
+
     # provisional 적재(Req 1.9) — 블록은 1:1로 region에 매핑, scene meta는 cut_scene_meta.
     if persist:
         region_by_index = {r["index"]: r["region_id"] for r in regions}
@@ -744,6 +754,46 @@ def _insert_llm_usage(
                 now, now,
             ),
         )
+
+
+def _record_llm_sample(
+    ctx: Optional[dict], *, stage: str, system_prompt: str, user_text: str,
+    image_refs: Optional[list], raw_output: str, repaired: bool,
+    finish_reason: Optional[str], webtoon_id: int,
+    episode_id: Optional[int], cut_id: Optional[int], run_id: Optional[int] = None,
+) -> None:
+    """teacher 증류용 입출력 원문 적재 — 모델 ctx에 collect_io가 켜져 있을 때만(그 외 no-op).
+
+    학습쌍 = (system_prompt + user_text + image_refs가 가리키는 이미지) → raw_output.
+    이미지는 인라인 X, cut 참조(R2에 이미 있음·렌더 결정론)로 저장해 행을 텍스트만으로 유지한다.
+    실패해도 run을 중단하지 않는다(수집은 부가기능 — 분석 흐름 불가침).
+    """
+    if not (ctx and ctx.get("collect_io")):
+        return
+    model_id = ctx.get("id")
+    if model_id is None or not raw_output:
+        return
+    now = datetime.now(timezone.utc)
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO analysis_llm_sample
+                    (webtoon_id, episode_id, cut_id, stage, llm_model_id,
+                     system_prompt, user_text, image_refs, raw_output,
+                     finish_reason, repaired, run_id, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    webtoon_id, episode_id, cut_id, stage, model_id,
+                    system_prompt or "", user_text or "",
+                    Json(image_refs or []), raw_output,
+                    finish_reason, bool(repaired), run_id, now, now,
+                ),
+            )
+    except Exception as e:  # noqa: BLE001 — 수집 실패는 분석을 막지 않는다.
+        logger.warning("[step3.sample] 입출력 수집 실패(stage=%s ep=%s cut=%s): %s",
+                       stage, episode_id, cut_id, e)
 
 
 def _init_belief() -> dict:
@@ -1504,6 +1554,12 @@ def extract_roster(
     if persist_usage:
         _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
                           stage=_ROSTER_STAGE, image_count=None, run_id=run_id)
+        _record_llm_sample(
+            ctx, stage=_ROSTER_STAGE, system_prompt=_ROSTER_SYSTEM_PROMPT, user_text=user_text,
+            image_refs=[], raw_output=getattr(call, "raw_text", "") or "",
+            repaired=getattr(call, "repaired", False), finish_reason=(usage or {}).get("finish_reason"),
+            webtoon_id=webtoon_id, episode_id=webtoon_episode_id, cut_id=None, run_id=run_id,
+        )
     present = sum(1 for r in roster if r.get("present_now"))
     logger.info("[step3.roster] episode %s — 로스터=%s (present_now=%s) tokens=%s",
                 webtoon_episode_id, len(roster), present, (usage or {}).get("total_tokens"))
@@ -1668,37 +1724,62 @@ def consolidate_episode(
 
 
 def _commit_slots(webtoon_episode_id: int, webtoon_id: int, slots: dict, now: datetime,
-                  run_id: Optional[int] = None) -> dict:
+                  run_id: Optional[int] = None, link: Optional[dict] = None) -> dict:
     """정리 슬롯을 회차스코프 CharacterAppearance로 커밋. 반환 {slot: (character_id, appearance_id)}.
 
-    Increment-1(링커 없음): 슬롯당 새 cluster Character + episode-scoped appearance(persona). 교차회차
-    결합(비요른=여러 회차)은 Phase 4 링커가 persona로 수행한다. 여기선 회차 내 슬롯 확정만.
-    부분 unique(episode,character,local_id)로 재실행 시 in-place 갱신.
+    link(Phase 4): {slot: 기존 character_id} — persona로 교차회차 결합된 슬롯은 그 인물의 appearance로
+    붙이고 persona를 누적(회차마다 재도출 말고 증거로 갱신=드리프트 해법). 미링크 슬롯만 새 cluster.
+    부분 unique(episode,character,local_id)로 재실행 시 in-place 갱신(prepare가 선삭제).
     """
+    link = link or {}
+    episode_no = _episode_info(webtoon_episode_id)["episode_no"]
     slot_map: dict = {}
     with db_cursor() as cur:
         for local_id, info in slots.items():
-            persona = json.dumps({"desc": info.get("persona", "")}, ensure_ascii=False)
+            desc = info.get("persona", "")
             prominence = info.get("prominence") or ""
-            cur.execute(
-                """
-                INSERT INTO analysis_character (webtoon_id, kind, name, aliases, extra,
-                    is_confirmed, is_name_auto_assigned, is_match_excluded, created_at, updated_at)
-                VALUES (%s, 'cluster', '', '[]'::jsonb, '{}'::jsonb, false, false, false, %s, %s)
-                RETURNING id
-                """,
-                (webtoon_id, now, now),
-            )
-            character_id = cur.fetchone()[0]
+            linked_cid = link.get(local_id)
+            if linked_cid:
+                # 기존 인물에 결합 — persona 누적(desc=최신 + variants 이력) + last_seen 갱신.
+                cur.execute("SELECT persona FROM analysis_character WHERE id = %s", (linked_cid,))
+                row = cur.fetchone()
+                prev = (row[0] if row else None) or {}
+                variants = list(prev.get("variants") or [])
+                if desc and desc not in variants:
+                    variants.append(desc)
+                persona = json.dumps({"desc": desc or prev.get("desc", ""), "variants": variants},
+                                     ensure_ascii=False)
+                cur.execute(
+                    "UPDATE analysis_character SET persona = %s::jsonb, last_seen_ep = %s, updated_at = %s "
+                    "WHERE id = %s AND is_confirmed = false",
+                    (persona, episode_no, now, linked_cid),
+                )
+                character_id, method = linked_cid, "persona"
+            else:
+                persona = json.dumps({"desc": desc, "variants": [desc] if desc else []},
+                                     ensure_ascii=False)
+                cur.execute(
+                    """
+                    INSERT INTO analysis_character (webtoon_id, kind, name, aliases, extra, persona,
+                        first_seen_episode_id, last_seen_ep, is_confirmed, is_name_auto_assigned,
+                        is_match_excluded, created_at, updated_at)
+                    VALUES (%s, 'cluster', '', '[]'::jsonb, '{}'::jsonb, %s::jsonb, %s, %s,
+                            false, false, false, %s, %s)
+                    RETURNING id
+                    """,
+                    (webtoon_id, persona, webtoon_episode_id, episode_no, now, now),
+                )
+                character_id, method = cur.fetchone()[0], "new"
             cur.execute(
                 """
                 INSERT INTO analysis_character_appearance
                     (character_id, label, episode_id, local_id, persona, prominence,
                      link_method, link_confidence, is_canonical, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, 'persona', NULL, false, %s, %s)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, NULL, false, %s, %s)
                 RETURNING id
                 """,
-                (character_id, local_id, webtoon_episode_id, local_id, persona, prominence, now, now),
+                (character_id, local_id, webtoon_episode_id, local_id,
+                 json.dumps({"desc": desc}, ensure_ascii=False), prominence, method, now, now),
             )
             appearance_id = cur.fetchone()[0]
             slot_map[local_id] = (character_id, appearance_id)
@@ -1781,6 +1862,153 @@ def _project_names(character_ids: list[int], now: datetime) -> int:
     return projected
 
 
+_LINK_SYSTEM_PROMPT = """교차회차 인물 링커(redesign §13·14·16). prior 로스터(이전 회차에서 확정된 인물의
+name + 고유 persona 지문)와 현재 회차 익명 슬롯(persona)을 받아, **오직 고유 어미·말버릇·관계로**
+매칭하라 — 역할어(리더/POV/탱커/베테랑)·외모는 금지(여러 명이 공유하므로 근거 아님).
+⚠️ **어미·말투가 명백히 다르면 절대 매칭하지 마라**(예: `~냥/~당` 애교체 슬롯을 반말 인물에, 또는
+하오체 슬롯을 해라체 인물에 매칭 금지). 같은 인물은 회차가 바뀌어도 말버릇이 유지된다 — 그 연속성이
+유일한 근거다. 조금이라도 애매하면 null(신규로 두는 게 오매칭보다 낫다). 한 prior 인물은 현재 슬롯
+최대 1개. confidence는 어미 일치의 확실성이다(느슨히 주지 마라). JSON만:
+{"link": {"A": {"name": "prior 이름 또는 null", "confidence": 0~1, "matched_ending": "일치한 고유 어미"}, ...}}"""
+
+_LINK_CONF_THR = 0.65  # persona LLM 링크 수락 임계 — 저확신 링크는 거부(오매칭 방지, redesign §16).
+
+
+def _load_prior_roster(webtoon_id: int, before_episode_no: int) -> list[dict]:
+    """이전 회차들에서 명명된 인물(persona 보유) — 링커 매칭 대상. 자기 회차는 제외(before)."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, persona->>'desc'
+            FROM analysis_character
+            WHERE webtoon_id = %s AND name <> '' AND deleted_at IS NULL
+              AND persona ? 'desc' AND (last_seen_ep IS NULL OR last_seen_ep < %s)
+            ORDER BY last_seen_ep DESC NULLS LAST
+            LIMIT 60
+            """,
+            (webtoon_id, before_episode_no),
+        )
+        return [{"char_id": r[0], "name": r[1], "persona": r[2] or ""} for r in cur.fetchall()]
+
+
+def _link_slots(webtoon_id: int, webtoon_episode_id: int, slots: dict, names: list[dict],
+                ctx: dict, run_id: Optional[int] = None) -> dict:
+    """현재 회차 슬롯 → 기존 인물(char_id) 매칭(redesign Phase 4). 반환 {slot: char_id}.
+
+    ① persona LLM 매칭(고유 어미·말버릇·관계) ② 이름 fallback(self/card 이름이 prior와 name_match:
+    자모+substring). prior 없으면 빈 dict(전부 신규). 실패 격리.
+    """
+    episode_no = _episode_info(webtoon_episode_id)["episode_no"]
+    prior = _load_prior_roster(webtoon_id, episode_no)
+    if not prior:
+        return {}
+    by_name = {p["name"]: p["char_id"] for p in prior}
+    linked: dict = {}
+    # ① persona LLM 매칭
+    prior_txt = "\n".join(f"  {p['name']}: {p['persona']}" for p in prior)
+    slots_txt = "\n".join(f"  {s}: {v.get('persona', '')}" for s, v in slots.items())
+    try:
+        call = call_llm_json(_pass2_ctx(ctx), _LINK_SYSTEM_PROMPT,
+                             f"[prior 로스터]\n{prior_txt}\n\n[현재 회차 슬롯]\n{slots_txt}", [])
+        used: set = set()
+        for slot, info in ((call.result or {}).get("link") or {}).items():
+            nm = (info or {}).get("name") if isinstance(info, dict) else None
+            conf = float((info or {}).get("confidence", 0) or 0) if isinstance(info, dict) else 0.0
+            if not nm or slot not in slots or conf < _LINK_CONF_THR:
+                continue  # 저확신 persona 링크 거부(오매칭 방지) — 신규로 둔다
+            for p in prior:
+                if p["char_id"] in used:
+                    continue
+                if name_match(nm, p["name"]):
+                    linked[slot] = p["char_id"]
+                    used.add(p["char_id"])
+                    break
+        if run_id is not None:
+            _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), call.usage or {},
+                              stage=_ROSTER_STAGE, image_count=None, run_id=run_id)
+    except Exception as e:  # noqa: BLE001 — 링커 실패 격리(전부 신규로 진행)
+        logger.warning("[step3.link] episode %s — persona 링크 실패(신규 진행): %s", webtoon_episode_id, e)
+    # ② 이름 fallback — 그 인물을 직접 가리키는 이름(자칭·카드·나레이션 주어)이 prior와 name_match면
+    #    결합(persona 링크가 저확신으로 거부됐어도 고정밀 이름링크로 복원). vocative(호격=상대)는 제외.
+    slot_names = {n["slot"]: n["surface"] for n in names
+                  if n.get("role") in ("self", "card", "narration_subject")}
+    for slot, surf in slot_names.items():
+        if slot in linked:
+            continue
+        for p in prior:
+            if name_match(surf, p["name"]):
+                linked[slot] = p["char_id"]
+                break
+    return linked
+
+
+def _merge_characters(cur, keep_id: int, drop_id: int, now: datetime) -> None:
+    """flow character 병합 — drop의 appearance·name_edge·화자귀속을 keep으로 재지정 후 drop 소프트삭제.
+
+    같은 회차 같은 local_id 충돌(한 회차에 한 인물 두 슬롯 = within-episode 과분할)은 drop 쪽
+    appearance를 소프트삭제로 흡수(부분 unique 위반 방지). is_confirmed 인물은 병합 대상 아님(상위에서 필터).
+    """
+    cur.execute(
+        """UPDATE analysis_character_appearance a SET character_id = %s, updated_at = %s
+           WHERE character_id = %s AND NOT EXISTS (
+               SELECT 1 FROM analysis_character_appearance b
+               WHERE b.character_id = %s AND b.episode_id = a.episode_id AND b.local_id = a.local_id
+                 AND b.deleted_at IS NULL)""",
+        (keep_id, now, drop_id, keep_id),
+    )
+    cur.execute("UPDATE analysis_character_appearance SET deleted_at = %s WHERE character_id = %s AND deleted_at IS NULL",
+                (now, drop_id))  # 충돌로 못 옮긴 잔여 흡수
+    cur.execute("UPDATE analysis_name_edge SET character_id = %s, updated_at = %s WHERE character_id = %s",
+                (keep_id, now, drop_id))
+    cur.execute("UPDATE analysis_text_annotation SET speaker_id = %s, updated_at = %s WHERE speaker_id = %s",
+                (keep_id, now, drop_id))
+    cur.execute("UPDATE analysis_character SET deleted_at = %s WHERE id = %s", (now, drop_id))
+
+
+def _dedup_flow_roster(webtoon_id: int, now: datetime) -> int:
+    """flow 로스터 dedup(redesign §16·17 부분이름 중복) — 같은 인물의 표면형 char들을 병합.
+
+    name_match(자모+substring)로 그룹핑 → 정본(더 완전한 이름/최다 등장)에 병합. 링커 가드가 오매칭
+    대신 중복(로트밀러/브라운 로트밀러·드왈키×2)을 남기는 트레이드오프의 사후 정리. is_confirmed 제외.
+    반환: 병합한 char 수.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """SELECT ch.id, ch.name,
+                 (SELECT count(*) FROM analysis_character_appearance a
+                  WHERE a.character_id = ch.id AND a.deleted_at IS NULL) AS eps
+               FROM analysis_character ch
+               WHERE ch.webtoon_id = %s AND ch.name <> '' AND ch.persona ? 'desc'
+                 AND ch.is_confirmed = false AND ch.deleted_at IS NULL
+               ORDER BY eps DESC, length(ch.name) DESC""",
+            (webtoon_id,),
+        )
+        chars = [{"id": r[0], "name": r[1], "eps": r[2]} for r in cur.fetchall()]
+        merged = 0
+        consumed: set = set()
+        for i, keep in enumerate(chars):
+            if keep["id"] in consumed:
+                continue
+            for other in chars[i + 1:]:
+                if other["id"] in consumed:
+                    continue
+                if name_match(keep["name"], other["name"]):
+                    # 정본 이름은 더 완전한 쪽으로(canonical_of); keep이 이미 등장수/길이 우선이라 보통 keep.
+                    canon = canonical_of(keep["name"], other["name"])
+                    _merge_characters(cur, keep["id"], other["id"], now)
+                    consumed.add(other["id"])
+                    merged += 1
+                    if canon != keep["name"]:
+                        cur.execute("UPDATE analysis_character SET name = %s, updated_at = %s WHERE id = %s",
+                                    (canon, now, keep["id"]))
+                        keep["name"] = canon
+    if merged:
+        # 병합 후 정본 이름 재투영(name_edge 기준).
+        _project_names([c["id"] for c in chars if c["id"] not in consumed], now)
+        logger.info("[step3.dedup] webtoon %s — flow 로스터 %s개 char 병합", webtoon_id, merged)
+    return merged
+
+
 def _commit_flow_speakers(webtoon_episode_id: int, assign: dict, idx_map: dict,
                           slot_map: dict, now: datetime) -> int:
     """흐름 화자배정을 TextAnnotation.speaker_id로 커밋(flow-first 전용, 간결).
@@ -1842,12 +2070,19 @@ def _prepare_flow_episode(webtoon_episode_id: int) -> None:
             return
         cur.execute("DELETE FROM analysis_name_edge WHERE character_id = ANY(%s)", (char_ids,))
         cur.execute("DELETE FROM analysis_character_appearance WHERE episode_id = %s", (webtoon_episode_id,))
+        # 고아 cluster(다른 회차 appearance 없음) 선별 후, speaker 참조를 NULL 처리하고 하드삭제.
+        # ⚠️ speaker FK는 Django SET_NULL이지만 raw SQL엔 DB FK가 그대로라 참조 먼저 끊어야 함.
         cur.execute(
-            """DELETE FROM analysis_character c WHERE c.id = ANY(%s) AND c.kind = 'cluster'
+            """SELECT c.id FROM analysis_character c WHERE c.id = ANY(%s) AND c.kind = 'cluster'
+               AND c.is_confirmed = false
                AND NOT EXISTS (SELECT 1 FROM analysis_character_appearance a
                                WHERE a.character_id = c.id AND a.deleted_at IS NULL)""",
             (char_ids,),
         )
+        orphans = [r[0] for r in cur.fetchall()]
+        if orphans:
+            cur.execute("UPDATE analysis_text_annotation SET speaker_id = NULL WHERE speaker_id = ANY(%s)", (orphans,))
+            cur.execute("DELETE FROM analysis_character WHERE id = ANY(%s)", (orphans,))
 
 
 def consolidate_and_commit_episode(
@@ -1869,11 +2104,14 @@ def consolidate_and_commit_episode(
     out = consolidate_episode(webtoon_episode_id, records, prior_context,
                               webtoon_id=webtoon_id, run_id=run_id)
     if out.get("error") or not out.get("slots"):
-        return {"slots": 0, "name_edges": 0, "speakers": 0, "projected": 0,
+        return {"slots": 0, "linked": 0, "name_edges": 0, "speakers": 0, "projected": 0,
                 "mentioned": len(out.get("mentioned") or []), "roster": [], "error": out.get("error")}
     now = datetime.now(timezone.utc)
     _prepare_flow_episode(webtoon_episode_id)  # 재분석 멱등 — 기존 flow 산출 정리
-    slot_map = _commit_slots(webtoon_episode_id, webtoon_id, out["slots"], now, run_id)
+    # Phase 4 링커 — 회차 슬롯을 기존 인물(persona)에 결합(교차회차 이름 안정화·드리프트 해법).
+    ctx = resolve_llm_model(webtoon_id, TEXT)
+    link = _link_slots(webtoon_id, webtoon_episode_id, out["slots"], out["names"], ctx, run_id)
+    slot_map = _commit_slots(webtoon_episode_id, webtoon_id, out["slots"], now, run_id, link=link)
     n_edges = _commit_name_edges(slot_map, out["names"], now, run_id)
     n_spk = _commit_flow_speakers(webtoon_episode_id, out["assign"], out["idx_map"], slot_map, now)
     cids = [cid for cid, _ in slot_map.values()]
@@ -1885,10 +2123,10 @@ def consolidate_and_commit_episode(
             cur.execute("SELECT name, aliases FROM analysis_character WHERE id = ANY(%s) AND name <> ''", (cids,))
             roster = [{"name": nm, "aliases": al or [], "present_now": True,
                        "status": "", "role": "", "evidence": ""} for nm, al in cur.fetchall()]
-    stats = {"slots": len(slot_map), "name_edges": n_edges, "speakers": n_spk,
+    stats = {"slots": len(slot_map), "linked": len(link), "name_edges": n_edges, "speakers": n_spk,
              "projected": n_proj, "mentioned": len(out["mentioned"]), "roster": roster, "error": None}
-    logger.info("[step3.consolidate] episode %s 커밋 — slots=%s edges=%s speakers=%s named=%s",
-                webtoon_episode_id, stats["slots"], n_edges, n_spk, len(roster))
+    logger.info("[step3.consolidate] episode %s 커밋 — slots=%s linked=%s edges=%s speakers=%s named=%s",
+                webtoon_episode_id, stats["slots"], len(link), n_edges, n_spk, len(roster))
     return stats
 
 
@@ -1972,6 +2210,12 @@ def resolve_episode(
         _insert_llm_usage(
             webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
             stage=_PASS2_STAGE, image_count=None, run_id=run_id,
+        )
+        _record_llm_sample(
+            ctx, stage=_PASS2_STAGE, system_prompt=_RESOLVE_SYSTEM_PROMPT, user_text=user_text,
+            image_refs=[], raw_output=getattr(call, "raw_text", "") or "",
+            repaired=getattr(call, "repaired", False), finish_reason=(usage or {}).get("finish_reason"),
+            webtoon_id=webtoon_id, episode_id=webtoon_episode_id, cut_id=None, run_id=run_id,
         )
 
     logger.info(
@@ -2491,6 +2735,12 @@ def narrate_episode(
     if persist_usage:
         _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
                           stage=_NARRATIVE_STAGE, image_count=None, run_id=run_id)
+        _record_llm_sample(
+            ctx, stage=_NARRATIVE_STAGE, system_prompt=_NARRATIVE_SYSTEM_PROMPT, user_text=user_text,
+            image_refs=[], raw_output=getattr(call, "raw_text", "") or "",
+            repaired=getattr(call, "repaired", False), finish_reason=(usage or {}).get("finish_reason"),
+            webtoon_id=webtoon_id, episode_id=webtoon_episode_id, cut_id=None, run_id=run_id,
+        )
     logger.info(
         "[step3.narrative] episode %s — beats=%s deceptions=%s threads=%s profiles=%s tokens=%s",
         webtoon_episode_id, len(sanitized["beats"]), len(sanitized["deceptions"]),
