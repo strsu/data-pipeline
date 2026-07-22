@@ -561,7 +561,9 @@ def _iter_episode_segments(
         #    행이 남아 있으므로 통째 flush하지 않고 아래 방출·이월 경로로 진행해 다음 반복에서
         #    이어 처리한다.
         if not _cuts_remaining() and buf.height <= arr.shape[0]:
-            for (y0, y1) in intervals:
+            # 최종 flush에선 더 성장할 이월이 없으므로 파편 병합을 전 구간(이월 포함)에 적용한다
+            # — split(_emit)이 여기서도 적용되는 것과 대칭(에피소드 끝단 파편 세그먼트 방지).
+            for (y0, y1) in merge_short_intervals(intervals):
                 yield from _emit(arr, y0, y1, forced=False)
             buf.discard_before(buf.height)  # 버퍼 비움 → 루프 종료
             continue
