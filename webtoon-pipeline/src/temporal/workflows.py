@@ -176,27 +176,10 @@ class EpisodeChainWorkflow:
             raise
         # v4.0: step3 완료 마킹은 별도 없음 — step3c가 resolve run을 succeeded로 전이하는 것이
         # 진행도의 정본이다(§17.1). _mark는 step1/2(run 원장 완료 기록)에만 쓴다.
-
-        # 정리 패스 트리거(§22.3): 마지막 정리 이후 succeeded resolve가 임계(기본 5) 이상이면
-        # 웹툰 단위 정리 자식 워크플로 발화. 웹툰당 workflow_id 멱등 + ABANDON(체인이
-        # continue-as-new로 넘어가도 정리는 독립 수명). 발화 실패는 체인을 막지 않는다.
-        due_webtoon_id = await workflow.execute_activity(
-            activities.consolidation_due_for_episode, ep.webtoon_episode_id,
-            task_queue=ORCH_QUEUE,
-            start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
-        )
-        if due_webtoon_id:
-            try:
-                await workflow.start_child_workflow(
-                    ConsolidateWebtoonWorkflow.run,
-                    ConsolidateInput(webtoon_id=due_webtoon_id),
-                    id=f"consolidate_webtoon_{due_webtoon_id}",
-                    task_queue=ORCH_QUEUE,
-                    parent_close_policy=workflow.ParentClosePolicy.ABANDON,
-                )
-                workflow.logger.info("[chain] webtoon=%s 정리 패스 발화", due_webtoon_id)
-            except Exception as e:  # 이미 실행 중(멱등 id) 등 — 무해
-                workflow.logger.info("[chain] 정리 패스 발화 생략: %s", e)
+        #
+        # 정리 패스(§22.3 제안검토 심판) 자동 훅은 폐기됨(2026-07-23) — flow-first/제안검토 기능
+        # 제거 방침. 훅이 회차 완료마다 ConsolidateWebtoonWorkflow(adjudicate)를 재발화해 GLM을
+        # 점유하고 teacher 미수집 콜을 낭비했다. 관련 워크플로/액티비티/adjudicate 코드도 제거.
 
     async def _mark(self, ep: EpisodeInput, phase: int) -> None:
         await workflow.execute_activity(
