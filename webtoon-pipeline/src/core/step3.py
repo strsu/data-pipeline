@@ -1825,6 +1825,31 @@ def _commit_flow_speakers(webtoon_episode_id: int, assign: dict, idx_map: dict,
     return resolved
 
 
+def _prepare_flow_episode(webtoon_episode_id: int) -> None:
+    """재분석 멱등 — 이 회차의 기존 flow 슬롯(episode-scoped appearance)·name_edge·고아 cluster 정리.
+
+    prepare_episode_scene(llm 주석 삭제)와 짝. 레거시 appearance는 episode_id=NULL이라 대상 아님 —
+    episode_id 세팅된 것만 flow 산출이다. ⚠️ Increment-1(링커 없음): flow cluster=회차당 1 appearance라
+    고아 삭제가 안전. Phase 4 링커 후엔 다회차 결합 appearance 보존 로직 필요.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT character_id FROM analysis_character_appearance WHERE episode_id = %s",
+            (webtoon_episode_id,),
+        )
+        char_ids = [r[0] for r in cur.fetchall()]
+        if not char_ids:
+            return
+        cur.execute("DELETE FROM analysis_name_edge WHERE character_id = ANY(%s)", (char_ids,))
+        cur.execute("DELETE FROM analysis_character_appearance WHERE episode_id = %s", (webtoon_episode_id,))
+        cur.execute(
+            """DELETE FROM analysis_character c WHERE c.id = ANY(%s) AND c.kind = 'cluster'
+               AND NOT EXISTS (SELECT 1 FROM analysis_character_appearance a
+                               WHERE a.character_id = c.id AND a.deleted_at IS NULL)""",
+            (char_ids,),
+        )
+
+
 def consolidate_and_commit_episode(
     webtoon_episode_id: int,
     records: list["Pass1Record"],
@@ -1837,7 +1862,7 @@ def consolidate_and_commit_episode(
 
     flow_first_enabled 게이트 뒤에서 R-스테이지 화자해소를 대체한다(익명 슬롯+흐름). 서사 산출
     (beats/report/threads/profiles)은 기존 N-스테이지가 담당 — 이 함수는 정체성/화자 축만 맡는다.
-    반환: 커밋 통계 dict.
+    반환: 커밋 통계 + N 주입용 roster([{name, present_now, ...}]).
     """
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
@@ -1845,15 +1870,25 @@ def consolidate_and_commit_episode(
                               webtoon_id=webtoon_id, run_id=run_id)
     if out.get("error") or not out.get("slots"):
         return {"slots": 0, "name_edges": 0, "speakers": 0, "projected": 0,
-                "mentioned": len(out.get("mentioned") or []), "error": out.get("error")}
+                "mentioned": len(out.get("mentioned") or []), "roster": [], "error": out.get("error")}
     now = datetime.now(timezone.utc)
+    _prepare_flow_episode(webtoon_episode_id)  # 재분석 멱등 — 기존 flow 산출 정리
     slot_map = _commit_slots(webtoon_episode_id, webtoon_id, out["slots"], now, run_id)
     n_edges = _commit_name_edges(slot_map, out["names"], now, run_id)
     n_spk = _commit_flow_speakers(webtoon_episode_id, out["assign"], out["idx_map"], slot_map, now)
-    n_proj = _project_names([cid for cid, _ in slot_map.values()], now)
+    cids = [cid for cid, _ in slot_map.values()]
+    n_proj = _project_names(cids, now)
+    # N(서사) 주입용 roster — projector가 명명한 것만(무명 슬롯 제외).
+    roster = []
+    if cids:
+        with db_cursor() as cur:
+            cur.execute("SELECT name, aliases FROM analysis_character WHERE id = ANY(%s) AND name <> ''", (cids,))
+            roster = [{"name": nm, "aliases": al or [], "present_now": True,
+                       "status": "", "role": "", "evidence": ""} for nm, al in cur.fetchall()]
     stats = {"slots": len(slot_map), "name_edges": n_edges, "speakers": n_spk,
-             "projected": n_proj, "mentioned": len(out["mentioned"]), "error": None}
-    logger.info("[step3.consolidate] episode %s 커밋 — %s", webtoon_episode_id, stats)
+             "projected": n_proj, "mentioned": len(out["mentioned"]), "roster": roster, "error": None}
+    logger.info("[step3.consolidate] episode %s 커밋 — slots=%s edges=%s speakers=%s named=%s",
+                webtoon_episode_id, stats["slots"], n_edges, n_spk, len(roster))
     return stats
 
 
@@ -2504,6 +2539,28 @@ def resolve_and_narrate(
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     if ctx is None:
         ctx = resolve_llm_model(webtoon_id, TEXT)
+
+    # ── 흐름-first 게이트(redesign §5·Phase 3) — flag ON이면 정체성/화자 축을 정리단계로 대체 ──
+    #    익명 슬롯+흐름 화자배정을 여기서 커밋(step3b 하트비트 하 — 정리 콜은 장시간 LLM). 그 뒤 N(서사)만
+    #    진행하고, ResolveResult의 characters/speaker_resolution을 비워 step3c apply가 R-CCIP 정체/화자를
+    #    재커밋하지 않게 한다(flow가 이미 커밋). R(resolve_episode_windowed)은 건너뛴다.
+    if _flow_first_enabled(webtoon_id):
+        flow = consolidate_and_commit_episode(
+            webtoon_episode_id, records or [], prior_context, webtoon_id=webtoon_id, run_id=run_id,
+        )
+        episode_roster = flow.get("roster") or []
+        n = narrate_episode(
+            webtoon_episode_id, records or [], ResolveResult(webtoon_episode_id=webtoon_episode_id),
+            prior_context, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id, episode_roster=episode_roster,
+        )
+        return ResolveResult(
+            webtoon_episode_id=webtoon_episode_id,
+            characters=[], speaker_resolution=[], face_reassignments=[],
+            beats=n.get("beats") or [], episode=n.get("episode") or {},
+            deceptions=n.get("deceptions") or [], threads=n.get("threads") or [],
+            profiles=n.get("profiles") or [], roster=episode_roster,
+            usage=n.get("usage") or {},
+        )
 
     # who-is-who 로스터(B3) — R 앞 1콜. 실패해도 빈 로스터로 R/N 진행(격리).
     roster_res = extract_roster(
