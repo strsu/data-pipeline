@@ -141,6 +141,20 @@ def _get_webtoon_id(webtoon_episode_id: int) -> int:
         return cur.fetchone()[0]
 
 
+def _flow_first_enabled(webtoon_id: int) -> bool:
+    """흐름-first 게이트(redesign D3) — config_webtoon_pipeline_state.flow_first_enabled.
+
+    ON이면 Stage V가 identified_faces를 비워(익명), 정체성 주입 오염을 차단한다. 설정 행이 없으면 False.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT flow_first_enabled FROM config_webtoon_pipeline_state WHERE webtoon_id = %s",
+            (webtoon_id,),
+        )
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+
 def _episode_info(webtoon_episode_id: int) -> dict:
     with db_cursor() as cur:
         cur.execute(
@@ -357,6 +371,35 @@ def _pass1_ctx(ctx: dict) -> dict:
     return _stage_ctx(ctx, _PASS1_MAX_TEMPERATURE)
 
 
+def build_pass1_input(
+    img: bytes, faces: list[dict], regions: list[dict], *, anonymize: bool = False
+) -> tuple[bytes, str]:
+    """Pass-1 비전 콜 입력 조립 — (오버레이+다운스케일 이미지, user_text JSON)의 단일 정본.
+
+    프로덕션(`extract_cut`)과 학습쌍 생성기/벤치마크(`tools/pass1_bench.py`)가 이 함수를
+    공유한다(입력 포맷 drift 방지 — 복제 금지). 시그니처의 img/faces/regions는
+    `fetch_cut_image`/`_load_faces`/`_load_regions` 산출 그대로.
+
+    anonymize=True(흐름-first, redesign D4): CCIP 추정 정체(identified_faces)를 **빈 리스트로** 주입한다.
+    43% 정확도 추정 이름이 화자·서사까지 오염시키는 근본 오염원(§2)이라, Stage V를 정체성-무지 상태로
+    돌린다. 얼굴 bbox 오버레이는 유지(위치 grounding). id만 남겨 모델이 위치는 참조하되 이름은 못 받게 함.
+    """
+    overlay_img = _downscale(overlay_faces(img, faces), _PASS1_MAX_DIM)
+    if anonymize:
+        identified = [{"id": f["id"]} for f in faces]
+    else:
+        identified = [
+            {"id": f["id"], "name": f.get("name"), "character_id": f.get("character_id"),
+             "confirmed": bool(f.get("confirmed"))}
+            for f in faces
+        ]
+    user_text = json.dumps({
+        "identified_faces": identified,
+        "ocr_blocks": [{"index": r["index"], "text": r["text"]} for r in regions],
+    }, ensure_ascii=False)
+    return overlay_img, user_text
+
+
 def _sanitize_speaker(raw, btype) -> dict:
     """화자는 speech/monologue 블록에만 귀속(Req 1.5). 그 외 type/비정형 입력은 전부 null."""
     null = {"face_label": None, "name": None, "confidence": 0.0, "basis": "none", "tail_hint": "none"}
@@ -534,6 +577,7 @@ def extract_cut(
     ctx: Optional[dict] = None,
     persist: bool = True,
     run_id: Optional[int] = None,
+    anonymize: Optional[bool] = None,
 ) -> Pass1Record:
     """컷 1개를 비전 LLM 1콜로 분석해 Pass-1 provisional 레코드를 만든다(step3a 단위).
 
@@ -572,16 +616,10 @@ def extract_cut(
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
     call_ctx = _pass1_ctx(ctx or resolve_llm_model(webtoon_id, VISION))
+    if anonymize is None:  # extract_episode가 회차당 1회 해석해 넘기지만, 단독 호출 대비 폴백.
+        anonymize = _flow_first_enabled(webtoon_id)
 
-    overlay_img = _downscale(overlay_faces(img, faces), _PASS1_MAX_DIM)
-    user_text = json.dumps({
-        "identified_faces": [
-            {"id": f["id"], "name": f.get("name"), "character_id": f.get("character_id"),
-             "confirmed": bool(f.get("confirmed"))}
-            for f in faces
-        ],
-        "ocr_blocks": [{"index": r["index"], "text": r["text"]} for r in regions],
-    }, ensure_ascii=False)
+    overlay_img, user_text = build_pass1_input(img, faces, regions, anonymize=anonymize)
 
     # Req 7.4 — 1회 재시도(총 2회). 모두 실패하면 빈 결과로 스킵.
     raw_result: dict = {}
@@ -798,6 +836,7 @@ def extract_episode(
     webtoon_id = _get_webtoon_id(webtoon_episode_id)
     ctx = resolve_llm_model(webtoon_id, VISION)  # 에피소드당 1회 해석 → 컷마다 재사용
     llm_model_id = ctx.get("id")
+    anonymize = _flow_first_enabled(webtoon_id)  # 회차당 1회 해석 → 컷마다 재사용(per-cut DB read 방지)
 
     if prepare:
         prepare_episode_scene(webtoon_episode_id)
@@ -826,7 +865,8 @@ def extract_episode(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(extract_cut, webtoon_episode_id, cn,
-                        ep_info=info, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id): cn
+                        ep_info=info, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+                        anonymize=anonymize): cn
             for cn in cut_numbers
         }
         for future in as_completed(futures):
@@ -1468,6 +1508,353 @@ def extract_roster(
     logger.info("[step3.roster] episode %s — 로스터=%s (present_now=%s) tokens=%s",
                 webtoon_episode_id, len(roster), present, (usage or {}).get("total_tokens"))
     return {"roster": roster, "usage": usage, "error": None}
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════
+# 흐름-first 정리 단계 (redesign-flow-first-2026-07-22 §5·Phase 3) — flow_first_enabled 게이트 뒤.
+# 익명 슬롯(대사 흐름으로 클러스터) + 흐름 화자배정 + 이름 3역할. exp_speaker_flow.py(0.95) 이식.
+# 얼굴·CCIP·정체성 입력 0. 슬롯=CharacterAppearance(회차스코프,persona), 이름=analysis_name_edge.
+# ════════════════════════════════════════════════════════════════════════════════════════
+
+_CONSOLIDATE_SYSTEM_PROMPT = """너는 웹툰 회차의 텍스트 블록만 보고(이미지·정체성 없음) 세 가지를 한다.
+① 말하는 인물의 **익명 슬롯**(A/B/…)을 대사 자체에서 갈라낸다. 근거는 **고유 말끝 어미·말버릇**
+   (~냥/~당, ~시오/~소, ~구려)과 **관계**(누구에게 존대/하대, 누구를 뭐라 부름)다.
+   '리더·POV·베테랑·탱커' 같은 역할어는 여러 명이 공유하므로 정체성 근거로 쓰지 마라.
+② 각 블록의 **화자를 흐름으로 배정**한다: 대사 교대(질문↔대답), 화법, 호칭, 1인칭 나레이션·독백의
+   시점 인물(POV). 효과음(sfx)·화자불명이면 null. 억지 배정 금지.
+③ 대사 속 이름을 **역할별로 분류**한다:
+   - self: 자칭("나는 X", "자칭 X") → 그 화자 슬롯의 이름
+   - narration_subject: 나레이션이 그 인물을 **주어로 삼아 행동·상태 서술**("X가 앞장섰다")
+   - vocative: 상대를 부름("X야", "X님") → 그 슬롯 아니라 상대
+   - card: 이름/별명 카드
+   - reference: 3인칭 언급("예전에 X가 했었지") → 현재 등장 인물이 아닐 수 있음(mentioned로)
+   ⚠️ 고립된 이름 토큰(문장 없이 이름만)·효과음 오독은 어느 분류도 아님(무시).
+
+반드시 JSON만 출력:
+{"slots": {"A": {"persona": "고유어미+관계 서술", "prominence": "main|minor|extra"}, ...},
+ "assign": {"0": "A", "1": null, "2": "B", ...},   (키는 블록 인덱스 문자열)
+ "names": [{"slot": "A", "surface": "에르웬", "role": "self|narration_subject|vocative|card"}],
+ "mentioned": [{"surface": "카락", "role": "reference"}]}"""
+
+_NAME_EDGE_SLOT_ROLES = ("self", "narration_subject", "vocative", "card")
+# 이름 정본 우선순위(강→약): 자칭 > 카드 > 나레이션 주어 > 호격. projector가 canonical 선택에 사용.
+_NAME_ROLE_RANK = {"human": 0, "self": 1, "card": 2, "narration_subject": 3, "vocative": 4}
+
+
+def _build_consolidate_payload(records: list["Pass1Record"], prior) -> tuple[list[dict], dict, dict]:
+    """익명 트랜스크립트(cut/type/text만, 정체성 0) + global_idx→(cut, region_index) 매핑.
+
+    _build_pass2_user_payload와 달리 얼굴/character_id/known_name을 일절 넣지 않는다(흐름-first는
+    정체성 무지 입력이 핵심). idx_map은 assign(블록→슬롯)을 화자 커밋용 (cut,block_index)로 되돌린다.
+    """
+    blocks: list[dict] = []
+    idx_map: dict[int, tuple] = {}
+    for rec in records:
+        if rec.skipped or rec.error:
+            continue
+        res = rec.result or {}
+        if not res:
+            continue
+        cut = rec.cut_number
+        for b in (res.get("blocks") or []):
+            text = (b.get("corrected_text") or "").strip()
+            if not text:
+                continue
+            gi = len(blocks)
+            idx_map[gi] = (cut, b.get("index"))
+            blocks.append({"i": gi, "cut": cut, "type": b.get("type"), "text": text})
+    payload = dict(_prior_to_dict(prior))  # confirmed_roster_prior(+open_threads) — persona/이름 링크 힌트
+    payload.setdefault("confirmed_roster_prior", [])
+    payload["blocks"] = blocks
+    return blocks, idx_map, payload
+
+
+def _sanitize_consolidate(raw: dict) -> dict:
+    """정리 콜 출력 방어 검증 — slots/assign/names/mentioned 형태 보정."""
+    slots = {}
+    for k, v in (raw.get("slots") or {}).items():
+        if not isinstance(k, str):
+            continue
+        if isinstance(v, dict):
+            prom = v.get("prominence")
+            slots[k] = {
+                "persona": _str_or_empty(v.get("persona")).strip(),
+                "prominence": prom if prom in ("main", "minor", "extra") else "",
+            }
+        else:
+            slots[k] = {"persona": _str_or_empty(v).strip(), "prominence": ""}
+    assign = {}
+    for k, v in (raw.get("assign") or {}).items():
+        try:
+            gi = int(k)
+        except (TypeError, ValueError):
+            continue
+        assign[gi] = v if (isinstance(v, str) and v in slots) else None
+    names = []
+    for n in (raw.get("names") or []):
+        if not isinstance(n, dict):
+            continue
+        surf = _str_or_empty(n.get("surface")).strip()
+        role = n.get("role")
+        slot = n.get("slot")
+        if surf and role in _NAME_EDGE_SLOT_ROLES and slot in slots:
+            names.append({"slot": slot, "surface": surf, "role": role})
+    mentioned = []
+    for m in (raw.get("mentioned") or []):
+        if isinstance(m, dict):
+            surf = _str_or_empty(m.get("surface")).strip()
+            if surf:
+                mentioned.append({"surface": surf, "role": "reference"})
+    return {"slots": slots, "assign": assign, "names": names, "mentioned": mentioned}
+
+
+def consolidate_episode(
+    webtoon_episode_id: int,
+    records: list["Pass1Record"],
+    prior_context=None,
+    *,
+    webtoon_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    persist_usage: bool = True,
+    run_id: Optional[int] = None,
+) -> dict:
+    """흐름-first 정리 단계(§5·Phase 3) — 익명 슬롯 클러스터 + 흐름 화자배정 + 이름 3역할, 텍스트 1콜.
+
+    exp_speaker_flow.py(정답지 0.95·narration 포함)와 exp_linker_chain_v3.py(발화행위 게이트·3인칭 분리)를
+    프로덕션으로 이식. 이미지 없이 glm-5.2급 텍스트 모델. 실패 시 빈 결과(+error)로 격리(run 중단 금지).
+    반환: {slots, assign, names, mentioned, idx_map, usage, error}.
+    """
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    if ctx is None:
+        ctx = resolve_llm_model(webtoon_id, TEXT)
+    call_ctx = _pass2_ctx(ctx)
+
+    blocks, idx_map, payload = _build_consolidate_payload(records, prior_context)
+    if not blocks:
+        return {"slots": {}, "assign": {}, "names": [], "mentioned": [], "idx_map": {},
+                "usage": {}, "error": None}
+    user_text = json.dumps(payload, ensure_ascii=False)
+
+    raw_result: dict = {}
+    usage: dict = {}
+    err: Optional[str] = None
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, _CONSOLIDATE_SYSTEM_PROMPT, user_text, [])
+            raw_result = call.result if isinstance(call.result, dict) else {}
+            usage = call.usage or {}
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001 — 스테이지 격리(run 중단 금지)
+            err = str(e)
+            raw_result = {}
+    if err is not None:
+        logger.warning("[step3.consolidate] episode %s — 정리 실패(스킵): %s", webtoon_episode_id, err)
+        return {"slots": {}, "assign": {}, "names": [], "mentioned": [], "idx_map": idx_map,
+                "usage": usage, "error": err}
+
+    out = _sanitize_consolidate(raw_result)
+    out["idx_map"] = idx_map
+    out["usage"] = usage
+    out["error"] = None
+    if persist_usage:
+        _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
+                          stage=_ROSTER_STAGE, image_count=None, run_id=run_id)
+    logger.info("[step3.consolidate] episode %s — 슬롯=%s 배정=%s 이름=%s 언급=%s tokens=%s",
+                webtoon_episode_id, len(out["slots"]), sum(1 for v in out["assign"].values() if v),
+                len(out["names"]), len(out["mentioned"]), (usage or {}).get("total_tokens"))
+    return out
+
+
+def _commit_slots(webtoon_episode_id: int, webtoon_id: int, slots: dict, now: datetime,
+                  run_id: Optional[int] = None) -> dict:
+    """정리 슬롯을 회차스코프 CharacterAppearance로 커밋. 반환 {slot: (character_id, appearance_id)}.
+
+    Increment-1(링커 없음): 슬롯당 새 cluster Character + episode-scoped appearance(persona). 교차회차
+    결합(비요른=여러 회차)은 Phase 4 링커가 persona로 수행한다. 여기선 회차 내 슬롯 확정만.
+    부분 unique(episode,character,local_id)로 재실행 시 in-place 갱신.
+    """
+    slot_map: dict = {}
+    with db_cursor() as cur:
+        for local_id, info in slots.items():
+            persona = json.dumps({"desc": info.get("persona", "")}, ensure_ascii=False)
+            prominence = info.get("prominence") or ""
+            cur.execute(
+                """
+                INSERT INTO analysis_character (webtoon_id, kind, name, aliases, extra,
+                    is_confirmed, is_name_auto_assigned, is_match_excluded, created_at, updated_at)
+                VALUES (%s, 'cluster', '', '[]'::jsonb, '{}'::jsonb, false, false, false, %s, %s)
+                RETURNING id
+                """,
+                (webtoon_id, now, now),
+            )
+            character_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO analysis_character_appearance
+                    (character_id, label, episode_id, local_id, persona, prominence,
+                     link_method, link_confidence, is_canonical, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, 'persona', NULL, false, %s, %s)
+                RETURNING id
+                """,
+                (character_id, local_id, webtoon_episode_id, local_id, persona, prominence, now, now),
+            )
+            appearance_id = cur.fetchone()[0]
+            slot_map[local_id] = (character_id, appearance_id)
+    return slot_map
+
+
+def _commit_name_edges(slot_map: dict, names: list[dict], now: datetime,
+                       run_id: Optional[int] = None) -> int:
+    """슬롯 결합 이름을 analysis_name_edge로 커밋(self/narration_subject/vocative/card).
+
+    vocative는 상대(수신자) 슬롯의 이름이지만, 정리 콜이 slot에 이미 수신자를 담아 준다(프롬프트 계약).
+    reference/mentioned는 현재 슬롯에 안 붙으므로 여기서 제외(Phase 4 링커가 기존 인물에 해소).
+    """
+    committed = 0
+    with db_cursor() as cur:
+        for n in names:
+            binding = slot_map.get(n["slot"])
+            if not binding:
+                continue
+            character_id, appearance_id = binding
+            cur.execute(
+                """
+                INSERT INTO analysis_name_edge
+                    (character_id, appearance_id, surface, canonical_name, is_canonical, role,
+                     confidence, source, run_id, status, created_at, updated_at)
+                VALUES (%s, %s, %s, '', false, %s, NULL, 'llm', %s, 'active', %s, %s)
+                """,
+                (character_id, appearance_id, n["surface"], n["role"], run_id, now, now),
+            )
+            committed += 1
+    return committed
+
+
+def _project_names(character_ids: list[int], now: datetime) -> int:
+    """projector(D1a) — analysis_name_edge에서 Character.name/aliases를 재계산하는 결정론 fn.
+
+    이름=엣지가 진실, name 스칼라는 denormalized 정본(기존 serializer·admin·UI 무손상). 정본 선택은
+    역할 우선순위(_NAME_ROLE_RANK: human>self>card>narration_subject>vocative), 동순위는 최다 표면형.
+    선택된 canonical_name을 name에, 나머지 고유 표면형을 aliases에 넣고 그 엣지에 is_canonical=true.
+    LLM 없음. Phase 3(회차 커밋) 끝 + Phase 4(링커) 끝에 호출.
+    """
+    projected = 0
+    with db_cursor() as cur:
+        for cid in character_ids:
+            cur.execute(
+                """
+                SELECT id, surface, role, confidence FROM analysis_name_edge
+                WHERE character_id = %s AND status = 'active' AND deleted_at IS NULL
+                """,
+                (cid,),
+            )
+            edges = cur.fetchall()
+            if not edges:
+                continue
+            # 표면형별 집계(빈도) — 오독 변종은 Phase 4 자모/substring dedup이 canonical_name으로 통일.
+            counts: dict = {}
+            best = None  # (role_rank, -count, surface)
+            for _eid, surface, role, _conf in edges:
+                counts[surface] = counts.get(surface, 0) + 1
+            for eid, surface, role, _conf in edges:
+                rank = _NAME_ROLE_RANK.get(role, 9)
+                key = (rank, -counts[surface], surface)
+                if best is None or key < best[0]:
+                    best = (key, eid, surface)
+            if best is None:
+                continue
+            _key, canon_eid, canon_surface = best
+            aliases = sorted({s for s in counts if s != canon_surface})
+            cur.execute(
+                "UPDATE analysis_name_edge SET is_canonical = (id = %s), canonical_name = %s, updated_at = %s "
+                "WHERE character_id = %s AND status = 'active'",
+                (canon_eid, canon_surface, now, cid),
+            )
+            cur.execute(
+                "UPDATE analysis_character SET name = %s, aliases = %s::jsonb, "
+                "is_name_auto_assigned = true, updated_at = %s WHERE id = %s AND kind = 'cluster'",
+                (canon_surface, json.dumps(aliases, ensure_ascii=False), now, cid),
+            )
+            projected += cur.rowcount or 0
+    return projected
+
+
+def _commit_flow_speakers(webtoon_episode_id: int, assign: dict, idx_map: dict,
+                          slot_map: dict, now: datetime) -> int:
+    """흐름 화자배정을 TextAnnotation.speaker_id로 커밋(flow-first 전용, 간결).
+
+    assign(글로벌블록→슬롯) + idx_map(글로벌블록→(cut,region_index)) + slot_map(슬롯→(cid,app))으로
+    (cut,region_index)→region_id(_episode_region_map)를 거쳐 source='llm' 주석의 speaker_id를 설정한다.
+    human 행은 불가침(source='llm'만). R-diff 로직과 무관한 흐름 전용 경로(exp_speaker_flow 0.95).
+    """
+    region_map = _episode_region_map(webtoon_episode_id)
+    resolved = 0
+    with db_cursor() as cur:
+        for gi, slot in assign.items():
+            if not slot:
+                continue
+            loc = idx_map.get(gi)
+            binding = slot_map.get(slot)
+            if not loc or not binding:
+                continue
+            region_id = region_map.get(loc)
+            if region_id is None:
+                continue
+            cur.execute(
+                """
+                UPDATE analysis_text_annotation
+                SET speaker_id = %s, resolution_status = 'resolved', updated_at = %s
+                WHERE region_id = %s AND source = 'llm'
+                """,
+                (binding[0], now, region_id),
+            )
+            resolved += cur.rowcount or 0
+        # 화자없는 블록(sfx/narration/system/other) 일괄 resolved(speaker NULL) — source='llm'만.
+        cur.execute(
+            """
+            UPDATE analysis_text_annotation ta
+            SET resolution_status = 'resolved', updated_at = %s
+            FROM analysis_text_region tr JOIN webtoon_cut wc ON tr.cut_id = wc.id
+            WHERE ta.region_id = tr.id AND wc.episode_id = %s AND ta.source = 'llm'
+              AND ta.type = ANY(%s) AND ta.resolution_status <> 'resolved'
+            """,
+            (now, webtoon_episode_id, list(_SPEAKERLESS_TYPES)),
+        )
+    return resolved
+
+
+def consolidate_and_commit_episode(
+    webtoon_episode_id: int,
+    records: list["Pass1Record"],
+    prior_context=None,
+    *,
+    webtoon_id: Optional[int] = None,
+    run_id: Optional[int] = None,
+) -> dict:
+    """흐름-first 정리 오케스트레이터(Phase 3) — 정리 콜 → 슬롯·이름엣지·흐름화자 커밋 → projector.
+
+    flow_first_enabled 게이트 뒤에서 R-스테이지 화자해소를 대체한다(익명 슬롯+흐름). 서사 산출
+    (beats/report/threads/profiles)은 기존 N-스테이지가 담당 — 이 함수는 정체성/화자 축만 맡는다.
+    반환: 커밋 통계 dict.
+    """
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    out = consolidate_episode(webtoon_episode_id, records, prior_context,
+                              webtoon_id=webtoon_id, run_id=run_id)
+    if out.get("error") or not out.get("slots"):
+        return {"slots": 0, "name_edges": 0, "speakers": 0, "projected": 0,
+                "mentioned": len(out.get("mentioned") or []), "error": out.get("error")}
+    now = datetime.now(timezone.utc)
+    slot_map = _commit_slots(webtoon_episode_id, webtoon_id, out["slots"], now, run_id)
+    n_edges = _commit_name_edges(slot_map, out["names"], now, run_id)
+    n_spk = _commit_flow_speakers(webtoon_episode_id, out["assign"], out["idx_map"], slot_map, now)
+    n_proj = _project_names([cid for cid, _ in slot_map.values()], now)
+    stats = {"slots": len(slot_map), "name_edges": n_edges, "speakers": n_spk,
+             "projected": n_proj, "mentioned": len(out["mentioned"]), "error": None}
+    logger.info("[step3.consolidate] episode %s 커밋 — %s", webtoon_episode_id, stats)
+    return stats
 
 
 def resolve_episode(
