@@ -225,16 +225,18 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
     if face_ids:
         fids = list(face_ids)
         with db_cursor() as cur:
-            # 재탐지는 이 detection들을 무효화하므로, detection을 참조하는 파생 행을 먼저 정리한다
-            # (안 그러면 FK 위반으로 삭제 실패). 제안(AI 검토 큐)·step2 정체·임베딩은 재생성 가능한
-            # 기계 산출물이라 삭제 안전. **human 정체(source='human')는 남긴다** — 삭제하면 수동
-            # 라벨이 소멸하므로, 남겨두면 detection FK가 걸려 라벨 있는 회차의 파괴적 재실행을
-            # 막는 가드로 작동한다(라벨 회차 재실행은 명시적 라벨 처리 후에만).
+            # 재탐지는 이 detection들을 무효화하므로(새 detection id 발급), detection을 참조하는 파생
+            # 행을 전부 정리한다(안 그러면 FK 위반으로 삭제 실패). 제안·step2/human 정체·임베딩·대표crop
+            # 참조는 모두 재생성 가능한 분석 산출물이라 삭제 안전 — 원본 이미지(컷 다운로드)는 안 건드린다.
+            # human 라벨도 지운다: 재탐지로 detection id가 바뀌면 라벨은 어차피 매칭 대상을 잃으므로
+            # 보존이 불가능하고, 재실행은 명시 트리거(force)로만 일어난다. (라벨은 재라벨/step2로 재생성.)
             cur.execute("DELETE FROM analysis_suggestion WHERE detection_id = ANY(%s)", (fids,))
             cur.execute(
-                "DELETE FROM analysis_face_identity WHERE detection_id = ANY(%s) AND source <> 'human'",
+                "DELETE FROM analysis_face_identity WHERE detection_id = ANY(%s) AND source = 'human'",
                 (fids,),
             )
+            n_human = cur.rowcount or 0
+            cur.execute("DELETE FROM analysis_face_identity WHERE detection_id = ANY(%s)", (fids,))
             # 대표 crop 참조(flow-first 슬롯 필드)는 재탐지로 무효 → NULL(SET_NULL 의도, DB는 NO ACTION).
             cur.execute(
                 "UPDATE analysis_character_appearance SET representative_detection_id = NULL "
@@ -243,6 +245,9 @@ def _cleanup_cut_faces(cut_id: int, source: str, title_id: str) -> None:
             )
             cur.execute("DELETE FROM analysis_face_embedding WHERE detection_id = ANY(%s)", (fids,))
             cur.execute("DELETE FROM analysis_face_detection WHERE id = ANY(%s)", (fids,))
+        if n_human:
+            logger.warning("[step1] cut_id=%s 재탐지 정리 — human 라벨 %d개 삭제(재탐지로 detection id 변경, "
+                           "라벨 보존 불가; 재라벨 필요 시 재생성).", cut_id, n_human)
 
 
 def prepare_episode_yolo(webtoon_episode_id: int, source: str, title_id: str) -> None:
