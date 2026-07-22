@@ -33,6 +33,10 @@ class LLMCallResult:
 
     result: dict
     usage: dict = field(default_factory=dict)
+    # 데이터셋/벤치마크용 부가 정보(프로덕션 호출부는 안 씀) — 모델이 실제로 낸 원문 텍스트와
+    # json-repair 개입 여부. SFT 학습 타겟은 원문(raw_text)이어야 하므로 여기서 노출한다.
+    raw_text: str = ""
+    repaired: bool = False
 
 
 def _build_usage(raw: Optional[dict], finish: Optional[str]) -> dict:
@@ -221,6 +225,15 @@ def _call_model_with_retries(
     if max_out:
         body["max_tokens"] = max_out
 
+    # Qwen(예: qwen-vl-fp8=Qwen3.6-27B) 추론형은 기본 thinking ON이라 사고과정이 토큰·시간을
+    # 크게 잡아먹는다(얼굴/컷당 ~3분, 실용불가). 게이트웨이(vLLM)에 chat_template_kwargs로
+    # thinking을 끄면 즉답한다(실측 1.9s/콜, reasoning_content 없음). qwen 계열에만 주입 —
+    # glm 등 타 모델은 이 kwarg를 모를 수 있어 model_id 접두 기준으로 스코프한다.
+    if str(ctx.get("model_id", "")).lower().startswith("qwen"):
+        ctk = dict(params.get("chat_template_kwargs") or {})
+        ctk.setdefault("enable_thinking", False)
+        body["chat_template_kwargs"] = ctk
+
     headers = {"Authorization": f"Bearer {_resolve_api_key(ctx)}"}
     # 스트리밍으로 호출한다 — Cloudflare 터널 idle timeout 회피(토큰이 계속 흘러와 연결 유휴 없음).
     body["stream"] = True
@@ -302,7 +315,7 @@ def _stream_llm_once(endpoint: str, body: dict, headers: dict) -> LLMCallResult:
     # content 우선, 비어 있으면 reasoning 폴백(intern-vl처럼 답이 reasoning에만 오는 모델 대응).
     text = "".join(content_chunks).strip() or "".join(reasoning_chunks).strip()
     try:
-        parsed = _parse_json_content(text)
+        parsed, repaired = _parse_json_content_ex(text)
     except (ValueError, json.JSONDecodeError) as e:
         # finish_reason='length'면 max_tokens 절단이 원인 — 추론형 모델(glm-4.6v 등)은
         # 사고과정(reasoning_content)이 토큰 예산을 먼저 소모해 본문이 잘릴 수 있다.
@@ -312,7 +325,8 @@ def _stream_llm_once(endpoint: str, body: dict, headers: dict) -> LLMCallResult:
             f"completion_tokens={(usage or {}).get('completion_tokens')!r}, "
             f"응답 길이={len(text)}자): {e}"
         ) from e
-    return LLMCallResult(result=parsed, usage=_build_usage(usage, finish))
+    return LLMCallResult(result=parsed, usage=_build_usage(usage, finish),
+                         raw_text=text, repaired=repaired)
 
 
 def extract_message_text(message: dict) -> str:
@@ -347,7 +361,14 @@ except Exception:  # pragma: no cover - 의존성 부재 방어
 
 
 def _parse_json_content(text: str) -> dict:
+    """`_parse_json_content_ex`의 기존 시그니처 유지 래퍼(파싱 dict만 반환)."""
+    return _parse_json_content_ex(text)[0]
+
+
+def _parse_json_content_ex(text: str) -> tuple[dict, bool]:
     """모델 응답에서 첫 JSON 객체만 강건하게 추출(코드펜스/여분 텍스트 방어).
+
+    반환 (parsed, repaired) — repaired는 json-repair 폴백이 개입했는지(데이터셋 품질 필터용).
 
     1) raw_decode: 코드펜스(```json ... ```)를 벗기고 첫 '{'부터 한 객체만 디코드(뒤 잡텍스트 무시).
     2) 실패 시 json-repair 폴백: 콤마/괄호 누락 등 경미한 손상을 보정해 재파싱한다(B2).
@@ -365,12 +386,12 @@ def _parse_json_content(text: str) -> dict:
     frag = s[i:]
     try:
         obj, _ = _DECODER.raw_decode(frag)  # 첫 객체만, 뒤 잡텍스트 무시
-        return obj
+        return obj, False
     except json.JSONDecodeError:
         if _repair_json is None:
             raise
         repaired = _repair_json(frag, return_objects=True)  # 경미한 손상 보정
         if isinstance(repaired, dict) and repaired:
             _logger.warning("[llm] JSON 손상 — json-repair 폴백으로 복구(%d자)", len(frag))
-            return repaired
+            return repaired, True
         raise  # 복구 실패(빈 객체/비-dict) → 원래 JSONDecodeError 전파
