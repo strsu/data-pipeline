@@ -90,6 +90,20 @@ def _load_face_records(webtoon_episode_id: int) -> list[dict]:
         ]
 
 
+def _flow_first_enabled(webtoon_id: int) -> bool:
+    """흐름-first 게이트(redesign D3·Phase 5) — config_webtoon_pipeline_state.flow_first_enabled.
+
+    step3._flow_first_enabled와 동일 의미(step2 자족성 위해 로컬 복제). ON이면 CCIP 정체 결합 스킵.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT flow_first_enabled FROM config_webtoon_pipeline_state WHERE webtoon_id = %s",
+            (webtoon_id,),
+        )
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+
 def _allocate_character(webtoon_id: int, webtoon_episode_id: int, cut_number: int) -> dict:
     """신규 얼굴 클러스터(Character kind=cluster) + CharacterAppearance 생성(v4.0 §17.2).
 
@@ -695,6 +709,24 @@ def identify_episode_faces(
     webtoon_id = webtoon["webtoon_id"]
     source = webtoon["source"]
     title_id = webtoon["title_id"]
+
+    # ── 흐름-first 얼굴 강등(redesign §5·Phase 5) ──────────────────────────────────
+    # flow_first_enabled면 CCIP 정체 결합을 전면 스킵한다. 정체성 척추가 익명 슬롯+대사 흐름으로
+    # 옮겨졌으므로(step3 정리단계), CCIP의 교차회차 매칭이 만들던 자석(죽은 카락·빙의 이한수에 얼굴
+    # 흡수)을 원천 차단한다. 얼굴은 step1 탐지(analysis_face_detection)로만 존재하고, 대표 crop은
+    # 후속(Phase 5.2)이 슬롯별로 고른다. human 확정 얼굴(source='human')은 그대로 서빙(불가침).
+    if _flow_first_enabled(webtoon_id):
+        with db_cursor() as cur:
+            cur.execute(
+                """SELECT count(*) FROM analysis_face_detection d
+                   JOIN webtoon_cut c ON c.id = d.cut_id
+                   WHERE c.episode_id = %s AND d.deleted_at IS NULL""",
+                (webtoon_episode_id,),
+            )
+            n_faces = cur.fetchone()[0]
+        logger.info("[step2] ep_id=%s flow_first — CCIP 정체 결합 스킵(얼굴 강등, Phase 5). 얼굴 %s개는 "
+                    "step1 탐지로만 존재(자석 원천 차단).", webtoon_episode_id, n_faces)
+        return {"mode": "flow_first_skip", "n_faces": n_faces, "n_matched": 0, "n_new": 0}
 
     ctx = resolve_embedding_model(webtoon_id)
     model_name = ctx["name"]
