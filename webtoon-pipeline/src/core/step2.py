@@ -717,6 +717,17 @@ def identify_episode_faces(
     # 후속(Phase 5.2)이 슬롯별로 고른다. human 확정 얼굴(source='human')은 그대로 서빙(불가침).
     if _flow_first_enabled(webtoon_id):
         with db_cursor() as cur:
+            # 얼굴 강등(Phase 5) — 이 회차의 **기존 step2 정체 결합을 제거**(자석 소멸). CCIP 교차회차
+            # 매칭이 죽은 카락·빙의 이한수에 얼굴을 쌓던 바인딩을 지운다. human 행(source='human')은
+            # 불가침(ep1~10 수동라벨 보존). 이후 신규 결합도 안 만든다(no-op) — 정체성은 step3 슬롯이 담당.
+            cur.execute(
+                """DELETE FROM analysis_face_identity fi
+                   USING analysis_face_detection d, webtoon_cut c
+                   WHERE fi.detection_id = d.id AND d.cut_id = c.id
+                     AND c.episode_id = %s AND fi.source = 'step2'""",
+                (webtoon_episode_id,),
+            )
+            purged = cur.rowcount or 0
             cur.execute(
                 """SELECT count(*) FROM analysis_face_detection d
                    JOIN webtoon_cut c ON c.id = d.cut_id
@@ -724,9 +735,10 @@ def identify_episode_faces(
                 (webtoon_episode_id,),
             )
             n_faces = cur.fetchone()[0]
-        logger.info("[step2] ep_id=%s flow_first — CCIP 정체 결합 스킵(얼굴 강등, Phase 5). 얼굴 %s개는 "
-                    "step1 탐지로만 존재(자석 원천 차단).", webtoon_episode_id, n_faces)
-        return {"mode": "flow_first_skip", "n_faces": n_faces, "n_matched": 0, "n_new": 0}
+        logger.info("[step2] ep_id=%s flow_first — 얼굴 강등(Phase 5): 구 step2 정체결합 %s개 제거(자석 소멸), "
+                    "얼굴 %s개는 step1 탐지로만 존재. human 불가침.", webtoon_episode_id, purged, n_faces)
+        return {"mode": "flow_first_purge", "n_faces": n_faces, "purged_step2": purged,
+                "n_matched": 0, "n_new": 0}
 
     ctx = resolve_embedding_model(webtoon_id)
     model_name = ctx["name"]
