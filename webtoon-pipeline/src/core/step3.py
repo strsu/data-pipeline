@@ -1072,9 +1072,9 @@ _ROSTER_SYSTEM_PROMPT = (
     " 정답이 아니다. **얼굴이 컷에 붙어 있다는 사실만으로 present_now=true로 하지 마라.** 진짜 등장인지는"
     " 대사·호칭·맥락으로만 판정한다(**대사 증거가 얼굴보다 절대 우선**).\n"
     "- **오귀속(mis-ID) 강등**: 대사·나레이션이 어떤 인물의 사망/부재를 명시(예 '죽었다','투신','참수',"
-    " '안 보이네요')하는데 CCIP가 그 인물(character_id)에 얼굴을 붙였다면, 그 얼굴들은 오귀속이다 →"
-    " present_now=false로 하고 그 **character_id를 misid_character_ids에 넣어라**(실제 누구인지 몰라도 됨)."
-    " 단 confirmed=true(human 확정)는 동결 — 절대 misid에 넣지 마라.\n"
+    " '안 보이네요')하는데 CCIP가 그 인물에 얼굴을 붙였다면, 그 얼굴들은 오귀속이다 → 반드시"
+    " **present_now=false로 하고 status에 사망/부재를 명시**하라(시스템이 그런 인물의 이 회차 CCIP"
+    " 얼굴을 자동 강등한다). 단 confirmed=true(human 확정)는 동결 — 살아있는 현재 인물로 취급.\n"
     "**JSON만** 출력: {\"roster\": [{"
     "\"name\": \"대표 이름 또는 지시어\", "
     "\"character_id\": \"이 인물의 character_id(입력 faces/roster의 cid, 모르면 null)\", "
@@ -1082,8 +1082,7 @@ _ROSTER_SYSTEM_PROMPT = (
     "\"present_now\": true/false, "
     "\"status\": \"생존|사망|불명 + 근거 한 줄\", "
     "\"role\": \"서사 역할 한 줄\", "
-    "\"evidence\": \"판단 근거(컷·원문)\"}], "
-    "\"misid_character_ids\": [오귀속으로 강등할 정수 character_id들, 없으면 빈 배열]}. "
+    "\"evidence\": \"판단 근거(컷·원문)\"}]}. "
     "없는 정보는 지어내지 말 것. **자연어는 반드시 한국어.**"
 )
 
@@ -3382,17 +3381,34 @@ def _commit_claims(
     return inserted
 
 
-def _apply_reconcile_demotions(webtoon_episode_id: int, misid_cids: list[int],
-                               valid_ids: set, now: datetime) -> int:
-    """로스터 reconcile이 오귀속으로 판정한 character_id들의 **이 회차 step2 얼굴정체를 무효화(삭제)**.
+# 사망/부재 판정 신호 — 로스터 status에서 오귀속 강등 대상을 파생한다(별도 misid 리스트는 모델
+# 변동에 취약해 폐기; present_now=false는 요약도 구동하는 robust 신호라 강등도 여기서 파생).
+_DEAD_ABSENT_TOKENS = ("사망", "죽", "참수", "투신", "살해", "부재", "미등장", "안 보", "dead", "absent", "gone")
 
-    대사>얼굴 원칙의 소급 적용 — CCIP가 죽은/부재 인물에 잘못 붙인 얼굴을 제거해 서빙/서사가
-    유령 등장으로 오도되지 않게 한다. **human 정체(source='human')는 불가침**. face_detection 자체는
-    남긴다(실제 얼굴은 다른 인물 것일 수 있어 — 재클러스터/재배정 여지). 반환: 삭제한 정체 행 수.
+
+def _apply_reconcile(webtoon_episode_id: int, roster: list[dict], valid_ids: set,
+                     now: datetime) -> tuple[int, int]:
+    """정체 조정 소급 적용 — 로스터가 **present_now=false + 사망/부재**로 판정한 인물의 이 회차
+    step2 얼굴정체를 무효화하고(대사>얼굴), 사망이면 narrative_state='dead'로 굳힌다.
+
+    강등 대상은 로스터의 present_now/status에서 파생한다(요약을 구동하는 것과 동일 신호 → 일관).
+    **human 정체(source='human')·human 확정 Character는 불가침.** face_detection 자체는 남긴다(실제
+    얼굴은 다른 인물 것일 수 있음 — 재배정 여지). 반환: (강등한 얼굴정체 수, narrative_state 설정 수).
     """
-    cids = [c for c in (misid_cids or []) if c in valid_ids]
-    if not cids:
-        return 0
+    demote_cids, dead_cids = [], []
+    for r in (roster or []):
+        cid = r.get("character_id")
+        status = r.get("status") or ""
+        if cid is None or cid not in valid_ids or r.get("present_now"):
+            continue
+        if not any(k in status for k in _DEAD_ABSENT_TOKENS):
+            continue  # present_now=false여도 명시적 사망/부재 신호가 있을 때만(과강등 방지)
+        demote_cids.append(cid)
+        if any(k in status for k in ("사망", "죽", "참수", "투신", "살해", "dead")):
+            dead_cids.append(cid)
+    n_faces = n_state = 0
+    if not demote_cids:
+        return 0, 0
     with db_cursor() as cur:
         cur.execute(
             """
@@ -3402,39 +3418,19 @@ def _apply_reconcile_demotions(webtoon_episode_id: int, misid_cids: list[int],
               AND fi.appearance_id = a.id AND a.character_id = ANY(%s)
               AND fi.source = 'step2'
             """,
-            (webtoon_episode_id, cids),
+            (webtoon_episode_id, demote_cids),
         )
-        n = cur.rowcount or 0
-    if n:
-        logger.info("[step3.reconcile] episode %s — 오귀속 얼굴정체 %s개 무효화(cid=%s)",
-                    webtoon_episode_id, n, cids)
-    return n
-
-
-def _apply_reconcile_status(roster: list[dict], valid_ids: set, now: datetime) -> int:
-    """로스터가 **사망 판정**한 인물의 narrative_state를 'dead'로 설정(소급 서사 상태).
-
-    present_now=false + status에 사망/죽음 신호. human 확정(is_confirmed)·이미 dead는 스킵.
-    부재(absent)는 회차 국소라 전역 상태로 안 굳힌다 — 사망만 반영.
-    """
-    n = 0
-    with db_cursor() as cur:
-        for r in (roster or []):
-            cid = r.get("character_id")
-            status = r.get("status") or ""
-            if cid is None or cid not in valid_ids or r.get("present_now"):
-                continue
-            if not any(k in status for k in ("사망", "죽", "dead")):
-                continue
+        n_faces = cur.rowcount or 0
+        for cid in dead_cids:
             cur.execute(
                 """UPDATE analysis_character SET narrative_state='dead', updated_at=%s
                    WHERE id=%s AND is_confirmed=false AND COALESCE(narrative_state,'')<>'dead'""",
                 (now, cid),
             )
-            n += cur.rowcount or 0
-    if n:
-        logger.info("[step3.reconcile] narrative_state=dead 설정 %s건", n)
-    return n
+            n_state += cur.rowcount or 0
+    logger.info("[step3.reconcile] episode %s — 오귀속 얼굴정체 %s개 무효화(cid=%s), narrative_state=dead %s건",
+                webtoon_episode_id, n_faces, demote_cids, n_state)
+    return n_faces, n_state
 
 
 def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
@@ -3545,9 +3541,7 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
     # 8) 정체 조정(reconcile) 소급 적용 — 로스터가 오귀속으로 판정한 인물의 이 회차 step2 얼굴을
     #    무효화하고(대사>얼굴), 사망 판정을 narrative_state에 반영한다. human 확정은 불가침.
     #    (요약은 로스터가 R/N보다 먼저 돌아 이미 교정됨 — 여기선 얼굴 데이터·상태를 맞춘다.)
-    n_demoted = _apply_reconcile_demotions(
-        webtoon_episode_id, result.misid_character_ids or [], valid_ids, now)
-    n_state = _apply_reconcile_status(result.roster or [], valid_ids, now)
+    n_demoted, n_state = _apply_reconcile(webtoon_episode_id, result.roster or [], valid_ids, now)
 
     stats = {
         "speakers_resolved": n_speakers,
