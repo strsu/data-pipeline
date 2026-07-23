@@ -68,16 +68,6 @@ class EpisodeInput:
     max_cut: int = 0  # 0이면 activity로 조회
 
 
-# 정리 패스(§22.3) 트리거 임계 — 마지막 정리 이후 succeeded resolve 개수.
-CONSOLIDATE_EVERY_N_RESOLVES = int(os.getenv("CONSOLIDATE_EVERY_N_RESOLVES", "5"))
-
-
-@dataclass
-class ConsolidateInput:
-    """웹툰 단위 정리 패스(§22.3~22.4) 입력 — 제안검토 심판 + 실행 위임."""
-    webtoon_id: int
-
-
 @dataclass
 class FaceChromaSyncInput:
     """human 얼굴 교정의 실시간 Chroma 투영(T3, prd §10) 입력 — service가 발화.

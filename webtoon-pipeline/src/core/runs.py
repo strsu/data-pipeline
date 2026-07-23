@@ -26,7 +26,6 @@ KIND_VISION = "vision"
 KIND_RESOLVE = "resolve"
 KIND_ARC = "arc"
 KIND_PROFILE = "profile"  # 캐릭터 프로필 재도출(§20) — episode NULL, stats.character_id/mode
-KIND_CONSOLIDATE = "consolidate"  # 정리 패스(§22.3) — episode NULL, 웹툰 단위 제안검토 심판
 
 
 def start_run(
@@ -192,23 +191,3 @@ def episode_needs_reresolve(episode_id: int) -> bool:
         return bool(cur.fetchone()[0])
 
 
-def consolidation_due(webtoon_id: int, threshold: int) -> bool:
-    """정리 패스 트리거 판정(§22.3) — "마지막 정리 run 이후 succeeded resolve ≥ threshold".
-
-    컬럼 없이 run 원장에서 도출(§17.1). 예약을 어떻게 쪼개든(1개씩/범위) 카운트가
-    누적되므로 동작이 같다. 정리 run이 한 번도 없으면 전체 succeeded resolve 수 기준.
-    """
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            SELECT count(*) FROM analysis_run r
-            WHERE r.webtoon_id = %s AND r.kind = %s AND r.status = 'succeeded'
-              AND r.finished_at > COALESCE(
-                    (SELECT max(finished_at) FROM analysis_run
-                     WHERE webtoon_id = %s AND kind = %s AND status = 'succeeded'),
-                    '-infinity'::timestamptz)
-            """,
-            (webtoon_id, KIND_RESOLVE, webtoon_id, KIND_CONSOLIDATE),
-        )
-        n = cur.fetchone()[0]
-    return n >= threshold

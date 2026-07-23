@@ -28,7 +28,7 @@ with workflow.unsafe.imports_passed_through():
     from src.temporal import activities
     from src.temporal.shared import (
         ORCH_QUEUE, STEP1, STEP1_QUEUE, STEP2, STEP2_QUEUE, STEP3, STEP3_QUEUE,
-        ChainInput, ConsolidateInput, EpisodeInput, FaceChromaSyncInput,
+        ChainInput, EpisodeInput, FaceChromaSyncInput,
         RegenBatchInput, RegenInput,
     )
 
@@ -317,102 +317,6 @@ class RegenerateBatchWorkflow:
             )
 
 
-@workflow.defn
-class ConsolidateWebtoonWorkflow:
-    """웹툰 단위 정리 패스(§22.3~22.4) — 제안검토 심판 → 실행 위임.
-
-    begin(umbrella run, ORCH) → plan(계획 스냅샷) → judge_dossier × N(서류철당
-    액티비티 1개, 순차) → reconcile(취합/가드/영속) → finish(수락/기각을 service
-    celery로 위임 + run 종료, ORCH). 심판류는 전부 STEP3_QUEUE.
-
-    서류철당 액티비티 분해 = 중간 저장: 완료된 서류철 판정은 워크플로 히스토리에
-    남아 워커 재시작/배포에도 재실행되지 않는다(수 시간짜리 패스의 LLM 콜 보존).
-    실행(병합 §19·자동 훅 §20)은 service 수락 경로가 담당 — 여기서는 판정까지만.
-    workflow_id(consolidate_webtoon_{id}) 멱등이라 체인 훅/버튼의 중복 발화는 무해.
-    """
-
-    @workflow.run
-    async def run(self, inp: ConsolidateInput) -> None:
-        begin = await workflow.execute_activity(
-            activities.consolidation_begin, inp,
-            task_queue=ORCH_QUEUE,
-            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-        )
-        run_id = begin["run_id"]
-
-        if workflow.patched("consolidate-dossier-split"):
-            # 신 경로(2026-07-14) — 서류철당 액티비티 분해.
-            result = await self._adjudicate_split(inp, run_id)
-        else:
-            # 구 경로 리플레이 호환 — 배포 시점 in-flight 실행(히스토리에 단일
-            # consolidation_adjudicate가 스케줄된)이 NondeterminismError로 죽지 않게
-            # 워크플로 코드 수준에서 분기한다(구 액티비티 등록 유지만으로는 리플레이를
-            # 못 구한다). 신규 실행은 patched()가 항상 True.
-            result = await workflow.execute_activity(
-                activities.consolidation_adjudicate,
-                args=[inp.webtoon_id, run_id],
-                task_queue=STEP3_QUEUE,
-                start_to_close_timeout=timedelta(hours=6),
-                heartbeat_timeout=timedelta(minutes=10),
-                retry_policy=_REGEN_RETRY,
-            )
-
-        await workflow.execute_activity(
-            activities.consolidation_finish,
-            args=[inp.webtoon_id, run_id, result],
-            task_queue=ORCH_QUEUE,
-            start_to_close_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-        )
-
-    async def _adjudicate_split(self, inp: ConsolidateInput, run_id: int) -> dict:
-        """plan → judge_dossier × N(순차) → reconcile. 표는 DB 스크래치로 흐르고
-        (payload judge_votes — Temporal 페이로드 2MB 한도 회피), 워크플로는 소형
-        요약만 나른다. 완료된 서류철 판정은 히스토리+DB에 남아 재시작에도 보존."""
-        # 계획 스냅샷 — DB 조회뿐이지만 웹툰 락 대기(체인 apply 진행 중)가 길 수 있다.
-        plan = await workflow.execute_activity(
-            activities.consolidation_plan,
-            args=[inp.webtoon_id],
-            task_queue=STEP3_QUEUE,
-            start_to_close_timeout=timedelta(hours=1),
-            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-        )
-
-        # 서류철 순차 판정 — 서류철 사이마다 락/슬롯이 풀려 정규 체인이 끼어들 수 있다.
-        # 한 서류철의 최종 실패(재시도 소진)는 call_error로 기록하고 패스는 계속.
-        dossiers = plan.get("dossiers") or []
-        summaries: list = []
-        call_errors: list[str] = []
-        for di, dossier in enumerate(dossiers, 1):
-            try:
-                r = await workflow.execute_activity(
-                    activities.consolidation_judge_dossier,
-                    args=[inp.webtoon_id, run_id, dossier, di, len(dossiers)],
-                    task_queue=STEP3_QUEUE,
-                    # 콜 1개(수 분) + 락 대기(regen 재해소가 시간 단위일 수 있음).
-                    start_to_close_timeout=timedelta(hours=2),
-                    heartbeat_timeout=timedelta(minutes=10),
-                    retry_policy=_REGEN_RETRY,
-                )
-                summaries.append(r)
-            except ActivityError:
-                workflow.logger.warning(
-                    "[consolidate] w%s 서류철 %d/%d %s 최종 실패 — call_error 기록 후 계속",
-                    inp.webtoon_id, di, len(dossiers), dossier.get("name"),
-                )
-                call_errors.append(dossier.get("name") or f"dossier_{di}")
-
-        return await workflow.execute_activity(
-            activities.consolidation_reconcile,
-            args=[inp.webtoon_id, run_id, plan, summaries, call_errors],
-            task_queue=STEP3_QUEUE,
-            start_to_close_timeout=timedelta(hours=1),
-            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
-        )
-
-
-# T3 청크 크기 — 얼굴당 crop fetch+임베딩 수 초 기준, 청크 하나가 액티비티
-# start_to_close(10분) 안에 넉넉히 끝나는 크기. 청크당 액티비티 1개 = 중간 저장
-# (대량 bulk에서 attempt 재시도가 전체 얼굴을 재실행하지 않게).
 _T3_CHUNK = 25
 
 

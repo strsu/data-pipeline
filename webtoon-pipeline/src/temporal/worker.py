@@ -38,7 +38,6 @@ from src.temporal.shared import (
     TEMPORAL_NAMESPACE,
 )
 from src.temporal.workflows import (
-    ConsolidateWebtoonWorkflow,
     EpisodeChainWorkflow,
     FaceChromaSyncWorkflow,
     RegenerateBatchWorkflow,
@@ -81,7 +80,7 @@ async def main() -> None:
         client,
         task_queue=ORCH_QUEUE,
         workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow, RegenerateBatchWorkflow,
-                   ConsolidateWebtoonWorkflow, FaceChromaSyncWorkflow],
+                   FaceChromaSyncWorkflow],
         activities=[
             activities.resolve_episode_for_chain,
             activities.next_chain_episode,
@@ -90,9 +89,6 @@ async def main() -> None:
             activities.mark_resolve_run_failed,
             activities.regen_begin,
             activities.regen_batch_begin,
-            activities.consolidation_due_for_episode,
-            activities.consolidation_begin,
-            activities.consolidation_finish,
             activities.face_chroma_sync,  # T3 — crop 임베딩(수 초)이라 orch 스레드 8개로 충분
         ],
         activity_executor=orch_executor,
@@ -128,10 +124,6 @@ async def main() -> None:
             activities.regen_reresolve_episode,
             activities.regen_batch_reresolve_episode,
             activities.regen_profile,
-            activities.consolidation_adjudicate,  # 구버전 호환(배포 시점 in-flight 재시도용)
-            activities.consolidation_plan,
-            activities.consolidation_judge_dossier,
-            activities.consolidation_reconcile,
         ],
         activity_executor=step3_executor,
         max_concurrent_activities=2,

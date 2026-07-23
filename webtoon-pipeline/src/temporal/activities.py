@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from temporalio import activity
 
 from src.temporal.shared import (
-    STEP_RUN_KIND, ChainInput, ConsolidateInput, EpisodeInput, FaceChromaSyncInput,
+    STEP_RUN_KIND, ChainInput, EpisodeInput, FaceChromaSyncInput,
     RegenBatchInput, RegenInput,
 )
 
@@ -698,103 +698,6 @@ def regen_profile(inp: RegenInput, webtoon_id: int, run_id: int) -> dict:
     return {"character_id": inp.character_id, "error": result.get("error")}
 
 
-# ── 정리 패스(§22.3~22.4): 제안검토 심판 + 실행 위임 ─────────────────────────
-# ConsolidateWebtoonWorkflow가 사용. 판정(LLM 심판+가드)은 pipeline(adjudicate.py),
-# 실행(제안 수락=§19 병합 시맨틱, 자동 훅 §20)은 service celery로 위임(service_bus).
-
-# service celery task 이름/큐 — service apps/api/toon/tasks.py의 명시 name과 일치해야 함.
-_EXECUTE_CONSOLIDATION_TASK = "apps.api.toon.tasks.execute_consolidation"
-_EXECUTE_CONSOLIDATION_QUEUE = "middle"
-
-
-@activity.defn
-def consolidation_due_for_episode(webtoon_episode_id: int) -> int | None:
-    """체인 훅용 트리거 판정 — due면 webtoon_id, 아니면 None."""
-    from src.config.db import db_cursor
-    from src.core import runs
-    from src.temporal.shared import CONSOLIDATE_EVERY_N_RESOLVES
-
-    with db_cursor() as cur:
-        cur.execute("SELECT webtoon_id FROM webtoon_episode WHERE id = %s", (webtoon_episode_id,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    webtoon_id = row[0]
-    if runs.consolidation_due(webtoon_id, CONSOLIDATE_EVERY_N_RESOLVES):
-        return webtoon_id
-    return None
-
-
-@activity.defn
-def consolidation_begin(inp: ConsolidateInput) -> dict:
-    """umbrella run(kind=consolidate, episode NULL) 시작 — 잔재 running은 start_run이 supersede."""
-    from src.core import runs
-    from src.operators.llm_resolver import TEXT, resolve_llm_model
-
-    ctx = resolve_llm_model(inp.webtoon_id, TEXT)
-    run_id = runs.start_run(inp.webtoon_id, None, runs.KIND_CONSOLIDATE,
-                            llm_model_id=ctx.get("id"))
-    return {"run_id": run_id}
-
-
-@activity.defn
-def consolidation_adjudicate(webtoon_id: int, run_id: int) -> dict:
-    """(구버전 호환) 심판 전체를 액티비티 1개로 — 배포 시점에 돌던 워크플로의 재시도용.
-
-    신규 실행은 plan/judge_dossier/reconcile 3분할 액티비티로 돈다(중간 저장 —
-    완료된 서류철 판정이 워크플로 히스토리에 남아 재시작에도 재실행 안 됨).
-    """
-    from src.core import adjudicate
-
-    with _webtoon_serialized(webtoon_id, "consolidate:judge"):
-        return _run_with_heartbeat(
-            adjudicate.adjudicate_webtoon,
-            args=(webtoon_id,),
-            kwargs=dict(run_id=run_id),
-            detail="consolidate:judge",
-        )
-
-
-@activity.defn
-def consolidation_plan(webtoon_id: int) -> dict:
-    """심판 1단계 — 서류철 계획 스냅샷(DB 조회만, LLM 없음)."""
-    from src.core import adjudicate
-
-    with _webtoon_serialized(webtoon_id, "consolidate:plan"):
-        return adjudicate.plan_webtoon(webtoon_id)
-
-
-@activity.defn
-def consolidation_judge_dossier(webtoon_id: int, run_id: int, dossier: dict,
-                                index: int, total: int) -> dict:
-    """심판 2단계 — 서류철 1개 = LLM 콜 1개. 실패는 예외 전파(재시도는 워크플로 정책,
-    소진 시 워크플로가 call_error로 기록하고 다음 서류철 진행).
-
-    같은 웹툰과는 _webtoon_serialized 락으로 직렬화(apply의 pending delete-reinsert와
-    겹치면 심판 중이던 sid가 소멸). 락이 서류철 사이마다 풀리므로 정규 체인 apply가
-    수 시간짜리 심판 패스 전체를 기다리지 않고 끼어들 수 있다 — 그 틈에 소멸한 sid는
-    judge/reconcile 가드가 버린다(수확 감소로 수렴, 정합성 훼손 없음).
-    """
-    from src.core import adjudicate
-
-    with _webtoon_serialized(webtoon_id, "consolidate:judge"):
-        return _run_with_heartbeat(
-            adjudicate.judge_dossier,
-            args=(webtoon_id, run_id, dossier, index, total),
-            detail=f"judge {index}/{total} {dossier.get('name', '')}",
-        )
-
-
-@activity.defn
-def consolidation_reconcile(webtoon_id: int, run_id: int, plan: dict,
-                            summaries: list, call_errors: list) -> dict:
-    """심판 3단계 — 표결 취합(payload judge_votes 스크래치)→교차대조/가드→권고 영속(LLM 없음)."""
-    from src.core import adjudicate
-
-    with _webtoon_serialized(webtoon_id, "consolidate:reconcile"):
-        return adjudicate.reconcile_pass(webtoon_id, run_id, plan, summaries, call_errors)
-
-
 # ── T3: human 얼굴 교정의 실시간 Chroma 투영 (prd §10) ────────────────────────
 
 @activity.defn
@@ -832,73 +735,3 @@ def face_chroma_sync(inp: FaceChromaSyncInput) -> dict:
             f"t3-sync 전건 실패({total}건) — Chroma/model-api 장애 추정, Temporal 재시도로 위임"
         )
     return results
-
-
-@activity.defn
-def consolidation_finish(webtoon_id: int, run_id: int, result: dict) -> dict:
-    """실행 위임 + umbrella run 종료.
-
-    수락/기각 목록이 있으면 service celery(execute_consolidation)로 위임하고 run은
-    succeeded(stats.execution='enqueued')로 닫는다 — 실행 결과는 service task가
-    같은 run stats에 덧붙인다(진행 정본은 여전히 run 1행). 브로커 미설정/전송 실패면
-    수동 실행이 가능하도록 stats에 결정 목록을 남기고 failed로 닫는다.
-
-    judge_votes 스크래치 청소는 여기서 한다 — result가 이미 워크플로 히스토리에 실려
-    reconcile 재시도가 표를 다시 읽을 일이 없어진 시점(reconcile 안에서 지우면 청소
-    커밋↔완료 보고 사이 크래시 시 재시도가 빈 표로 noop, §22.7).
-    """
-    from src.config.db import db_cursor
-    from src.core import adjudicate, runs
-    from src.operators import service_bus
-
-    try:
-        adjudicate._clear_judge_votes_scratch(webtoon_id)
-    except Exception:  # noqa: BLE001 — 잔재는 다음 plan이 치우므로 finish를 막지 않는다
-        logger.warning("[consolidate] w%s judge_votes 스크래치 청소 실패(무해 — 다음 plan이 처리)",
-                       webtoon_id, exc_info=True)
-
-    accepts = result.get("accept_suggestion_ids") or []
-    rejects = result.get("reject_suggestion_ids") or []
-    stats = {"judge": result.get("stats") or {},
-             "accept_suggestion_ids": accepts, "reject_suggestion_ids": rejects}
-
-    if result.get("error"):
-        runs.finish_run(run_id, status="failed", error=str(result["error"]), stats=stats)
-        return {"run_id": run_id, "enqueued": False, "error": result["error"]}
-
-    if not accepts and not rejects:
-        stats["execution"] = "noop"
-        runs.finish_run(run_id, stats=stats)
-        return {"run_id": run_id, "enqueued": False, "error": None}
-
-    # 재시도 멱등: 이전 attempt가 이미 위임했으면(execution 키 존재) 다시 enqueue하지
-    # 않고, service task가 이미 기록한 실행 결과(dict)를 'enqueued' 마커로 되덮지도
-    # 않는다(finish_run은 || merge라 늦게 쓰는 쪽이 이긴다 — 라운드3 리뷰).
-    with db_cursor() as cur:
-        cur.execute("SELECT stats FROM analysis_run WHERE id = %s", (run_id,))
-        row = cur.fetchone()
-    prev_execution = ((row[0] or {}).get("execution") if row else None)
-    if prev_execution is not None:
-        if not isinstance(prev_execution, dict):
-            stats["execution"] = prev_execution  # 'enqueued' 등 — 그대로 유지
-        else:
-            stats.pop("execution", None)  # 실행 결과 dict 보존(merge가 덮지 않게 키 제외)
-        runs.finish_run(run_id, stats=stats)
-        logger.info("[consolidate] w%s run=%s — 이미 위임됨(execution=%s) — 재enqueue 생략",
-                    webtoon_id, run_id, "dict" if isinstance(prev_execution, dict) else prev_execution)
-        return {"run_id": run_id, "enqueued": True, "error": None}
-
-    try:
-        service_bus.send_service_task(
-            _EXECUTE_CONSOLIDATION_TASK,
-            args=[webtoon_id, run_id, accepts, rejects],
-            queue=_EXECUTE_CONSOLIDATION_QUEUE,
-        )
-        stats["execution"] = "enqueued"
-        runs.finish_run(run_id, stats=stats)
-        return {"run_id": run_id, "enqueued": True, "error": None}
-    except Exception as e:  # noqa: BLE001 — 전송 실패는 run에 남기고 수동 수습 가능하게
-        stats["execution"] = "enqueue_failed"
-        runs.finish_run(run_id, status="failed", error=f"celery enqueue 실패: {e}", stats=stats)
-        logger.error("[consolidate] w%s run=%s 실행 위임 실패: %s", webtoon_id, run_id, e)
-        return {"run_id": run_id, "enqueued": False, "error": str(e)}
