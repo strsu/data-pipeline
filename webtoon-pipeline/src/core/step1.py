@@ -37,7 +37,9 @@ from src.config.chroma import get_face_collection
 from src.config.db import db_cursor
 from src.config.r2 import delete_face_crop, upload_face_crop
 from src.config.s3 import fetch_cut_image
-from src.operators.cut_merger import _content_intervals, merge_short_intervals, split_tall_interval
+from src.operators.cut_merger import (
+    _content_intervals, merge_short_intervals, split_tall_interval, MIN_SEGMENT_PX,
+)
 from src.operators.ocr_yolo_client import run_ocr, run_yolo
 
 logger = logging.getLogger(__name__)
@@ -559,6 +561,13 @@ def _iter_episode_segments(
             # 파편(MIN_SEGMENT_PX 미만) 완결 구간을 이웃과 병합(split의 대칭). carry-over(last)는
             # 다음 윈도우에서 성장할 수 있으므로 병합 대상 아님 — 완결된 terminated에만 적용.
             terminated = merge_short_intervals(terminated)
+            # Fix C(cross-window carry): 병합 후에도 terminated 꼬리가 짧으면(윈도우 내 병합할
+            # 이웃이 없음 = 경계 슬리버) 다음 윈도우로 이월해 미래 콘텐츠와 병합한다. 남은 컷이
+            # 있을 때만 — 마지막 윈도우는 최종 flush가 전 구간(last 포함) 병합으로 처리한다.
+            if (terminated and _cuts_remaining()
+                    and (terminated[-1][1] - terminated[-1][0]) < MIN_SEGMENT_PX):
+                last = [terminated[-1][0], last[1]]
+                terminated = terminated[:-1]
             carry_start = last[0]  # 이월(Carry_Over_Block) 블록의 버퍼 로컬 시작
         else:
             terminated, last, carry_start = [], None, None
@@ -823,13 +832,14 @@ def _process_segment_ocr(
             """
             INSERT INTO analysis_text_region
                 (cut_id, segment_id, index, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                 score, line_group, is_used, is_excluded, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
+                 strip_y1, strip_y2, score, line_group, is_used, is_excluded,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_text_region_cut_index DO NOTHING
             RETURNING id
             """,
             (cut_id, segment_id, idx, lb[0], lb[1], lb[2], lb[3],
-             score, gid, is_used, now, now),
+             gy1, gy2, score, gid, is_used, now, now),
         )
         res = cur.fetchone()
         if not res:
@@ -908,13 +918,13 @@ def _process_segment_yolo(
             """
             INSERT INTO analysis_face_detection
                 (cut_id, segment_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                 conf, is_used, is_duplicate, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 strip_y1, strip_y2, conf, is_used, is_duplicate, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_face_record_cut_idx DO NOTHING
             RETURNING id
             """,
             (cut_id, segment_id, fidx, lb[0], lb[1], lb[2], lb[3],
-             face["conf"], is_used, is_dup, now, now),
+             gy1, gy2, face["conf"], is_used, is_dup, now, now),
         )
         res = cur.fetchone()
         if not res:

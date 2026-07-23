@@ -66,7 +66,7 @@ def _row_flatness(arr: np.ndarray) -> np.ndarray:
 def split_tall_interval(
     arr: np.ndarray, y0: int, y1: int,
     max_h: int = MAX_SEGMENT_PX, search_ratio: float = SPLIT_SEARCH_RATIO,
-    slack: float = SPLIT_SLACK,
+    slack: float = SPLIT_SLACK, min_h: int = MIN_SEGMENT_PX,
 ) -> list[tuple[int, int]]:
     """콘텐츠 구간 [y0,y1)이 max_h보다 크면 **OCR이 읽을 수 있는 크기**로 쪼갠다.
 
@@ -97,6 +97,11 @@ def split_tall_interval(
         out.append((s, cut))
         s = cut
     out.append((s, y1))
+    # Fix A(min/max 대칭): 마지막 조각이 min_h 미만이면 직전 조각에 흡수(자투리 세그 방지).
+    # split이 슬리버 꼬리를 남기지 않도록 — 직전이 max_h를 살짝 넘겨도 슬리버보다 낫다.
+    if len(out) >= 2 and (out[-1][1] - out[-1][0]) < min_h:
+        out[-2] = (out[-2][0], out[-1][1])
+        out.pop()
     return out
 
 
@@ -114,12 +119,15 @@ def merge_short_intervals(
     out: list[list[int]] = [list(intervals[0])]
     for y0, y1 in intervals[1:]:
         prev = out[-1]
-        if (prev[1] - prev[0]) < min_h and (y1 - prev[0]) <= max_h:
+        # Fix B(min/max 대칭): 짧은 prev는 max_h를 넘겨서라도 흡수한다. 슬리버(<min_h)가 양이웃
+        # ~max_h 사이에 껴 병합 못하는 사고 방지 — 결과가 커지면 _emit→split_tall_interval이
+        # 재분할하고, 그 split 꼬리는 Fix A가 흡수하므로 슬리버가 재생성되지 않는다.
+        if (prev[1] - prev[0]) < min_h:
             prev[1] = y1          # 짧은 prev를 현재까지 확장(갭 포함)
         else:
             out.append([y0, y1])
-    # 꼬리 구간이 짧으면 직전과 병합(max_h 이내일 때만).
-    if len(out) >= 2 and (out[-1][1] - out[-1][0]) < min_h and (out[-1][1] - out[-2][0]) <= max_h:
+    # 꼬리 구간이 짧으면 직전과 병합(max_h 초과 허용 — split이 뒤에서 정리).
+    if len(out) >= 2 and (out[-1][1] - out[-1][0]) < min_h:
         out[-2][1] = out[-1][1]
         out.pop()
     return [(a, b) for a, b in out]
