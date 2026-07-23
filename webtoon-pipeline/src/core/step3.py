@@ -3489,7 +3489,14 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
     now = datetime.now(timezone.utc)
     valid_ids = _webtoon_character_ids(webtoon_id)
     cut_map = _episode_cut_id_map(webtoon_episode_id)
-    region_map = _episode_region_map(webtoon_episode_id)
+    # 세그먼트-단위 웹툰: resolve LLM이 블록을 (segment_index, seg읽기순)으로 참조하므로 region_map·
+    # beats를 세그 기준으로 구성(로더 재사용 = fresh extract와 동일 순서 → 키 재현). Phase C.
+    from src.core import step3_segment as _ss
+    _seg_ranges = None
+    if _ss.segment_unit_enabled(webtoon_id):
+        region_map, _seg_ranges = _ss.episode_region_map_and_ranges(webtoon_episode_id)
+    else:
+        region_map = _episode_region_map(webtoon_episode_id)
     no_id_map = _episode_no_id_map(webtoon_id)
 
     # 1) 이름·승격 투영(소급) + 통합 suggestion 큐 적재(name/merge/label_conflict/face_reassign).
@@ -3514,8 +3521,11 @@ def apply_resolution(ep: "ExtractResult | int", result: "ResolveResult", *,
         webtoon_episode_id, region_map, result.speaker_resolution, valid_ids, now,
     )
 
-    # 3) 비트.
-    n_beats = _commit_beats(webtoon_episode_id, result.beats, now, run_id)
+    # 3) 비트. 세그 모드면 beats의 cut_start/cut_end(세그 index 공간)를 실제 컷 범위로 환산(C4).
+    _beats = result.beats
+    if _seg_ranges is not None:
+        _beats = _ss.remap_beats_to_cuts(_beats, _seg_ranges)
+    n_beats = _commit_beats(webtoon_episode_id, _beats, now, run_id)
 
     # 4) 회차 리포트(인물 타임라인 = characters 요약 — 검토 UI/재적용 재구성용 스냅샷).
     character_timeline = [
@@ -3903,12 +3913,16 @@ def reresolve_episode(
     if invalidate_speaker_character_ids:
         _invalidate_llm_speakers(webtoon_episode_id, invalidate_speaker_character_ids)
 
+    from src.core import step3_segment as _ss  # 세그-단위 게이트(Phase C·D)
+    _seg_mode = _ss.segment_unit_enabled(webtoon_id)
+
     vision_run_id = None
     if rerun_extract:
         vision_run_id = runs.start_run(webtoon_id, webtoon_episode_id, runs.KIND_VISION,
                                        llm_model_id=vision_model_id, stats=origin_stats)
-        ext = extract_episode(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True,
-                              run_id=vision_run_id)
+        _extract = _ss.extract_episode_segment if _seg_mode else extract_episode
+        ext = _extract(webtoon_episode_id, heartbeat_cb=heartbeat_cb, prepare=True,
+                       run_id=vision_run_id)
         runs.finish_run(vision_run_id, stats={
             "cuts_total": ext.cuts_total, "cuts_analyzed": ext.cuts_analyzed,
             "cuts_skipped": ext.cuts_skipped, "usage": ext.usage_total,
@@ -3916,7 +3930,8 @@ def reresolve_episode(
         records = ext.records
     else:
         vision_run_id = runs.latest_succeeded_run_id(webtoon_episode_id, runs.KIND_VISION)
-        records = _load_pass1_records_from_db(webtoon_episode_id)
+        records = (_ss.load_pass1_records_segment(webtoon_episode_id) if _seg_mode
+                   else _load_pass1_records_from_db(webtoon_episode_id))
 
     if prior_context is None:
         prior_context = narrative_context.load_prior(webtoon_id, info["episode_no"])

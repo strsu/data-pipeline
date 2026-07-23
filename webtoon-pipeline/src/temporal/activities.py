@@ -366,7 +366,7 @@ def step3a_extract(ep: EpisodeInput) -> dict:
     넘긴다(Req 9.3). per-call LLMUsage 적재는 코어가 내부에서 수행한다(Req 6.7).
     """
     from dataclasses import asdict
-    from src.core import runs, step3
+    from src.core import runs, step3, step3_segment
     from src.operators.llm_resolver import VISION, resolve_llm_model
 
     def _hb(done: int) -> None:
@@ -377,8 +377,12 @@ def step3a_extract(ep: EpisodeInput) -> dict:
         ctx = resolve_llm_model(webtoon_id, VISION)
         run_id = runs.start_run(webtoon_id, ep.webtoon_episode_id, runs.KIND_VISION,
                                 llm_model_id=ctx.get("id"))
+        # 세그먼트-단위 웹툰(segment_unit_enabled)이면 컷 대신 세그먼트 단위로 Stage V(Phase D).
+        _extract = (step3_segment.extract_episode_segment
+                    if step3_segment.segment_unit_enabled(webtoon_id)
+                    else step3.extract_episode)
         try:
-            result = step3.extract_episode(ep.webtoon_episode_id, heartbeat_cb=_hb, run_id=run_id)
+            result = _extract(ep.webtoon_episode_id, heartbeat_cb=_hb, run_id=run_id)
         except Exception as e:
             runs.finish_run(run_id, status="failed", error=str(e))
             raise
