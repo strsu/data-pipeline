@@ -101,23 +101,3 @@ class RegenInput:
     absorbed_character_ids: list[int] | None = None
     rerun_extract: bool = False
     invalidate_character_ids: list[int] | None = None
-
-
-@dataclass
-class RegenBatchInput:
-    """웹툰 단위 배치 재분석 입력 — RegenerateBatchWorkflow(§20.9, 2026-07-14).
-
-    정리 패스 심판이 수락을 일괄 실행할 때 캐릭터별 개별 워크플로 대신 이것 하나를
-    발화한다: reresolve 대상 캐릭터들의 등장 에피소드 **합집합을 1번씩만** 재해소한 뒤
-    캐릭터별 프로필 재도출로 마무리 — 겹치는 회차의 중복 재해소(2026-07-13 화산귀환
-    16시간 백로그의 주원인)를 제거한다.
-
-    items: [{"character_id", "mode"("profile"|"reresolve"), "absorbed_character_ids",
-             "invalidate_character_ids"}] — 같은 캐릭터는 호출측(service)이 coalesce
-            (reresolve ⊃ profile, absorbed/invalidate는 union).
-    batch_key: workflow_id 유니크 꼬리(보통 consolidate run id) — 배치는 멱등 재발화가
-            아니라 판정 1회당 1배치라 웹툰 단위 멱등 id를 쓰지 않는다.
-    """
-    webtoon_id: int
-    items: list[dict]
-    batch_key: str = ""

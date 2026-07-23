@@ -40,7 +40,6 @@ from src.temporal.shared import (
 from src.temporal.workflows import (
     EpisodeChainWorkflow,
     FaceChromaSyncWorkflow,
-    RegenerateBatchWorkflow,
     RegenerateCharacterWorkflow,
 )
 
@@ -79,7 +78,7 @@ async def main() -> None:
     orch_worker = Worker(
         client,
         task_queue=ORCH_QUEUE,
-        workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow, RegenerateBatchWorkflow,
+        workflows=[EpisodeChainWorkflow, RegenerateCharacterWorkflow,
                    FaceChromaSyncWorkflow],
         activities=[
             activities.resolve_episode_for_chain,
@@ -88,7 +87,6 @@ async def main() -> None:
             activities.is_phase3_enabled,
             activities.mark_resolve_run_failed,
             activities.regen_begin,
-            activities.regen_batch_begin,
             activities.face_chroma_sync,  # T3 — crop 임베딩(수 초)이라 orch 스레드 8개로 충분
         ],
         activity_executor=orch_executor,
@@ -122,7 +120,6 @@ async def main() -> None:
             activities.step3b_resolve,
             activities.step3c_apply,
             activities.regen_reresolve_episode,
-            activities.regen_batch_reresolve_episode,
             activities.regen_profile,
         ],
         activity_executor=step3_executor,

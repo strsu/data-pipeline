@@ -24,7 +24,7 @@ from temporalio import activity
 
 from src.temporal.shared import (
     STEP_RUN_KIND, ChainInput, EpisodeInput, FaceChromaSyncInput,
-    RegenBatchInput, RegenInput,
+    RegenInput,
 )
 
 logger = logging.getLogger(__name__)
@@ -570,97 +570,6 @@ def regen_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
             detail="regen:reresolve",
         )
         regen.bump_profile_run_progress(run_id, episodes_done)
-    return {"webtoon_episode_id": webtoon_episode_id,
-            "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
-
-
-# ── 웹툰 단위 배치 재분석(§20.9, 2026-07-14) ─────────────────────────────────
-# RegenerateBatchWorkflow가 사용. 정리 패스 심판의 수락 실행이 캐릭터별 개별 워크플로 대신
-# 배치 하나를 발화한다 — reresolve 대상들의 등장 에피소드 **합집합을 1번씩만** 재해소한 뒤
-# 캐릭터별 프로필 재도출(regen_profile 재사용)로 마무리. 겹치는 회차의 중복 재해소 제거.
-
-
-@activity.defn
-def regen_batch_begin(inp: RegenBatchInput) -> dict | None:
-    """배치 대상 해석 + 캐릭터별 umbrella run 시작. 유효 항목이 없으면 None(no-op).
-
-    반환: {"webtoon_id", "episodes": [{"episode_id","episode_no"}...(reresolve 합집합, 회차순)],
-           "items": [{"character_id","mode","absorbed_character_ids","run_id"}...],
-           "invalidate_character_ids": [...(items의 invalidate union)]}.
-    umbrella run은 캐릭터별(kind=profile, stats.character_id/mode)로 만들어 프론트
-    regen-status 표시 계약을 유지한다. reresolve run의 episodes_total은 합집합 크기.
-    """
-    from src.core import regen
-    from src.operators.llm_resolver import TEXT, resolve_llm_model
-
-    valid_items: list[dict] = []
-    invalidate: set[int] = set()
-    episodes_by_id: dict[int, dict] = {}
-    for item in inp.items or []:
-        cid = int(item.get("character_id") or 0)
-        mode = item.get("mode") or "profile"
-        if regen._character_info(cid) is None:
-            logger.warning("[regen-batch] character=%s 없음/삭제됨 — 항목 건너뜀", cid)
-            continue
-        if mode == "reresolve":
-            for ep in regen.character_episode_ids(cid):
-                episodes_by_id[ep["episode_id"]] = ep
-        for i in item.get("invalidate_character_ids") or []:
-            if i:
-                invalidate.add(int(i))
-        valid_items.append({
-            "character_id": cid, "mode": mode,
-            "absorbed_character_ids": [int(i) for i in (item.get("absorbed_character_ids") or []) if i],
-        })
-    if not valid_items:
-        logger.warning("[regen-batch] webtoon=%s 유효 항목 없음 — no-op", inp.webtoon_id)
-        return None
-
-    episodes = sorted(episodes_by_id.values(), key=lambda e: e["episode_no"])
-    ctx = resolve_llm_model(inp.webtoon_id, TEXT)
-    for item in valid_items:
-        item["run_id"] = regen.begin_profile_run(
-            inp.webtoon_id, item["character_id"], item["mode"],
-            llm_model_id=ctx.get("id"),
-            episodes_total=len(episodes) if item["mode"] == "reresolve" else 0,
-        )
-    logger.info(
-        "[regen-batch] webtoon=%s begin — items=%d(reresolve=%d) episodes(합집합)=%d invalidate=%s",
-        inp.webtoon_id, len(valid_items),
-        sum(1 for i in valid_items if i["mode"] == "reresolve"), len(episodes), sorted(invalidate),
-    )
-    return {"webtoon_id": inp.webtoon_id, "episodes": episodes, "items": valid_items,
-            "invalidate_character_ids": sorted(invalidate)}
-
-
-@activity.defn
-def regen_batch_reresolve_episode(webtoon_episode_id: int, webtoon_id: int,
-                                  run_ids: list[int], episodes_done: int,
-                                  invalidate_character_ids: list[int] | None = None) -> dict:
-    """배치 재해소 1에피소드 — 텍스트 전용 + 옛 화자 무효화(regen_reresolve_episode와 동일 시맨틱).
-
-    run_ids: 배치의 reresolve umbrella run들 — 전부 superseded면 배치 종료 신호(superseded=True),
-    살아있는 run들만 진행도(episodes_done)를 갱신한다.
-    """
-    from src.core import regen, step3
-
-    with _webtoon_serialized(webtoon_id, "regen:batch"):
-        live = [r for r in (run_ids or []) if regen.run_is_live(r)]
-        if run_ids and not live:
-            logger.info("[regen-batch] runs=%s 전부 superseded — ep%s 재해소 건너뜀(배치 종료 신호)",
-                        run_ids, webtoon_episode_id)
-            return {"superseded": True, "webtoon_episode_id": webtoon_episode_id}
-
-        out = _run_with_heartbeat(
-            step3.reresolve_episode,
-            args=(webtoon_episode_id,),
-            kwargs=dict(rerun_extract=False, webtoon_id=webtoon_id,
-                        invalidate_speaker_character_ids=invalidate_character_ids or [],
-                        run_origin="regen"),
-            detail="regen:batch",
-        )
-        for r in live:
-            regen.bump_profile_run_progress(r, episodes_done)
     return {"webtoon_episode_id": webtoon_episode_id,
             "resolve_error": out.get("resolve_error"), "run_id": out.get("run_id")}
 
