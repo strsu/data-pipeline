@@ -183,8 +183,9 @@ def extract_segment(
     세그-로컬 읽기순(로더가 부여) — region_id로 매핑해 provisional annotation 적재.
     """
     seg_ix = seg.index
-    if not seg.regions and not seg.faces:
-        return Pass1Record(cut_number=seg_ix, cut_id=None, faces=seg.faces, skipped="empty")
+    # 빈 세그(리전·얼굴 0=art 패널)도 분석한다 — 모든 컷/세그 분석 합의(대사 없어도 scene 서술 확보)
+    # + 세그 index 연속성 유지(스킵으로 불연속되면 narrative beat 경계가 빈 index에 떨어져 서사 빵꾸).
+    # 이미지 없을 때만 스킵.
     if not seg.image_bytes:
         return Pass1Record(cut_number=seg_ix, cut_id=None, faces=seg.faces, skipped="no_image")
 
@@ -213,6 +214,13 @@ def extract_segment(
         return Pass1Record(cut_number=seg_ix, cut_id=None, faces=seg.faces, usage=usage, error=err)
 
     result = _sanitize_pass1(raw_result, seg.regions)
+    logger.info(
+        "[step3.seg] ep=%s seg=%s(컷%s~%s) — blocks=%s faces=%s chars=%s scene=%.35s",
+        webtoon_episode_id, seg_ix,
+        (seg.cuts[0] if seg.cuts else "-"), (seg.cuts[-1] if seg.cuts else "-"),
+        len(result["blocks"]), len(seg.faces), len(result.get("characters") or []),
+        (result.get("cut_summary") or "").replace("\n", " "),
+    )
 
     # teacher 입출력 수집 — 이미지 ref=세그(구성 컷+strip 범위로 재구성 가능).
     _record_llm_sample(

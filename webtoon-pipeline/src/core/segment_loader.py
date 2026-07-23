@@ -79,6 +79,11 @@ def _cut_offset_at(cut_offsets: list[tuple[int, int]], cn: int) -> int | None:
     return None
 
 
+def _cuts_overlapping(y1: int, y2: int, cuts: list[dict]) -> list[int]:
+    """세그 strip 범위 [y1,y2)와 겹치는 컷 번호(빈 세그도 컷범위 확보 — beats remap 재현성)."""
+    return sorted(c["cn"] for c in cuts if c["off"] < y2 and c["off"] + c["h"] > y1)
+
+
 def load_segment_units(webtoon_episode_id: int) -> list[SegUnit]:
     """회차의 세그먼트 분석단위 목록을 조립(읽기전용). 세그 없으면 빈 리스트."""
     with db_cursor() as cur:
@@ -193,7 +198,8 @@ def load_segment_units(webtoon_episode_id: int) -> list[SegUnit]:
         for i, f in enumerate(u.faces):
             f["id"] = f"F{i}"
             f.pop("_sort", None)
-        u.cuts.sort()
+        # 컷범위는 strip 겹침으로(리전 유무 무관 — 빈 세그도 매핑돼 beats remap 재현성 보장)
+        u.cuts = _cuts_overlapping(u.strip_y1, u.strip_y2, cuts)
         if strip.shape[0] >= u.strip_y2 > u.strip_y1 >= 0:
             bio = BytesIO()
             Image.fromarray(strip[u.strip_y1:u.strip_y2]).save(bio, "JPEG", quality=92)
