@@ -919,7 +919,7 @@ def _process_segment_yolo(
             INSERT INTO analysis_face_detection
                 (cut_id, segment_id, face_idx, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
                  strip_y1, strip_y2, conf, is_used, is_duplicate, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT ON CONSTRAINT uniq_face_record_cut_idx DO NOTHING
             RETURNING id
             """,
