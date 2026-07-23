@@ -1,5 +1,15 @@
 # 세그먼트-단위 분석 정석 구현 계획 (2026-07-23)
 
+## ✅ 구현 완료·배포 (2026-07-24)
+**Phase A/B/C/D 전부 구현·커밋·main push·배포됨.** 토글 `segment_unit_enabled` 기본 OFF(전 웹툰) → **휴면**(A2/A4만 활성=순개선).
+- 커밋: data-pipeline `23d90f6`(A: step1 strip_y+슬리버흡수) `b7b5d13`(B+C+D: 세그 Stage V+다운스트림 세그키잉) / service `385f729`(마이그 0040).
+- 신규 모듈: `src/core/segment_loader.py`(로더) `src/core/step3_segment.py`(extract_segment·extract_episode_segment·region_map·reresolve·beats remap). 게이팅: step3.apply_resolution/reresolve_episode + temporal/activities(순환회피 지연import).
+- **통제 E2E(참교육 ep2, V→R→N→apply 세그모드)**: resolve_error=null, segScene=115·cutScene=0, 화자배정=250(나화진84·교장33·김학재39…)·무효speaker=0, beats cut_end=99≤100컷(remap✅), region_map 불변식 416키 일치. → 통과.
+- **남은 것**: ①실사용=웹툰 토글 ON+재분석(strip_y 채움+세그모드 가동)·스케일 검증 ②비효율=apply가 region_map 위해 strip 재조립(후속: ExtractResult에 region_map 부착) ③참교육 ep2가 E2E로 세그모드 분석됨(토글 OFF인데 세그산출 — 무해, 재분석시 정리) ④세그 stale scene_meta는 세그모드 재실행때만 정리(_clear_episode_segment_scene).
+
+---
+
+
 Stage V(step3)를 컷-단위 → **세그먼트-단위(1급 시민)**로 전환. MVP(재투영) 아니라 정석.
 근거: 6웹툰 truncation 컷~71% vs 세그~20%, 화자 커버리지 세그 1.7~2배(핸드오프 §0.5 B).
 
