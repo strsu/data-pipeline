@@ -2663,6 +2663,120 @@ def _webtoon_character_names(webtoon_id: int) -> dict[int, str]:
         return {r[0]: r[1] for r in cur.fetchall()}
 
 
+# ── 대사 클러스터 naming 패스 (recall 회복, remain-trouble D5) ───────────────────────────────
+# Stage R의 per-세그 name_evidence(face_label 결속)가 놓치는 자칭/호격 명명을 회복한다. 전-회차
+# 트랜스크립트를 **화자 시각클러스터 라벨(S1..)과 함께** 통으로 텍스트 모델에 주고, 대사 흐름
+# (자칭·호격·3인칭)으로 슬롯에 이름을 바인딩시킨다. 실측(exp_naming_bind): 프로덕션이 통째 놓친
+# 주인공 청명(90대사/22얼굴)을 자칭 "본도 청명"으로 복구. consolidate의 명명 강점을 텍스트-발명
+# 슬롯이 아니라 **시각 클러스터**에 되살린 것. 출력은 ResolveResult.characters로 흘려 apply가 명명·
+# (동명이면)자동 귀속한다.
+_NAMING_SYSTEM_PROMPT = (
+    "너는 웹툰 회차의 익명 화자 슬롯(S1,S2,...)에 실제 인물 이름을 바인딩한다.\n"
+    "입력: 읽기순 대사 트랜스크립트. 각 줄 = [화자슬롯] (type) 텍스트. 슬롯은 같은 인물의 대사를 묶은 것(이름 미상).\n"
+    "대사 증거로 각 슬롯의 이름을 찾아라:\n"
+    "- 자칭(강): '나는 X', '본도(本道) X', '이 X가', '매화검존 X' 등 화자가 자기를 X라 함 → 그 화자 슬롯 = X\n"
+    "- 호격(중): 화자 A가 'X야/X아/X님' 하고 부름 → 지목되는 상대(직후 반응/대화상대 슬롯) = X\n"
+    "- 3인칭 언급(약): 'X의 묘책', 'X라는 자' → 현재 대화의 어느 슬롯인지 확실할 때만\n"
+    "확신 있는 것만. 이름 못 찾은 슬롯은 생략. 지어내지 마라. 같은 이름이 여러 슬롯이면 **모두** 적어라(동일인 분할).\n"
+    "confidence: 자칭 0.9~1.0, 호격(상대 명확) 0.7~0.85, 3인칭(슬롯 확실) 0.6~0.8, 애매하면 낮게.\n"
+    "반드시 JSON만: {\"names\":[{\"slot\":\"S1\",\"name\":\"청명\",\"confidence\":0.95,\"evidence\":\"본도 청명 자칭\"}]}"
+)
+_NAMING_STAGE = "naming"
+
+
+def name_clusters_by_dialogue(
+    webtoon_episode_id: int,
+    records: list["Pass1Record"],
+    *,
+    webtoon_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    run_id: Optional[int] = None,
+) -> dict:
+    """대사 흐름으로 **시각 클러스터에 이름을 바인딩**(자칭/호격/3인칭). 반환 {characters, usage}.
+
+    각 발화 블록의 화자를 그 유닛 faces(face_label→character_id)로 클러스터에 매핑해 슬롯 라벨을
+    만들고(빈도순 S1..), 트랜스크립트+라벨을 텍스트 모델에 통으로 준다. 출력 이름을 클러스터
+    character_id로 되짚어 ResolveResult.characters 형식([{character_id,name,name_confidence,evidence}])
+    으로 반환 → apply(_project_characters)가 명명·승격·(동명이면)자동 귀속. 실패 시 빈 결과(격리).
+    """
+    if webtoon_id is None:
+        webtoon_id = _get_webtoon_id(webtoon_episode_id)
+    if ctx is None:
+        ctx = resolve_llm_model(webtoon_id, TEXT)
+    call_ctx = _pass2_ctx(ctx)
+
+    blocks: list[tuple] = []  # (type, text, cluster_cid)
+    for rec in records or []:
+        if rec.skipped or rec.error or not rec.result:
+            continue
+        face2cid = {f.get("id"): f.get("character_id") for f in (rec.faces or [])}
+        for b in (rec.result.get("blocks") or []):
+            if b.get("type") not in _SPEAKER_TYPES and b.get("type") != "narration":
+                continue
+            text = (b.get("corrected_text") or "").strip()
+            if not text:
+                continue
+            fl = (b.get("speaker") or {}).get("face_label")
+            blocks.append((b.get("type"), text, face2cid.get(fl)))
+    from collections import Counter
+    freq = Counter(cid for _t, _x, cid in blocks if cid is not None)
+    if not freq:
+        return {"characters": [], "usage": {}}
+    cid2slot = {cid: f"S{i+1}" for i, (cid, _n) in enumerate(freq.most_common())}
+    slot2cid = {v: k for k, v in cid2slot.items()}
+    lines = [f"[{cid2slot.get(cid, '?')}] ({typ}) {text}" for typ, text, cid in blocks]
+    user_text = "트랜스크립트:\n" + "\n".join(lines)
+
+    raw: dict = {}
+    usage: dict = {}
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, _NAMING_SYSTEM_PROMPT, user_text, [])
+            raw = call.result if isinstance(call.result, dict) else {}
+            usage = call.usage or {}
+            break
+        except Exception as e:  # noqa: BLE001 — 스테이지 격리(run 중단 금지)
+            logger.warning("[step3.naming] episode %s — naming 실패(재시도): %s", webtoon_episode_id, e)
+            raw = {}
+    if run_id is not None and usage:
+        _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
+                          stage=_NAMING_STAGE, image_count=None, run_id=run_id)
+
+    out: list[dict] = []
+    for n in (raw.get("names") or []):
+        if not isinstance(n, dict):
+            continue
+        cid = slot2cid.get(n.get("slot"))
+        name = _str_or_empty(n.get("name")).strip()
+        conf = _clampf(n.get("confidence", 0))
+        if cid and name and conf > 0:
+            out.append({"character_id": cid, "name": name[:64], "name_confidence": conf,
+                        "evidence": _str_or_empty(n.get("evidence")).strip()[:200], "significance": None})
+    # 지배 클러스터(대사 최다)를 앞에 — 동명 다수 시 그게 primary가 되도록.
+    out.sort(key=lambda o: -freq.get(o["character_id"], 0))
+    logger.info("[step3.naming] episode %s — 슬롯명명 %s개: %s", webtoon_episode_id, len(out),
+                ", ".join(f"{cid2slot.get(o['character_id'])}={o['name']}({o['name_confidence']:.2f})" for o in out))
+    return {"characters": out, "usage": usage}
+
+
+def _union_naming_characters(stage_r: list[dict], naming: list[dict]) -> list[dict]:
+    """Stage R characters + naming 패스 characters union. 같은 character_id면 naming이 이름/신뢰/증거를
+    덮어쓰되(고신뢰 자칭명명 우선) significance 등 나머지는 Stage R 유지. 새 cid는 append."""
+    out = [dict(c) for c in (stage_r or [])]
+    idx = {c.get("character_id"): c for c in out if c.get("character_id") is not None}
+    for nc in naming or []:
+        cid = nc.get("character_id")
+        tgt = idx.get(cid)
+        if tgt is not None:
+            tgt["name"] = nc["name"]
+            tgt["name_confidence"] = nc["name_confidence"]
+            tgt["evidence"] = nc.get("evidence") or tgt.get("evidence")
+        else:
+            out.append(dict(nc))
+            idx[cid] = out[-1]
+    return out
+
+
 def resolve_and_narrate(
     ep: "ExtractResult | int",
     prior_context=None,
@@ -2713,18 +2827,25 @@ def resolve_and_narrate(
         r.roster = episode_roster
         return r
 
+    # 대사 클러스터 naming 패스(recall 회복, D5) — 자칭/호격 명명을 시각 클러스터에 바인딩.
+    # Stage R characters와 union(같은 cid는 naming이 우선 — 고신뢰 자칭명명).
+    naming = name_clusters_by_dialogue(
+        webtoon_episode_id, records or [], webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+    )
+    characters = _union_naming_characters(r.characters, naming.get("characters") or [])
+
     n = narrate_episode(
         webtoon_episode_id, records or [], r, prior_context,
         webtoon_id=webtoon_id, ctx=ctx, run_id=run_id, episode_roster=episode_roster,
     )
     usage = dict(r.usage or {})
-    for extra in (roster_res.get("usage") or {}, n.get("usage") or {}):
+    for extra in (roster_res.get("usage") or {}, naming.get("usage") or {}, n.get("usage") or {}):
         for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
             usage[k] = int(usage.get(k, 0) or 0) + int(extra.get(k, 0) or 0)
 
     return ResolveResult(
         webtoon_episode_id=webtoon_episode_id,
-        characters=r.characters,
+        characters=characters,
         speaker_resolution=r.speaker_resolution,
         face_reassignments=r.face_reassignments,
         beats=n.get("beats") or [],
@@ -2830,6 +2951,28 @@ def _sync_match_exclusion(final_kind: str, sig, cur_excl: bool, source: str):
     return None
 
 
+def _attach_cluster_to_character(cur, cid: int, target: int, now: datetime) -> None:
+    """익명 클러스터 `cid`를 기존 인물 `target`에 흡수(자동 귀속, D5). 같은 커서 트랜잭션 안에서 수행.
+
+    appearance(얼굴 그룹)와 화자 참조(text_annotation.speaker_id)를 target으로 재배정 → cid의 얼굴이
+    target 이름으로 라벨되고 소급 전파. name_edge/claim도 재배정(대개 클러스터엔 없음). 빈 cid는
+    소프트삭제. profile은 재배정 안 함(target이 Stage N으로 자체 생성 — 중복 방지)."""
+    cur.execute("UPDATE analysis_character_appearance SET character_id = %s, updated_at = %s "
+                "WHERE character_id = %s AND deleted_at IS NULL", (target, now, cid))
+    n_app = cur.rowcount or 0
+    cur.execute("UPDATE analysis_text_annotation SET speaker_id = %s, updated_at = %s "
+                "WHERE speaker_id = %s", (target, now, cid))
+    n_spk = cur.rowcount or 0
+    cur.execute("UPDATE analysis_name_edge SET character_id = %s WHERE character_id = %s "
+                "AND deleted_at IS NULL", (target, cid))
+    cur.execute("UPDATE analysis_character_claim SET character_id = %s WHERE character_id = %s",
+                (target, cid))
+    cur.execute("UPDATE analysis_character SET deleted_at = %s, updated_at = %s WHERE id = %s",
+                (now, now, cid))
+    logger.info("[step3.apply] 자동귀속(D5): cluster %s → character %s 흡수(appearance %s·화자 %s 재배정, 소프트삭제)",
+                cid, target, n_app, n_spk)
+
+
 def _project_characters(
     webtoon_id: int, characters: list[dict], valid_ids: set[int], now: datetime,
 ) -> list[dict]:
@@ -2902,6 +3045,14 @@ def _project_characters(
                     sets.append("kind = 'character'")
                     sets.append("is_name_auto_assigned = true")
                     claimed_names.add(name.lower())
+                elif (conf >= _NAME_AUTO_CONFIDENCE and cur_kind == "cluster"
+                      and existing is not None and existing != cid):
+                    # 자동 귀속(D5) — 익명 클러스터를 **동명 기존 인물에 흡수**(appearance/화자 재배정
+                    # + 소프트삭제). recall 회복·교차회차 연결·회차내 과분할 봉합. 위험한 "명명된 둘
+                    # 병합"과 다름(익명→기존정체 귀속). cluster→named 방향·정확한 이름일치·고신뢰만.
+                    _attach_cluster_to_character(cur, cid, existing, now)
+                    claimed_names.add(name.lower())
+                    continue  # cid는 흡수·소프트삭제됨 — significance/제외/UPDATE 스킵
                 elif name != _cur_name:
                     # 현재 이름과 동일하면 제안 생략 — 실질 변화 없는 중복 노이즈(회차마다 재생성 방지).
                     suggestions.append({
