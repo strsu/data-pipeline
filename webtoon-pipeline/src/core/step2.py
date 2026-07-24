@@ -204,11 +204,13 @@ def _get_excluded_appearance_ids(webtoon_id: int, anonymous_only: bool = False) 
     + soft-delete된 개별 appearance(ca.deleted_at). 쿼리 시점 제외라 이미 Chroma에
     시딩돼 남아있는 과거 에피소드 doc까지 함께 후보에서 빠진다.
 
-    anonymous_only(재설계 Path A)=True면 **명명·승격된 인물(kind='character')의 appearance도 제외**한다 —
-    얼굴이 크로스회차 명명 인물에 자석처럼 흡수되는 걸 원천 차단(익명 클러스터끼리만 매칭). 이 목록은
-    load_ccip_anchors(앵커 로드)와 find_match(cosine $nin) 양쪽에 반영되므로, 여기 한 곳만 막으면 된다.
+    anonymous_only(재설계 Path A)=True면 **이름이 붙은 모든 인물(name<>'' 또는 kind='character')의
+    appearance를 제외**한다 — 얼굴이 명명된 인물(명명 클러스터 포함)에 자석처럼 흡수돼 그 이름이
+    resolve pass2 페이로드로 새는 걸 원천 차단(익명=name='' 클러스터끼리만 매칭. 교차회차 정체는
+    이름-우선으로 잇고 CCIP는 미명명 클러스터에만 보조). 이 목록은 load_ccip_anchors(앵커 로드)와
+    find_match(cosine $nin) 양쪽에 반영되므로, 여기 한 곳만 막으면 된다.
     """
-    kind_clause = "OR c.kind = 'character'" if anonymous_only else ""
+    kind_clause = "OR c.name <> '' OR c.kind = 'character'" if anonymous_only else ""
     with db_cursor() as cur:
         cur.execute(
             f"""
@@ -262,12 +264,12 @@ def _seed_confirmed_faces(
     얼굴 하나가 끝날 때마다 같은 값(heartbeat_value)으로 heartbeat를 보내 타임아웃
     타이머를 갱신한다.
 
-    anonymous_only(재설계 Path A)=True면 명명·승격 인물(kind='character')의 확정 얼굴은 앵커로
-    시딩하지 않는다 — 익명 클러스터(kind='cluster')만 매칭 기준점으로 삼아 명명 인물로의 흡수를 막는다.
+    anonymous_only(재설계 Path A)=True면 이름이 붙은 인물(name<>'' 또는 kind='character')의 확정 얼굴은
+    앵커로 시딩하지 않는다 — 익명(name='') 클러스터만 매칭 기준점으로 삼아 명명 인물로의 흡수를 막는다.
     (제외 목록(_get_excluded_appearance_ids)이 이미 명명 appearance를 후보에서 빼지만, 여기서도 걸러
     불필요한 S3 다운로드·임베딩을 아끼고 앵커 캐시를 익명 클러스터로 순수하게 유지한다.)
     """
-    kind_clause = "AND c.kind = 'cluster'" if anonymous_only else ""
+    kind_clause = "AND c.name = '' AND c.kind = 'cluster'" if anonymous_only else ""
     with db_cursor() as cur:
         cur.execute(
             f"""
