@@ -197,16 +197,21 @@ def _update_character_first_seen(appearance_id: int, episode_id: int, episode_no
         )
 
 
-def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
+def _get_excluded_appearance_ids(webtoon_id: int, anonymous_only: bool = False) -> list[int]:
     """매칭 후보에서 제외할 appearance_id 목록.
 
     제외 대상: is_match_excluded(죽은 단역 등) + soft-delete된 캐릭터(c.deleted_at)
     + soft-delete된 개별 appearance(ca.deleted_at). 쿼리 시점 제외라 이미 Chroma에
     시딩돼 남아있는 과거 에피소드 doc까지 함께 후보에서 빠진다.
+
+    anonymous_only(재설계 Path A)=True면 **명명·승격된 인물(kind='character')의 appearance도 제외**한다 —
+    얼굴이 크로스회차 명명 인물에 자석처럼 흡수되는 걸 원천 차단(익명 클러스터끼리만 매칭). 이 목록은
+    load_ccip_anchors(앵커 로드)와 find_match(cosine $nin) 양쪽에 반영되므로, 여기 한 곳만 막으면 된다.
     """
+    kind_clause = "OR c.kind = 'character'" if anonymous_only else ""
     with db_cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT ca.id
             FROM analysis_character_appearance ca
             JOIN analysis_character c ON ca.character_id = c.id
@@ -215,6 +220,7 @@ def _get_excluded_appearance_ids(webtoon_id: int) -> list[int]:
                 c.is_match_excluded = true
                 OR c.deleted_at IS NOT NULL
                 OR ca.deleted_at IS NOT NULL
+                {kind_clause}
               )
             """,
             (webtoon_id,),
@@ -247,6 +253,7 @@ def _get_valid_appearance_ids(webtoon_id: int) -> set[int]:
 def _seed_confirmed_faces(
     webtoon_id: int, source: str, title_id: str, collection, model_name: str, metric_type: str,
     heartbeat_cb: Optional[Callable[[int], None]] = None, heartbeat_value: int = 0,
+    anonymous_only: bool = False,
 ) -> int:
     """수동 확정 얼굴을 Chroma에 시딩 — 매칭 기준점 보장.
 
@@ -254,10 +261,16 @@ def _seed_confirmed_faces(
     웹툰에서는 이 단계만으로도 heartbeat_timeout을 넘길 수 있다. 메인 루프와 동일하게
     얼굴 하나가 끝날 때마다 같은 값(heartbeat_value)으로 heartbeat를 보내 타임아웃
     타이머를 갱신한다.
+
+    anonymous_only(재설계 Path A)=True면 명명·승격 인물(kind='character')의 확정 얼굴은 앵커로
+    시딩하지 않는다 — 익명 클러스터(kind='cluster')만 매칭 기준점으로 삼아 명명 인물로의 흡수를 막는다.
+    (제외 목록(_get_excluded_appearance_ids)이 이미 명명 appearance를 후보에서 빼지만, 여기서도 걸러
+    불필요한 S3 다운로드·임베딩을 아끼고 앵커 캐시를 익명 클러스터로 순수하게 유지한다.)
     """
+    kind_clause = "AND c.kind = 'cluster'" if anonymous_only else ""
     with db_cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT fr.id, fr.face_idx, fr.bbox_x1, fr.bbox_y1, fr.bbox_x2, fr.bbox_y2,
                    fr.conf, fi.appearance_id, wc.cut_number, we.no AS episode_no,
                    ca.label AS appearance_label, c.id AS character_pk,
@@ -276,6 +289,7 @@ def _seed_confirmed_faces(
               AND c.is_match_excluded = false
               AND c.deleted_at IS NULL
               AND ca.deleted_at IS NULL
+              {kind_clause}
             """,
             (model_name, webtoon_id),
         )
@@ -710,35 +724,13 @@ def identify_episode_faces(
     source = webtoon["source"]
     title_id = webtoon["title_id"]
 
-    # ── 흐름-first 얼굴 강등(redesign §5·Phase 5) ──────────────────────────────────
-    # flow_first_enabled면 CCIP 정체 결합을 전면 스킵한다. 정체성 척추가 익명 슬롯+대사 흐름으로
-    # 옮겨졌으므로(step3 정리단계), CCIP의 교차회차 매칭이 만들던 자석(죽은 카락·빙의 이한수에 얼굴
-    # 흡수)을 원천 차단한다. 얼굴은 step1 탐지(analysis_face_detection)로만 존재하고, 대표 crop은
-    # 후속(Phase 5.2)이 슬롯별로 고른다. human 확정 얼굴(source='human')은 그대로 서빙(불가침).
-    if _flow_first_enabled(webtoon_id):
-        with db_cursor() as cur:
-            # 얼굴 강등(Phase 5) — 이 회차의 **기존 step2 정체 결합을 제거**(자석 소멸). CCIP 교차회차
-            # 매칭이 죽은 카락·빙의 이한수에 얼굴을 쌓던 바인딩을 지운다. human 행(source='human')은
-            # 불가침(ep1~10 수동라벨 보존). 이후 신규 결합도 안 만든다(no-op) — 정체성은 step3 슬롯이 담당.
-            cur.execute(
-                """DELETE FROM analysis_face_identity fi
-                   USING analysis_face_detection d, webtoon_cut c
-                   WHERE fi.detection_id = d.id AND d.cut_id = c.id
-                     AND c.episode_id = %s AND fi.source = 'step2'""",
-                (webtoon_episode_id,),
-            )
-            purged = cur.rowcount or 0
-            cur.execute(
-                """SELECT count(*) FROM analysis_face_detection d
-                   JOIN webtoon_cut c ON c.id = d.cut_id
-                   WHERE c.episode_id = %s AND d.deleted_at IS NULL""",
-                (webtoon_episode_id,),
-            )
-            n_faces = cur.fetchone()[0]
-        logger.info("[step2] ep_id=%s flow_first — 얼굴 강등(Phase 5): 구 step2 정체결합 %s개 제거(자석 소멸), "
-                    "얼굴 %s개는 step1 탐지로만 존재. human 불가침.", webtoon_episode_id, purged, n_faces)
-        return {"mode": "flow_first_purge", "n_faces": n_faces, "purged_step2": purged,
-                "n_matched": 0, "n_new": 0}
+    # ── 익명 클러스터링 모드(character-linking 재설계 Path A) ──────────────────────
+    # flow_first_enabled면 CCIP를 "익명 시각 클러스터링"으로만 돌린다(purge 아님). 얼굴은 kind='cluster'
+    # (name='')인 익명 슬롯끼리만 병합하고, **명명·승격된 인물(kind='character')로는 절대 흡수하지 않는다**
+    # (자석 차단 — 죽은 카락·빙의 이한수에 얼굴 쌓이던 근원). 이름은 step3 reconcile(대사)이 슬롯에 얹고,
+    # 교차회차 정체는 이름-우선으로 잇는다(CCIP는 미명명 클러스터에만 보조). human 확정(source='human')은
+    # 불가침(그대로 서빙). = 얼굴(시각 슬롯) 유지 + 명명은 대사가 담당. (구 flow_first_purge를 대체.)
+    anonymous_only = _flow_first_enabled(webtoon_id)
 
     ctx = resolve_embedding_model(webtoon_id)
     model_name = ctx["name"]
@@ -752,6 +744,7 @@ def identify_episode_faces(
     _seed_confirmed_faces(
         webtoon_id, source, title_id, collection, model_name, metric_type,
         heartbeat_cb=heartbeat_cb, heartbeat_value=resume_from,
+        anonymous_only=anonymous_only,
     )
     # 시딩(확정 upsert)과 짝: human이 부정한 얼굴의 잔존 doc 제거 — anchor 적재 전에
     # 실행해야 이번 에피소드 매칭 후보에서 확실히 빠진다.
@@ -762,7 +755,7 @@ def identify_episode_faces(
     )
     # 리스트로 고정 — 아래에서 유령 appearance_id를 발견할 때마다 append해 이후 쿼리에서도
     # 제외되게 한다(list는 참조로 넘겨지므로 find_match 재호출 시 갱신된 내용이 그대로 반영됨).
-    excluded_appearance_ids = list(_get_excluded_appearance_ids(webtoon_id))
+    excluded_appearance_ids = list(_get_excluded_appearance_ids(webtoon_id, anonymous_only))
     valid_appearance_ids = _get_valid_appearance_ids(webtoon_id)
 
     # collection.get()/일괄 임베딩이 heartbeat_timeout(2분)보다 오래 걸릴 수 있어,

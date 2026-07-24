@@ -47,11 +47,14 @@
 
 = **CCIP 클러스터(a,b,c) → reconcile이 이름 얹기.** 이름 없는 익명 분석이라 CCIP 오독 명명 오염 없음 + 얼굴(인물) 유지.
 
-### 열린 설계 질문 (다음 세션서 정할 것)
-- **Q1**: "클러스터 id를 슬롯으로 주입" — appearance_id를 그대로? 아니면 회차-로컬 슬롯번호(A/B/C)로 재라벨? (프롬프트 가독성 vs 안정성)
-- **Q2**: reconcile을 **언제** 돌려 이름을 얹나 — 회차별 R 스테이지 내부? 전 회차 후 웹툰-전역 1회? (persona 링커=대사·화법 회차간 연결, 원설계 `redesign-flow-first`에 있으나 미배포.)
-- **Q3**: 교차회차 정체 — 같은 인물이 회차마다 다른 클러스터로 잡힘. 클러스터를 회차 넘어 어떻게 잇나(CCIP 갤러리 매칭? persona? 이름?).
-- **Q4**: 세그-네이티브 저장(remain-trouble D2)과의 순서 — 독립이라 병행 가능.
+### ✅ 설계 결정 (2026-07-24 확정)
+- **Q1 = F라벨 + 회차-로컬 문자슬롯 병기.** Stage V에 `{"id":"F0","slot":"A"}` — F는 오버레이 grounding(이미지에 그린 숫자와 일치), slot은 `appearance_id`를 회차 내 결정론적 순서로 A/B/C 재라벨한 **안정 축**(raw int 아님 — LLM 정수-크기 헛패턴·가독성 회피). 매핑 `appearance_id↔slot`은 결정론적이라 resolve/reconcile이 되짚음. **부가정제**: `source='human'`(확정) 얼굴은 CCIP 추측이 아니라 ground truth라 `name`까지 주입(불가침) — 익명화를 "CCIP step2 추측에만" 좁힘.
+- **Q2 = 회차별 명명 먼저(즉시 출하) + 웹툰-전역 나중.** 회차 내 대사증거로 슬롯 명명(박대석 소급강등 = 이미 검증). 전역 명명전파는 Q3 링킹 이후 후속.
+- **Q3 = 이름-우선 링킹 + 미명명 클러스터에만 CCIP 보조.** 대사-이름이 정체를 몲(ep1-slotA=ep5-slotB=청명이면 병합), CCIP는 이름없는 클러스터에만 보조(이름 절대 안 덮음). persona 링커는 3순위. = 옛 43% 시각자석 실패의 반전.
+- **⭐ 아키텍처 = Path A (시각슬롯 단일화).** 이중구조를 "시각 슬롯 단일 우주"로 구현: Stage V에 익명 CCIP 시각슬롯 주입 → 화자배정도 **세그 비전이 face_label 참조로 수행**(기존 resolve 경로에서 CCIP 이름만 벗김) → reconcile이 시각슬롯에 명명. **텍스트-only consolidate 경로 폐기.** 근거: 흐름-first가 텍스트-only로 우회한 이유(컷단위 비전 화자배정 과분할)를 **세그먼트 단위 전환이 이미 제거**(화자 커버리지 1.7~2배). 세그 단위 비전이면 익명 시각슬롯 화자배정이 grounding까지 얻으며 한 우주로 끝남. ⚠️ **세그 비전 화자배정이 흐름-first 0.95에 근접하는지는 화산귀환 A/B 소규모 대조로 확인 후 토글 제거.**
+- **Q4**: 세그-네이티브 저장(remain-trouble D2)과 독립 — 병행 가능.
+
+> ⚠️ **핵심 발견**: 코드에 "슬롯"이 두 우주다 — ①시각 슬롯(`appearance_id`, step2 CCIP) ②페르소나 슬롯(`consolidate_episode`가 대사만으로 발명, `_commit_slots`가 슬롯당 새 cluster 생성, **얼굴과 연결 0**). flow_first purge만 빼면 둘이 각자 놀아 "얼굴에 이름"이 저절로 안 됨. Path A는 ②(consolidate)를 버리고 ①(시각)로 단일화 + resolve 경로에서 CCIP 이름만 벗기는 방식.
 
 ---
 
@@ -62,10 +65,19 @@
 - 크래시 핫픽스 `7ae5297`, A/B/C 서사빵꾸 fix `4c73091`, **429 재시도 `e2c0cbc`**(방금 배포).
 - 문서 커밋: `2972dbe`·`e44a632`(remain-trouble 결정), 이 PRD.
 
+### Path A 하이브리드 구현 (2026-07-24, ✅ 코드완료·미배포·미커밋)
+§2 Path A를 `flow_first_enabled=true` 뒤에 구현(토글은 검증까지 유지 — true=Path A, false=옛 CCIP이름). 변경(로컬, 미커밋):
+- **step2.py**(익명 클러스터링): purge 조기반환 삭제 → `anonymous_only` 플래그로 정상 클러스터링 진입. `_get_excluded_appearance_ids(webtoon_id, anonymous_only)`에 `OR c.kind='character'`(명명인물 매칭후보 제외=자석 차단, load_ccip_anchors+cosine $nin 양쪽 반영되는 단일지점). `_seed_confirmed_faces`는 `AND c.kind='cluster'`로 명명인물 앵커 시딩 안 함. 신규는 이미 kind='cluster',name=''.
+- **step3.py**: `_slot_label`(엑셀식 A/B/…AA)+`_episode_slot_map(ep_id)`(appearance_id→슬롯, 첫등장순, human>step2 우선 일치) 신설. `build_pass1_input(...,slot_map=)` 익명경로 재작성: `{"id":F,"slot":A}` + **human 확정만 `confirmed`+`name`**(불가침). `extract_cut`/`extract_episode`에 slot_map 배선(회차1회). Stage V 시스템프롬프트에 slot 설명 추가. **resolve_and_narrate의 consolidate 분기 삭제** → flow_first여도 표준 resolve(roster→R→N). 화자배정은 face_label→appearance→cid(이름 없이 작동), 명명은 name_evidence(대사).
+- **step3_segment.py**: `extract_segment`/`extract_episode_segment`에 slot_map 배선.
+- 검증: py_compile OK, step3 회귀테스트 13통과(1실패는 사전존재·무관 segment-share 속성테스트).
+- **consolidate_and_commit_episode/_commit_slots 등 옛 텍스트-only 경로는 코드에 남김**(dead, 검증 후 §④에서 제거).
+
 ### 미착수 (다음)
-- **flow_first 제거 + 하이브리드**(이 PRD §2) — 미착수. 순서: ①step2 purge제거 ②Stage V 클러스터슬롯 주입 ③resolve/reconcile 명명 ④flow_first 컬럼·게이트 제거.
-- 세그-네이티브 저장(remain-trouble D2, 프론트 대공사).
-- LLM 주도 lookback(remain-trouble D4, 프로덕션 미적용).
+- **배포 + 화산귀환 A/B 검증**: push→CI→ArgoCD 후 ep1 재분석(step1?→step2→step3). 확인: 얼굴 클러스터 유지(purge 0)·클러스터 익명(kind=cluster,이름없음)·화자배정 수·대사기반 승격(유령/빙의 오명명 0)·slot 주입 로그. Path A 화자배정이 흐름-first 0.95에 근접하면 §④로.
+- **§④ 토글 제거**(검증 후): flow_first 컬럼·게이트·consolidate 코드 삭제 → Path A 무조건화. + resolve pass2 페이로드에 slot 라벨 노출(cid 대신 가독성, 교차유닛 추적 실질 이득).
+- **Q3 웹툰-전역 명명링킹**(이름-우선+미명명만 CCIP) — 회차별 명명 안정화 후.
+- 세그-네이티브 저장(remain-trouble D2, 프론트 대공사). LLM 주도 lookback(D4).
 
 ### ⚠️ 화산귀환(17) 현재 데이터 상태 (정리 필요)
 - config: `flow_first_enabled=true`, `segment_unit_enabled=true`(내가 실험 중 false로 바꿨다 **true로 복원함**).

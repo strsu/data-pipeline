@@ -63,9 +63,12 @@ _USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc", "profile", "
 # speaker.basis, "지어내지 마"). 연속성은 Pass-1이 아니라 Pass-2가 담당(Req 1.2).
 _PASS1_SYSTEM_PROMPT = (
     "당신은 웹툰 컷 분석기입니다. 입력: 현재 컷 이미지(얼굴 bbox에 F0/F1 라벨 오버레이), "
-    "identified_faces(F라벨+알려진 이름+confirmed), ocr_blocks(index+text). 현재 컷만 분석해 **JSON만** 출력.\n"
+    "identified_faces(F라벨+slot?+이름?+confirmed?), ocr_blocks(index+text). 현재 컷만 분석해 **JSON만** 출력.\n"
     "identified_faces의 confirmed=true는 **사람이 확정한 정체성(진실)** — 그대로 신뢰한다. "
     "confirmed=false는 얼굴인식 추정값이라 이미지/대사와 어긋나 보이면 name_evidence로 이의만 남긴다.\n"
+    "얼굴에 **slot**(A/B/C…)이 붙어 있으면 그 회차 전체에서 **같은 인물(같은 얼굴)**을 가리키는 안정 라벨이다 — "
+    "이름은 아직 모를 수 있다. slot이 같은 얼굴은 동일인으로 다루고(한 컷에 같은 slot 둘이면 같은 사람), 이름은 "
+    "지어내지 말고 대사·나레이션 증거가 있을 때만 name_evidence에 남긴다(그 slot의 F라벨과 함께).\n"
     "⚠️ **모든 자연어 출력(cut_summary/key_objects/name_evidence 등)은 반드시 한국어로 작성한다** "
     "(예외: corrected_text만 OCR 원문 언어 유지). 영어 등 다른 언어로 답하지 말 것.\n"
     "⚠️ **cut_summary 등 서술형 텍스트 안에서 대사·문구를 인용할 때 큰따옴표(\")를 쓰지 마라** — "
@@ -266,6 +269,45 @@ def _load_faces(cut_id: int) -> list[dict]:
         ]
 
 
+def _slot_label(n: int) -> str:
+    """0→A, 1→B, ..., 25→Z, 26→AA, 27→AB ... (엑셀식 열 라벨). 회차 내 안정 슬롯 문자."""
+    s = ""
+    n += 1
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _episode_slot_map(webtoon_episode_id: int) -> dict[int, str]:
+    """회차의 얼굴 클러스터(appearance_id)에 안정 문자 슬롯(A/B/C…)을 배정 — 재설계 Path A.
+
+    익명 Stage V 주입용. appearance_id는 DB 정수라 LLM 가독성이 나쁘므로 **첫 등장 순서**(min cut,
+    그다음 appearance_id)로 결정론적 문자 라벨을 얹는다. `_load_faces`와 동일한 human>step2 우선
+    해석(DISTINCT ON)을 써서 실제 주입될 얼굴의 appearance_id와 일치시킨다. 재실행 시 appearance_id가
+    고정이라 슬롯도 안정적이다. 반환 {appearance_id: "A"}. 클러스터가 없으면 빈 dict.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT fi.appearance_id, MIN(wc.cut_number) AS first_cut
+            FROM analysis_face_detection fr
+            JOIN webtoon_cut wc ON fr.cut_id = wc.id
+            LEFT JOIN LATERAL (
+                SELECT appearance_id FROM analysis_face_identity
+                WHERE detection_id = fr.id AND deleted_at IS NULL
+                ORDER BY source ASC LIMIT 1
+            ) fi ON true
+            WHERE wc.episode_id = %s AND fr.is_used = true
+              AND fi.appearance_id IS NOT NULL
+            GROUP BY fi.appearance_id
+            ORDER BY first_cut, fi.appearance_id
+            """,
+            (webtoon_episode_id,),
+        )
+        return {row[0]: _slot_label(i) for i, row in enumerate(cur.fetchall())}
+
+
 # ── 저장 ──────────────────────────────────────────────────────────────────────
 
 def _find_character_by_name(webtoon_id: int, name: str) -> Optional[int]:
@@ -372,7 +414,8 @@ def _pass1_ctx(ctx: dict) -> dict:
 
 
 def build_pass1_input(
-    img: bytes, faces: list[dict], regions: list[dict], *, anonymize: bool = False
+    img: bytes, faces: list[dict], regions: list[dict], *, anonymize: bool = False,
+    slot_map: Optional[dict] = None,
 ) -> tuple[bytes, str]:
     """Pass-1 비전 콜 입력 조립 — (오버레이+다운스케일 이미지, user_text JSON)의 단일 정본.
 
@@ -380,13 +423,26 @@ def build_pass1_input(
     공유한다(입력 포맷 drift 방지 — 복제 금지). 시그니처의 img/faces/regions는
     `fetch_cut_image`/`_load_faces`/`_load_regions` 산출 그대로.
 
-    anonymize=True(흐름-first, redesign D4): CCIP 추정 정체(identified_faces)를 **빈 리스트로** 주입한다.
-    43% 정확도 추정 이름이 화자·서사까지 오염시키는 근본 오염원(§2)이라, Stage V를 정체성-무지 상태로
-    돌린다. 얼굴 bbox 오버레이는 유지(위치 grounding). id만 남겨 모델이 위치는 참조하되 이름은 못 받게 함.
+    anonymize=True(재설계 Path A): CCIP 추정 **이름**을 주입하지 않는다(43% 오독이 화자·서사까지 오염하는
+    근본 오염원 §2 차단). 대신 각 얼굴에 **안정 시각 슬롯**(slot_map[appearance_id]=A/B/C…, 회차 내 같은
+    얼굴 클러스터를 가리키는 안정 라벨)을 얹어, 이름 없이도 "누가 누구인지(A=A)"는 참조하게 한다. F 라벨
+    (오버레이 위치 grounding)은 유지. ⭐**human 확정 얼굴(source='human')만 이름까지 주입** — CCIP 추측이
+    아니라 ground truth(불가침)라 오염 없음. 나머지(step2 클러스터)는 slot만. slot_map 없으면 slot 생략
+    (단독/벤치 호출 폴백). 이름은 step3 resolve/reconcile이 대사 증거로 슬롯에 얹는다.
     """
     overlay_img = _downscale(overlay_faces(img, faces), _PASS1_MAX_DIM)
     if anonymize:
-        identified = [{"id": f["id"]} for f in faces]
+        identified = []
+        for f in faces:
+            entry = {"id": f["id"]}
+            slot = (slot_map or {}).get(f.get("appearance_id"))
+            if slot:
+                entry["slot"] = slot
+            if f.get("confirmed"):  # human 확정(불가침 ground truth) — confirmed 플래그+이름 노출
+                entry["confirmed"] = True
+                if f.get("name"):
+                    entry["name"] = f.get("name")
+            identified.append(entry)
     else:
         identified = [
             {"id": f["id"], "name": f.get("name"), "character_id": f.get("character_id"),
@@ -578,6 +634,7 @@ def extract_cut(
     persist: bool = True,
     run_id: Optional[int] = None,
     anonymize: Optional[bool] = None,
+    slot_map: Optional[dict] = None,
 ) -> Pass1Record:
     """컷 1개를 비전 LLM 1콜로 분석해 Pass-1 provisional 레코드를 만든다(step3a 단위).
 
@@ -618,8 +675,10 @@ def extract_cut(
     call_ctx = _pass1_ctx(ctx or resolve_llm_model(webtoon_id, VISION))
     if anonymize is None:  # extract_episode가 회차당 1회 해석해 넘기지만, 단독 호출 대비 폴백.
         anonymize = _flow_first_enabled(webtoon_id)
+    if slot_map is None and anonymize:  # 단독 호출 폴백 — 회차 슬롯맵 해석(extract_episode는 미리 넘김).
+        slot_map = _episode_slot_map(webtoon_episode_id)
 
-    overlay_img, user_text = build_pass1_input(img, faces, regions, anonymize=anonymize)
+    overlay_img, user_text = build_pass1_input(img, faces, regions, anonymize=anonymize, slot_map=slot_map)
 
     # Req 7.4 — 1회 재시도(총 2회). 모두 실패하면 빈 결과로 스킵.
     raw_result: dict = {}
@@ -886,6 +945,7 @@ def extract_episode(
     ctx = resolve_llm_model(webtoon_id, VISION)  # 에피소드당 1회 해석 → 컷마다 재사용
     llm_model_id = ctx.get("id")
     anonymize = _flow_first_enabled(webtoon_id)  # 회차당 1회 해석 → 컷마다 재사용(per-cut DB read 방지)
+    slot_map = _episode_slot_map(webtoon_episode_id) if anonymize else None  # 익명 슬롯맵도 회차당 1회
 
     if prepare:
         prepare_episode_scene(webtoon_episode_id)
@@ -915,7 +975,7 @@ def extract_episode(
         futures = {
             pool.submit(extract_cut, webtoon_episode_id, cn,
                         ep_info=info, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
-                        anonymize=anonymize): cn
+                        anonymize=anonymize, slot_map=slot_map): cn
             for cn in cut_numbers
         }
         for future in as_completed(futures):
@@ -2631,27 +2691,11 @@ def resolve_and_narrate(
     if ctx is None:
         ctx = resolve_llm_model(webtoon_id, TEXT)
 
-    # ── 흐름-first 게이트(redesign §5·Phase 3) — flag ON이면 정체성/화자 축을 정리단계로 대체 ──
-    #    익명 슬롯+흐름 화자배정을 여기서 커밋(step3b 하트비트 하 — 정리 콜은 장시간 LLM). 그 뒤 N(서사)만
-    #    진행하고, ResolveResult의 characters/speaker_resolution을 비워 step3c apply가 R-CCIP 정체/화자를
-    #    재커밋하지 않게 한다(flow가 이미 커밋). R(resolve_episode_windowed)은 건너뛴다.
-    if _flow_first_enabled(webtoon_id):
-        flow = consolidate_and_commit_episode(
-            webtoon_episode_id, records or [], prior_context, webtoon_id=webtoon_id, run_id=run_id,
-        )
-        episode_roster = flow.get("roster") or []
-        n = narrate_episode(
-            webtoon_episode_id, records or [], ResolveResult(webtoon_episode_id=webtoon_episode_id),
-            prior_context, webtoon_id=webtoon_id, ctx=ctx, run_id=run_id, episode_roster=episode_roster,
-        )
-        return ResolveResult(
-            webtoon_episode_id=webtoon_episode_id,
-            characters=[], speaker_resolution=[], face_reassignments=[],
-            beats=n.get("beats") or [], episode=n.get("episode") or {},
-            deceptions=n.get("deceptions") or [], threads=n.get("threads") or [],
-            profiles=n.get("profiles") or [], roster=episode_roster,
-            usage=n.get("usage") or {},
-        )
+    # ── 재설계 Path A: consolidate(텍스트-only 페르소나 슬롯) 경로 폐기 ──────────────────────
+    #    flow_first(익명)여도 **표준 resolve 경로**를 탄다. Stage V가 CCIP 이름 대신 익명 시각 슬롯을
+    #    주입하므로, R(resolve_episode_windowed)이 face_label→appearance→cid로 화자를 배정하고
+    #    name_evidence(대사)로 슬롯에 이름을 얹는다 — 얼굴(시각정체) 유지 + 명명은 대사가 담당. 옛
+    #    consolidate_and_commit_episode(대사만으로 슬롯 발명, 얼굴과 무관)는 이 경로로 대체됨(검증 후 코드 제거).
 
     # who-is-who 로스터(B3) — R 앞 1콜. 실패해도 빈 로스터로 R/N 진행(격리).
     roster_res = extract_roster(

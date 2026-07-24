@@ -175,7 +175,7 @@ def _clear_episode_segment_scene(webtoon_episode_id: int) -> None:
 def extract_segment(
     seg: SegUnit, webtoon_episode_id: int, *,
     webtoon_id: int, ctx: dict, run_id: Optional[int] = None,
-    anonymize: bool = False, persist: bool = True,
+    anonymize: bool = False, persist: bool = True, slot_map: Optional[dict] = None,
 ) -> Pass1Record:
     """세그먼트 1개를 비전 LLM 1콜로 분석 → Pass-1 레코드(cut_number=세그 index).
 
@@ -191,7 +191,7 @@ def extract_segment(
 
     call_ctx = _pass1_ctx(ctx)
     overlay_img, user_text = build_pass1_input(
-        seg.image_bytes, seg.faces, seg.regions, anonymize=anonymize
+        seg.image_bytes, seg.faces, seg.regions, anonymize=anonymize, slot_map=slot_map
     )
 
     raw_result: dict = {}
@@ -272,6 +272,7 @@ def extract_episode_segment(
     ctx = resolve_llm_model(webtoon_id, VISION)
     llm_model_id = ctx.get("id")
     anonymize = _flow_first_enabled(webtoon_id)
+    slot_map = step3._episode_slot_map(webtoon_episode_id) if anonymize else None  # 익명 슬롯맵 1회
 
     if prepare:
         prepare_episode_scene(webtoon_episode_id)      # llm 주석 + cut_scene_meta 정리
@@ -289,7 +290,8 @@ def extract_episode_segment(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(extract_segment, u, webtoon_episode_id,
-                        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id, anonymize=anonymize): u.index
+                        webtoon_id=webtoon_id, ctx=ctx, run_id=run_id,
+                        anonymize=anonymize, slot_map=slot_map): u.index
             for u in units
         }
         for future in as_completed(futures):
