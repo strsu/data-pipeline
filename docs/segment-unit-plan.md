@@ -5,7 +5,19 @@
 - 커밋: data-pipeline `23d90f6`(A: step1 strip_y+슬리버흡수) `b7b5d13`(B+C+D: 세그 Stage V+다운스트림 세그키잉) / service `385f729`(마이그 0040).
 - 신규 모듈: `src/core/segment_loader.py`(로더) `src/core/step3_segment.py`(extract_segment·extract_episode_segment·region_map·reresolve·beats remap). 게이팅: step3.apply_resolution/reresolve_episode + temporal/activities(순환회피 지연import).
 - **통제 E2E(참교육 ep2, V→R→N→apply 세그모드)**: resolve_error=null, segScene=115·cutScene=0, 화자배정=250(나화진84·교장33·김학재39…)·무효speaker=0, beats cut_end=99≤100컷(remap✅), region_map 불변식 416키 일치. → 통과.
-- **남은 것**: ①실사용=웹툰 토글 ON+재분석(strip_y 채움+세그모드 가동)·스케일 검증 ②비효율=apply가 region_map 위해 strip 재조립(후속: ExtractResult에 region_map 부착) ③참교육 ep2가 E2E로 세그모드 분석됨(토글 OFF인데 세그산출 — 무해, 재분석시 정리) ④세그 stale scene_meta는 세그모드 재실행때만 정리(_clear_episode_segment_scene).
+- **남은 것**: → `remain-trouble.md`로 이관·종합.
+
+## 작업 로그 (2026-07-24, 시간순)
+1. **Phase A~D 구현·배포** (커밋 `23d90f6` A / `b7b5d13` B+C+D / service `385f729` 마이그 0040). 신규 `segment_loader.py`·`step3_segment.py`. 통제 E2E(참교육 ep2, flow_first OFF+세그) 통과.
+2. **크래시 핫픽스** (`7ae5297`): Phase A(A2)에서 `face_detection` INSERT의 `%s`를 15개(컬럼 14)로 잘못 넣어 `IndexError: tuple index out of range` — 화산귀환 step1 세그 처리 실패. 14개로 수정. (text_region INSERT는 14=14로 정상이었음.)
+3. **화산귀환(17) 파이프라인** — 사용자가 segment_unit+flow_first **둘 다 ON**. 체인-A(step1,2 1~10)→ep1 완료→체인-B(step3 1~10). ep1 결과 요약·티저 우수(청명 명명 정확).
+4. **A/B/C fix** (`4c73091`): 세그+flow_first 화산귀환 ep1 **서사 빵꾸**(주마등 컷62~77 미커버) 수정.
+   - 근본원인: 빈 세그(리전·얼굴0) 스킵 → 세그 index 불연속 → narrative LLM이 beat 경계를 빈 index(78·79)에 찍음 → remap 실패.
+   - **A**: extract_segment이 빈 세그도 분석(스킵 제거) — "모든 컷 분석" 합의 준수 + index 연속성.
+   - **B**: 로더가 strip_y 겹침으로 전 세그 컷범위 계산(`_cuts_overlapping`) — beat remap 전세그 커버.
+   - **C**: extract_segment per-segment 로그 추가.
+   - fix 후 step3 재실행 중.
+5. **참교육 수동분석 교차확인** (`chamgyoyuk-manual-analysis-2026-07-17.md`): 그 md가 지목한 스킵 컷(세그 커버리지) 문제는 07-22 재분석+strip_y로 **해결됨** 검증(c3→13리전). 미해결 발견들은 `remain-trouble.md` §B로.
 
 ---
 
