@@ -55,7 +55,7 @@ _PASS1_STAGE = "vision"  # LLMUsage.stage — Stage V 컷 비전 콜(step3a).
 # LLMUsage.stage 허용값(service `LLMStage` enum과 일치) — usage 적재의 단일 진실원천.
 # vision=컷 비전(V), resolve=정체·화자 해소(R), narrative=서사 분석(N), arc=아크 종합(A),
 # profile=캐릭터 프로필 재도출(§20, src.core.regen).
-_USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc", "profile", "judge")
+_USAGE_STAGES = ("vision", "roster", "resolve", "narrative", "arc", "profile", "judge", "naming")
 
 # ── Pass-1 (컷별 provisional 추출) ────────────────────────────────────────────
 # 정본: qwen-vl/_pass1.py SYS 프롬프트를 그대로 이관(분류 먼저→화자 나중, strict JSON,
