@@ -381,7 +381,7 @@ def _purge_human_negated_docs(webtoon_id: int, model_name: str, collection,
 
 def _restore_missing_step2_docs(
     webtoon_id: int, source: str, title_id: str, model_name: str, metric_type: str,
-    collection, heartbeat=None,
+    collection, heartbeat=None, anonymous_only: bool = False,
 ) -> int:
     """활성 step2 얼굴인데 Chroma doc이 없는 것을 재임베딩 upsert — 복원 방향 안전망.
 
@@ -416,7 +416,8 @@ def _restore_missing_step2_docs(
                 SELECT 1 FROM analysis_face_identity h
                 WHERE h.detection_id = fr.id AND h.source = 'human' AND h.deleted_at IS NULL
               )
-            """,
+              {kind_clause}
+            """.format(kind_clause=("AND c.name = '' AND c.kind = 'cluster'" if anonymous_only else "")),
             (model_name, webtoon_id),
         )
         rows = cur.fetchall()
@@ -754,6 +755,7 @@ def identify_episode_faces(
     # 복원 방향 안전망: 활성 step2 얼굴인데 doc이 없는 것(T3 실패한 복원 등) 재투영.
     _restore_missing_step2_docs(
         webtoon_id, source, title_id, model_name, metric_type, collection, heartbeat=hb_pre,
+        anonymous_only=anonymous_only,
     )
     # 리스트로 고정 — 아래에서 유령 appearance_id를 발견할 때마다 append해 이후 쿼리에서도
     # 제외되게 한다(list는 참조로 넘겨지므로 find_match 재호출 시 갱신된 내용이 그대로 반영됨).
