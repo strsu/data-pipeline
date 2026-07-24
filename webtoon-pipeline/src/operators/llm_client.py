@@ -248,7 +248,10 @@ def _call_model_with_retries(
             with _LLM_SEMAPHORE:
                 return _stream_llm_once(endpoint, body, headers)
         except (httpx.HTTPStatusError, httpx.TransportError) as e:
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+            # 4xx는 즉시 실패 — 단 429(레이트리밋)는 재시도 가능(곧 풀림). 429를 여기서 흡수해야
+            # 지속 429에 step3의 세그/컷 스킵(데이터 드롭)이 안 난다. 백오프가 자연 스로틀 역할.
+            if (isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code < 500 and e.response.status_code != 429):
                 _logger.error("[llm] %s(%s) 4xx 실패(재시도 안 함) — %s", endpoint, tag, e)
                 raise
             last_exc = e
