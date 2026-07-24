@@ -41,6 +41,29 @@ k3s 클러스터에 ArgoCD로 배포되는 GitOps 설정(YAML) 모음. app-of-ap
 
 이 레포 push 시 CI(`.github/workflows/deploy.yaml`)가 `ghcr.io/strsu/*` 이미지를 빌드하고 **proxmox-configuration의 `pipeline_repo/kustomization.yaml` 태그를 자동 커밋**한다(`[skip-ci]`) — 태그 수동 수정 금지. 배포 리소스(nodeSelector: k3s-super-worker-01 고정, 리소스, Infisical 시크릿)를 바꾸려면 그쪽 레포에서 작업하고, 그쪽 `CLAUDE.md`·`docs/`를 먼저 읽을 것.
 
+## 클러스터/파드 직접 접근 (kubectl)
+
+로컬(macOS)엔 kubeconfig가 **없다**. 관리 노드 `k3s-mgmt`(**192.168.1.36**)에 SSH로 들어가 kubectl을 쓴다. 워크로드 namespace는 **`beldori`**(파드: `webtoon-pipeline-*` = Temporal 워커, `model-api-*` = ocr-yolo/clip/ccip).
+
+```bash
+# 접속 래퍼(로컬에서 원격 kubectl 실행). 크리덴셜은 prd-for-character-linking.md §4에도 있음.
+sshpass -p 123123 ssh root@192.168.1.36 "kubectl get pods -n beldori"
+sshpass -p 123123 ssh root@192.168.1.36 "kubectl logs -n beldori <pod> --tail=100"
+```
+
+**원칙: 정본은 레포 수정 → ArgoCD 동기화.** `kubectl apply/delete/rollout`을 클러스터에 직접 치는 건 디버깅·검증 용도로만(정상 배포는 위 push→CI→ArgoCD 경로). **읽기 명령(get/logs/describe/exec 조회)은 자유.**
+
+Temporal 워크플로 조작은 워커 파드 안에서 한다(`src.temporal.starter`):
+
+```bash
+POD=$(sshpass -p 123123 ssh root@192.168.1.36 "kubectl get pods -n beldori -l app=webtoon-pipeline -o name | head -1")
+# 트리거: python -m src.temporal.starter <source> <title_id> <start_ep> <steps> <max_ep>
+sshpass -p 123123 ssh root@192.168.1.36 "kubectl exec -n beldori $POD -- python -m src.temporal.starter naver 769209 1 step1,step2,step3 1"
+# 정지는 파드 안 python에서: get_workflow_handle(id).terminate()
+```
+
+배포 롤아웃 재시작(ConfigMap 변경 반영 등, 디버깅용): `kubectl rollout restart deployment/<name> -n beldori`. 더 넓은 운영 플레이북(ArgoCD·KEDA·Envoy·Infisical)은 `proxmox-configuration/docs/operations.md` 참조.
+
 ## 프로덕션 DB 직접 조회
 
 접속 정보는 이 레포 루트의 `prod.env`(gitignore됨)에 있다. 로컬에 `psql`이 없으므로 `webtoon-pipeline/.venv`의 psycopg2로 조회한다(이미 설치돼 있음).
