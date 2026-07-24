@@ -73,8 +73,16 @@
 - 검증: py_compile OK, step3 회귀테스트 13통과(1실패는 사전존재·무관 segment-share 속성테스트).
 - **consolidate_and_commit_episode/_commit_slots 등 옛 텍스트-only 경로는 코드에 남김**(dead, 검증 후 §④에서 제거).
 
+### ✅ 배포·검증 완료 (2026-07-24)
+- **배포**: 이미지 `0545bd5` 라이브(자석수정 `name<>''` 포함). CI가 docs 커밋을 tip으로 보면 파이프라인 빌드 스킵하는 함정 겪음(HEAD~1..HEAD diff) → 파이프라인 파일 커밋으로 재빌드 강제.
+- **웹툰17 전체 리셋**: reset_webtoon.py에 최신 테이블 3개(name_edge·llm_sample·segment_scene_meta) 누락 보강 후 실행(analysis 전부·cut 1114·R2 1004·Chroma 3컬렉션 삭제).
+- **화산귀환 ep1 재분석 검증 = Path A 통과**:
+  - step2: 89 얼굴 → **29 익명 클러스터, 명명 인물 0**(자석 소멸. 옛 false는 5 char+11 named cluster).
+  - 명명(대사 기반): **청명(main,11얼굴)·동료걸인소년(sup,7)·천마(sup,0얼굴=외형없는이름 B3 정확)** 3명 + 익명 26. **misid=[]**(유령/빙의 오귀속 0).
+  - 화자배정 168(청명40·걸인31·천마6·익명클러스터91).
+  - ⭐**정밀도>재현율**: 옛 5명(CCIP추측 왕초·화산장로 포함)→3명(대사확증만). 적게 명명하되 안 틀림. 왕초 등은 익명 클러스터로 생존, Q3 교차회차 이름링킹이 나중에 명명.
+
 ### 미착수 (다음)
-- **배포 + 화산귀환 A/B 검증**: push→CI→ArgoCD 후 ep1 재분석(step1?→step2→step3). 확인: 얼굴 클러스터 유지(purge 0)·클러스터 익명(kind=cluster,이름없음)·화자배정 수·대사기반 승격(유령/빙의 오명명 0)·slot 주입 로그. Path A 화자배정이 흐름-first 0.95에 근접하면 §④로.
 - **§④ 토글 제거**(검증 후): flow_first 컬럼·게이트·consolidate 코드 삭제 → Path A 무조건화. + resolve pass2 페이로드에 slot 라벨 노출(cid 대신 가독성, 교차유닛 추적 실질 이득).
 - **Q3 웹툰-전역 명명링킹**(이름-우선+미명명만 CCIP) — 회차별 명명 안정화 후.
 - 세그-네이티브 저장(remain-trouble D2, 프론트 대공사). LLM 주도 lookback(D4).
