@@ -2716,8 +2716,12 @@ def name_clusters_by_dialogue(
             text = (b.get("corrected_text") or "").strip()
             if not text:
                 continue
-            fl = (b.get("speaker") or {}).get("face_label")
-            blocks.append((b.get("type"), text, face2cid.get(fl)))
+            sp = b.get("speaker") or {}
+            # 화자 클러스터: fresh(Stage V)는 face_label→faces, reresolve 재구성은 speaker.character_id 직접.
+            cid = sp.get("character_id")
+            if cid is None:
+                cid = face2cid.get(sp.get("face_label"))
+            blocks.append((b.get("type"), text, cid))
     from collections import Counter
     freq = Counter(cid for _t, _x, cid in blocks if cid is not None)
     if not freq:
