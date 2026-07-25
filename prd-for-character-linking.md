@@ -2,7 +2,25 @@
 
 작성 2026-07-24. **세션 이어가기용 자족 문서.** 세그먼트-단위 분석 작업 중 정체성(인물) 축이
 근본 재설계로 이어진 경위·결정·현황·계획을 전부 기록. 관련 정본:
-`docs/segment-unit-plan.md`(세그 구현), `remain-trouble.md`(남은 과제), `chamgyoyuk-manual-analysis-2026-07-17.md`(참교육 수동분석 대조군), `redesign-flow-first-2026-07-22.md`(흐름-first 원설계), `docs/session-handoff-2026-07-23.md`.
+`docs/segment-unit-plan.md`(세그 구현), `remain-trouble.md`(남은 과제 D5~D8), `chamgyoyuk-manual-analysis-2026-07-17.md`(참교육 수동분석 대조군), `redesign-flow-first-2026-07-22.md`(흐름-first 원설계), `docs/session-handoff-2026-07-23.md`.
+
+---
+
+## ★★ 최종 설계 v2 (2026-07-25) — cluster-first 대사흐름 정체 + 멀티모달 (야간 R&D 검증)
+
+아래 §0~6은 경위(Path A→reconcile). 이 절이 **현행 도달 결론**이다. 상세·실험로그 = `remain-trouble.md` D5~D8 + `$CLAUDE_JOB_DIR/tmp/RESEARCH_LOG.md`·`exp_*.py`.
+
+**핵심 원칙 (사용자 통찰)**: ①정체는 **대사가 이끈다**(얼굴 아님 — 웹툰 얼굴은 작화변이·측면·SD·가림·옷으로 약함). ②**Character 1:n Appearance(외형: 젊/늙/옷) 1:n Name(별호/직함/전생명)** — 스키마 이미 지원(`analysis_character` 1:n `analysis_character_appearance`). ③**이름은 최후에만** 커밋(cluster-first) — 조기 명명이 flip·오염의 근원.
+
+**파이프라인**:
+1. **Pass1 = 별칭-인식 coref** (회차 전체 트랜스크립트 단일 텍스트콜, glm-5.2). 소설처럼 이어 읽으며 캐릭터 파악: 한 캐릭터=여러 이름(별호·직함·전생명·OCR변이)을 **네이티브 그룹핑**, 서로 대화(conversant)하는 자는 다른 캐릭터. **5장르 검증**(무협·학교·바바리안·무속·회귀 — 전부 클린). 이미지 불필요. ⭐윈도우/carry-forward보다 압도적(순차 드리프트 붕괴 회피).
+2. **경계선 안정화**: 유사인물쌍(청명/구칠, 환생 거지)은 단일 Pass1이 ~40% 병합(비결정). → **conversant 하드제약**(대화하는 자는 반드시 다른 캐릭터 — 청명↔구칠 대화 검출 신뢰) + **앙상블 투표** + **face tiebreak**(청명 appearance 4610 ≠ 구칠 4614).
+3. **별칭 vs 다른사람 판별 = conversant(공기)**: 서로 대화하면 다른 사람, **절대 공존 안 함(회상·전생만)이면 별호**(청명/매화검존 = 한 캐릭터). *기계적 "같은 컷 등장" 공기는 실패*(자기 다중명명이 거짓공기) → LLM 대화관계로.
+4. **얼굴 = 종속·확증** (정체 주 아님): 말풍선 꼬리로 얼굴→캐릭터 부착. 얼굴클러스터는 tiebreak/확증·교차회차 링크용. CCIP=러프 prior.
+5. **교차회차 글로벌 정체** = **이름링크**(양쪽 명명 인물, flip 없음) + **얼굴클러스터 링크**(한쪽만 명명된 무명 인물 — appearance가 회차 span, 예 구칠 4614 ep1·ep2) + persona. 완전 링크 = 이름 ∪ 얼굴.
+6. **cluster-first 구현**: `_cluster_first_enabled` 게이트(config, 기본OFF·안전폴백). ON이면 apply가 **eager 명명·승격·자동귀속 정지**(D6 오염 벡터=자동귀속 차단), 이름은 suggestion만, 클러스터 익명 유지. **전역 명명 최후 패스는 미구현**(별칭coref + 얼굴/공기 링크 → 이름).
+
+**미검증/미착수**: Hungarian per-화 매칭·그래프 커뮤니티(전역 클러스터링), 앙상블·conversant제약 통합, 얼굴부착 정밀도(청명/구칠 스왑 잔존), 전역 명명 최후 패스, 프로덕션 배선. **⚠️ prod: D5(a47259d) 자동귀속 라이브 → 신규분석 오염 지속. cluster-first ON 배포로 정지 필요(코드 준비됨, 미배포).**
 
 ---
 

@@ -158,6 +158,26 @@ def _flow_first_enabled(webtoon_id: int) -> bool:
         return bool(row[0]) if row else False
 
 
+def _cluster_first_enabled(webtoon_id: int) -> bool:
+    """cluster-first 게이트(D8) — 이름을 커밋하지 않고 **익명 클러스터로 추적, 명명은 최후**.
+
+    ON이면 apply(_project_characters)가 **eager 명명·승격·자동귀속을 하지 않고** 이름 후보를
+    suggestion으로만 남긴다(D6 오염 벡터 = 자동귀속 정지). 클러스터는 kind='cluster'·name='' 유지.
+    전역 명명(별칭-인식 coref + 얼굴/공기 링크)은 별도 최후 패스가 담당(미구현). 설정 컬럼
+    `cluster_first_enabled`가 없으면(마이그레이션 전) False로 안전 폴백 — 프로덕션 동작 불변.
+    """
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT cluster_first_enabled FROM config_webtoon_pipeline_state WHERE webtoon_id = %s",
+                (webtoon_id,),
+            )
+            row = cur.fetchone()
+            return bool(row[0]) if row else False
+    except Exception:  # noqa: BLE001 — 컬럼 미존재(마이그레이션 전) 등: 안전 폴백
+        return False
+
+
 def _episode_info(webtoon_episode_id: int) -> dict:
     with db_cursor() as cur:
         cur.execute(
@@ -2995,6 +3015,9 @@ def _project_characters(
     """
     suggestions: list[dict] = []
     claimed_names: set[str] = set()  # 이번 apply에서 확정한 이름(동명 중복 승격 방지)
+    # cluster-first(D8): 이름을 커밋하지 않고 익명 클러스터 유지 — 승격·자동귀속 정지(D6 오염 벡터 차단).
+    # 이름은 전부 suggestion(type=name)으로만. 전역 명명은 별도 최후 패스가 담당.
+    cluster_first = _cluster_first_enabled(webtoon_id)
     for c in characters or []:
         cid = c.get("character_id")
         if cid is None or cid not in valid_ids:
@@ -3037,7 +3060,8 @@ def _project_characters(
             if name:
                 dup_in_run = name.lower() in claimed_names
                 can_promote = (
-                    conf >= _NAME_AUTO_CONFIDENCE
+                    not cluster_first  # cluster-first면 eager 승격 안 함(익명 유지)
+                    and conf >= _NAME_AUTO_CONFIDENCE
                     and cur_kind == "cluster"
                     and (existing is None or existing == cid)
                     and not dup_in_run
@@ -3049,7 +3073,8 @@ def _project_characters(
                     sets.append("kind = 'character'")
                     sets.append("is_name_auto_assigned = true")
                     claimed_names.add(name.lower())
-                elif (conf >= _NAME_AUTO_CONFIDENCE and cur_kind == "cluster"
+                elif (not cluster_first  # cluster-first면 자동귀속 안 함(D6 오염 벡터 정지)
+                      and conf >= _NAME_AUTO_CONFIDENCE and cur_kind == "cluster"
                       and existing is not None and existing != cid):
                     # 자동 귀속(D5) — 익명 클러스터를 **동명 기존 인물에 흡수**(appearance/화자 재배정
                     # + 소프트삭제). recall 회복·교차회차 연결·회차내 과분할 봉합. 위험한 "명명된 둘
