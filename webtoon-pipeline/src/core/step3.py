@@ -32,6 +32,9 @@ from src.operators.overlay import overlay_faces
 logger = logging.getLogger(__name__)
 
 _NAME_AUTO_CONFIDENCE = 0.85
+# 전역 명명(step3d) 자동병합 게이트. ⚠️ 2026-07-25 임시 False(안전 정지) — name-link가 co-presence
+# 노이즈로 주인공에 남 얼굴 흡수. 얼굴-일관성 게이트 구현 후 True로. False면 이름은 suggestion만 남음.
+_GLOBAL_NAMING_ENABLED = False
 
 # Pass-1(컷별 provisional 추출) 상수 — 비전 1콜 throughput/품질 가드.
 _PASS1_MAX_DIM = 1280          # 다운스케일 상한(긴 변, px)
@@ -2955,6 +2958,12 @@ def resolve_global_identities(
     안전, 무명 과분할 병합은 향후 정밀화). 반환 요약 dict.
     """
     empty = {"groups": 0, "promoted": 0, "attached": 0, "clusters": 0}
+    # ⚠️ 2026-07-25 임시 비활성(안전 정지): name-link가 화자→얼굴 귀속의 co-presence 노이즈로
+    # 주인공에 남의 얼굴을 대량 흡수(웹툰17 청명=26클러스터/194얼굴, 천마 0·구칠 2). 이름 투표는
+    # "이름 확신"이지 "이 얼굴이 그 인물인가"가 아니라 M1 임계로도 못 거른다. **얼굴-일관성(CCIP
+    # 유사도) 게이트** 구현까지 no-op — 이름은 suggestion(검토 큐)으로 남아 human 검토. (게이트 추가 시 재활성)
+    if not _GLOBAL_NAMING_ENABLED:
+        return empty
     # cluster-first 전용 — 비-cluster-first 흐름은 per-episode apply가 이미 승격/자동귀속하므로
     # 여기서 또 병합하면 이중 처리·오염. cluster-first OFF면 no-op(안전).
     if not _cluster_first_enabled(webtoon_id):
