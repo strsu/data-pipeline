@@ -109,6 +109,28 @@ D1(Path A)은 구현·배포(이미지 `0545bd5`)·검증 완료. **정본 = `pr
 - **⭐ 별칭 vs 다른사람 판별 = 공기(cooccurrence)**: **두 이름의 화자가 서로 대화하면 다른 사람**(청명↔구칠 = 청명이 구칠에게 물음 = 공존 = 분할O), **절대 공존 안 하면 같은 사람/별호**(청명/매화검존 = 매화검존은 청명 회상뿐, 비공존 = 병합). 얼굴이 젊/늙 달라도(1:n 외형) 공기가 정체 유지. → **분할 후 공기 판별로 별칭 병합** 넣으면 이슈① 해소.
 - **⚠️ 프로덕션**: D5(a47259d) 자동귀속 라이브 → 신규분석 오염 지속. cluster-first 확정 후 prod에서 auto-attach OFF 필요.
 
+### ⭐⭐ 야간 R&D 결론 (2026-07-25) — 아키텍처 확정. **다음 세션 여기부터**
+**정본 설계 = `prd-for-character-linking.md` 최상단 "최종 설계 v2".** 하네스·연구로그 **영속 위치 = `anon-roster/identity-redesign/`**(exp_*.py + RESEARCH_LOG.md, gitignore지만 로컬 유지 — job tmp 아님). 실행: `cd webtoon-pipeline && set -a && source ../prod.env && set +a && VLLM_API_HOST=http://192.168.1.15:4000 .venv/bin/python ../anon-roster/identity-redesign/exp_coref.py`.
+
+**확정 아키텍처:**
+- **Pass1 = conversant-제약 별칭-coref (2콜, 텍스트, glm-5.2)** — `exp_coref.py`(무제약) / `exp_constrained.py`·`exp_best.py`(제약):
+  1. **conversant쌍 추출**: 서로 대화(호명·질문답·교대)하는 인물쌍 = 확실히 다른 사람.
+  2. **별칭-인식 coref + "conversant=다른캐릭터" 하드제약**: 회차 전체 트랜스크립트를 소설처럼 읽고 캐릭터 파악. 한 캐릭터=여러 이름(별호·직함·전생명·OCR변이·관계명) 네이티브 그룹핑.
+- **경계선 안정화 = conversant 하드제약**(E8: 청명/구칠 병합 **0/3**, 제약없이 40%). 앙상블(E9 3/5)은 폴백.
+- **얼굴 = 종속·확증·교차링크**(정체 주 아님): 꼬리로 얼굴→캐릭터. 얼굴클러스터 tiebreak(청명 appearance **4610** ≠ 구칠 **4614**). co-presence 노이즈 → 순수꼬리 필요(E11 진행).
+- **교차회차 글로벌정체 = 이름링크 ∪ 얼굴클러스터링크**: 양쪽 명명(청명·매화검존, flip없음) + 무명(구칠 ep1"거지소년"/ep2명명, but appearance 4614가 회차span → 얼굴로 링크). E3·E6.
+- **cluster-first**: 이름 최후, D5 자동귀속 정지. 코드 준비 = `_cluster_first_enabled` 게이트(step3.py, config `cluster_first_enabled`, 기본OFF·안전폴백). **로컬 커밋 `62e3bc7`, 미배포**(랩 outage 시 작성). ON이면 apply eager명명·승격·자동귀속 OFF, 이름 suggestion만.
+
+**야간 실험 요약(E1~E11, RESEARCH_LOG.md 상세):**
+- E1/E5/E10 별칭-coref 5장르 검증(별호·직함·전생명·OCR변이·언급만인물 그룹핑). E2 무제약 40%불안정. E7 conversant검출 신뢰. **E8 제약=3/3 결정론분리** ⭐. E9 앙상블 폴백. E3/E6 교차회차=이름∪얼굴. exp_best 통합 성공.
+- 폐기: 윈도우 carry-forward(스케일 과앵커 붕괴, `step3_reconcile.py` gated·미배선). VLM 얼굴게이트(노이즈). 기계적 "같은컷 공기"(자기다중명명 거짓공기).
+
+**다음 세션 재개 체크리스트:**
+1. `prd-for-character-linking.md` 설계v2 + 이 D8 읽기. 하네스=`anon-roster/identity-redesign/`.
+2. **미완**: ①E11 얼굴부착 정밀도(순수꼬리로 청명/구칠 스왑 개선) 결과 확인 ②전역 명명 최후 패스(coref+얼굴/공기 링크→이름) 구현 ③Hungarian/그래프 전역클러스터링(미검증) ④프로덕션 배선(conversant-제약 coref를 R단계로, cluster-first ON).
+3. **시급**: cluster-first ON 배포로 D5 자동귀속 오염 정지(다른웹툰 재분석 전). 코드 준비됨(62e3bc7) — service에 config `cluster_first_enabled` 컬럼 마이그레이션 필요.
+4. 인프라: 랩(spark1 .15 litellm/LLM) 야간 ~42분 다운 후 복구. LLM 대량은 직결+저병렬(429·과부하 회피).
+
 ---
 
 ## A. 세그+flow_first 조합 (둘 다 ON) — 미완성·논의 필요
