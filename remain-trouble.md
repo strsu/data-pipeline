@@ -95,6 +95,17 @@ D1(Path A)은 구현·배포(이미지 `0545bd5`)·검증 완료. **정본 = `pr
 **우선순위**: ~~D3·D1~~ ✅ + **D5(recall) ✅** → **D8(cluster-first 정체추적 재설계, 현재 R&D)** → D2(세그-네이티브) → D4(lookback).
 
 **⭐ D8. cluster-first 정체추적 재설계 (2026-07-24 R&D, 사용자 설계리뷰) — 정체=글로벌ID문제, 얼굴은 신호 하나**
+
+> ### ✅✅ 2026-07-25 A+B+C 구현·배포·검증 완료 (아래 R&D를 프로덕션으로)
+> 커밋: data-pipeline `b0bf6cf`(A+B+C) + `2da618b`(별칭수정) **push·배포됨**, service `c55491e`(마이그 0041) 적용됨. **cluster-first 전역 ON**(config `cluster_first_enabled` default true, 게이트 no-row→True).
+> - **B**: `name_clusters_by_dialogue` = conversant-제약 **slot-coref 2콜**(`_extract_conversant_pairs`+`_alias_coref`). **slot 단위**(라인단위 O(라인수)는 긴회차 180s타임아웃 — glm-5.2 콜당 ~270s, litellm p50 268s=정상). 별호=aliases.
+> - **C**: `resolve_global_identities(webtoon_id)` = pending name suggestion→클러스터별 정본→**name-link union-find**→대표 승격+나머지 `_attach_cluster_to_character` 흡수. `step3d_global_identities` activity(apply 후, 비차단·멱등)로 배선(workflows.py·worker.py). cluster-first OFF면 no-op.
+> - **A**: 게이트 전역 ON(step3.py) + service 마이그 0041. **배포순서**: data-pipeline 먼저→service(구코드는 컬럼 안 읽어 순서 무관도 안전).
+> - **리뷰 3회**: M1(클러스터별 자기신뢰 게이트) M2(`_GENERIC_NAME_STOPLIST` 호칭 오병합 차단) M3(흡수 전 소스 재검사=HITL 클로버 방지) m5(그룹당 단일 트랜잭션) + **별칭오염 수정**(정본과 함께 투표된 별호만 — flip 클러스터의 천마/운암 오유입·라우팅버그 차단, best_conf→canon_conf).
+> - **검증(웹툰17 naver 769209 리셋→재분석)**: ep2 실측 **청명/구칠 별도 인물·얼굴데이터 분리·오염0**(D6 벡터 차단 실증), 청명 aliases=[매화검존] clean. **회차간 정체 flip 클러스터**(cid4647 천마↔청명, cid4631 청명↔운암) 존재 = CCIP/coref 고유 모호성, 다수결 처리.
+> - **남은(E/follow-up)**: 폐기 D7 `step3_reconcile.py`(67bb5b0) 삭제·flow_first/consolidate dead정리 / **regen(reresolve) 경로 step3d 미배선**(정규 체인만 배선) / 무명 얼굴-link 병합(v1은 name-link만, Hungarian 미구현) / skip된 pending suggestion 잔류 / flip 클러스터 정밀화.
+
+
 - **재프레임(사용자)**: 청명↔구칠 뒤집힘·오염은 얼굴정확도가 아니라 **Global Identity Resolution** 문제. 웹툰 얼굴은 약함(작화변이·측면·SD·가림·옷). → **멀티모달 추적**: `대사패턴·공기(cooccurrence)·얼굴·헤어·위치` 가중합 + Hungarian/그래프 전역클러스터링 + **이름은 최후에만**. 방법4(클러스터-우선, 명명-최후)가 핵심 — flip을 없앰. 리뷰: 동의, 단 **웹툰은 대사를 앵커모달로**(얼굴 가중 낮춤), Hungarian 불균형·로컬품질·가중치검증 함정 대비.
 - **①D5 명명중단 = cluster-first**: auto-attach·eager promotion OFF, 이름은 커밋 아니라 **name_candidate**. 클러스터 익명 추적, 전역 최후 명명. → flip/오염 원천차단.
 - **로컬 실측(하네스 `$CLAUDE_JOB_DIR/tmp/` — cluster_first·cluster_split·exp_multimodal·exp_novel_read·exp_face_attach)**:
