@@ -163,8 +163,10 @@ def _cluster_first_enabled(webtoon_id: int) -> bool:
 
     ON이면 apply(_project_characters)가 **eager 명명·승격·자동귀속을 하지 않고** 이름 후보를
     suggestion으로만 남긴다(D6 오염 벡터 = 자동귀속 정지). 클러스터는 kind='cluster'·name='' 유지.
-    전역 명명(별칭-인식 coref + 얼굴/공기 링크)은 별도 최후 패스가 담당(미구현). 설정 컬럼
-    `cluster_first_enabled`가 없으면(마이그레이션 전) False로 안전 폴백 — 프로덕션 동작 불변.
+    전역 명명(conversant-제약 coref + name-link)은 최후 패스(step3d `resolve_global_identities`)가 담당.
+
+    **전역 기본 ON**(D8 결정): 컬럼이 있으면 행이 없어도 True(전역 적용), 웹툰별로 명시 False면 그 값.
+    컬럼이 없으면(마이그레이션 전) False로 안전 폴백 — 마이그레이션 배포 전엔 프로덕션 동작 불변.
     """
     try:
         with db_cursor() as cur:
@@ -173,8 +175,9 @@ def _cluster_first_enabled(webtoon_id: int) -> bool:
                 (webtoon_id,),
             )
             row = cur.fetchone()
-            return bool(row[0]) if row else False
-    except Exception:  # noqa: BLE001 — 컬럼 미존재(마이그레이션 전) 등: 안전 폴백
+            # 행 없음/NULL → 전역 기본 ON. 명시 False만 OFF(웹툰별 opt-out).
+            return True if (row is None or row[0] is None) else bool(row[0])
+    except Exception:  # noqa: BLE001 — 컬럼 미존재(마이그레이션 전) 등: 안전 폴백(동작 불변)
         return False
 
 
@@ -2690,18 +2693,88 @@ def _webtoon_character_names(webtoon_id: int) -> dict[int, str]:
 # 주인공 청명(90대사/22얼굴)을 자칭 "본도 청명"으로 복구. consolidate의 명명 강점을 텍스트-발명
 # 슬롯이 아니라 **시각 클러스터**에 되살린 것. 출력은 ResolveResult.characters로 흘려 apply가 명명·
 # (동명이면)자동 귀속한다.
-_NAMING_SYSTEM_PROMPT = (
-    "너는 웹툰 회차의 익명 화자 슬롯(S1,S2,...)에 실제 인물 이름을 바인딩한다.\n"
-    "입력: 읽기순 대사 트랜스크립트. 각 줄 = [화자슬롯] (type) 텍스트. 슬롯은 같은 인물의 대사를 묶은 것(이름 미상).\n"
-    "대사 증거로 각 슬롯의 이름을 찾아라:\n"
-    "- 자칭(강): '나는 X', '본도(本道) X', '이 X가', '매화검존 X' 등 화자가 자기를 X라 함 → 그 화자 슬롯 = X\n"
-    "- 호격(중): 화자 A가 'X야/X아/X님' 하고 부름 → 지목되는 상대(직후 반응/대화상대 슬롯) = X\n"
-    "- 3인칭 언급(약): 'X의 묘책', 'X라는 자' → 현재 대화의 어느 슬롯인지 확실할 때만\n"
-    "확신 있는 것만. 이름 못 찾은 슬롯은 생략. 지어내지 마라. 같은 이름이 여러 슬롯이면 **모두** 적어라(동일인 분할).\n"
-    "confidence: 자칭 0.9~1.0, 호격(상대 명확) 0.7~0.85, 3인칭(슬롯 확실) 0.6~0.8, 애매하면 낮게.\n"
-    "반드시 JSON만: {\"names\":[{\"slot\":\"S1\",\"name\":\"청명\",\"confidence\":0.95,\"evidence\":\"본도 청명 자칭\"}]}"
+# ── 대사 명명 = conversant-제약 별칭-coref, slot 단위 (D8, 2콜) ──────────────────
+# 야간 R&D(E1~E10) 결론: 단일 슬롯-명명은 경계선(환생 거지쌍 청명/구칠)을 40% 오병합. 대화쌍
+# 하드제약(대화=다른사람)을 넣으면 0/3 결정론 분리 + 별호(청명=매화검존) 별칭그룹. 5장르 검증.
+# 프로덕션은 **slot 단위** coref — 라인단위(출력 O(라인수))는 긴 회차에서 180s 타임아웃. 이미 있는
+# 화자 클러스터(cid→슬롯 S1..Sn)를 기본 단위로 주고 모델은 슬롯 그룹핑+명명만(출력 O(슬롯수)).
+# cluster-first 정합: 클러스터(슬롯)가 먼저, 대사가 이름/병합을 얹는다.
+_CONVERSANT_SYSTEM_PROMPT = (
+    "웹툰 회차 대사를 읽기순으로 준다. 각 줄 = [화자슬롯] (타입) 텍스트. 슬롯(S1,S2,…)은 같은 화자로 묶인 대사다.\n"
+    "**서로 직접 대화하는(한 슬롯이 상대를 호명·질문하고 다른 슬롯이 답하거나 교대하는) 슬롯쌍**을 찾아라."
+    " 이 두 슬롯은 확실히 서로 **다른 인물**이다.\n"
+    "회상·언급만 된 것은 제외 — 실제 대화 교대만.\n"
+    "반드시 JSON만: {\"pairs\":[{\"a\":\"S1\",\"b\":\"S2\",\"evidence\":\"S1이 S2에게 이름을 물음\"}]}"
+)
+_COREF_SYSTEM_PROMPT = (
+    "웹툰 회차 대사를 읽기순으로 준다. 각 줄 = [화자슬롯] (타입) 텍스트. 슬롯(S1,S2,…)은 같은 화자로 묶인 대사다."
+    " 소설처럼 읽으며 슬롯들을 **실제 인물**로 묶고 이름을 찾아라.\n"
+    "⚠️ **한 인물이 여러 슬롯으로 쪼개져 있을 수 있다**(같은 사람인데 분리됨) — 하나로 묶어라(slots 배열에 전부).\n"
+    "⚠️ **한 인물은 여러 이름으로 불릴 수 있다** — 본명·별호·직함·별명·전생명(예: 매화검존=청명, 고금제일마=천마)."
+    " 전부 names 배열에.\n"
+    "⚠️ **서로 대화하는(질문↔대답·호명·교대) 슬롯은 다른 인물**이다. 절대 한 인물로 묶지 마라.\n"
+    "__CONSTRAINT__"
+    "판단 근거: 대사 교대, 화법(반말/존대), 호칭, 자칭, POV, 회상/전생 문맥.\n"
+    "각 인물: id(C1,C2…), slots(그 인물의 슬롯들, 최소 1개), names(알려진 이름들 — 자칭/호격 근거."
+    " 이름 못 찾으면 빈 배열), confidence(이름 확신: 자칭 0.9~1.0, 호격 0.7~0.85, 3인칭 0.6~0.8, 애매하면 낮게),"
+    " evidence(이름 근거 한 줄).\n"
+    "확신 있는 이름만. 지어내지 마라. 모든 슬롯을 정확히 한 인물에 배정하라.\n"
+    "반드시 JSON만: {\"characters\":[{\"id\":\"C1\",\"slots\":[\"S1\",\"S5\"],\"names\":[\"청명\",\"매화검존\"],"
+    "\"confidence\":0.95,\"evidence\":\"본도 청명 자칭\"}]}"
 )
 _NAMING_STAGE = "naming"
+
+# 전역 명명(C)의 병합 키로 부적격한 일반 호칭/직함 — coref가 이름 못 찾으면 이런 걸 name으로 낼 수
+# 있는데(사부/형님 등), 정규 문자열이 같다고 서로 다른 인물을 묶으면 안 된다(M2). 이런 정본은
+# 스킵(익명 유지·suggestion 잔류) — 별호로만 쓰인다. 정규화(소문자·공백제거) 비교.
+_GENERIC_NAME_STOPLIST = frozenset({
+    "사부", "스승", "사부님", "스승님", "형님", "형", "누나", "누님", "언니", "오빠",
+    "선배", "선배님", "후배", "대장", "두목", "왕초", "공자", "소협", "대협", "선생",
+    "선생님", "낭자", "소저", "도련님", "아가씨", "나리", "어르신", "장문인", "문주",
+    "방주", "회장", "사장", "부장", "과장", "팀장", "아저씨", "아줌마",
+    "할아버지", "할머니", "아버지", "어머니", "엄마", "아빠", "당신", "그대", "본인",
+})
+
+
+def _is_generic_name(name: str) -> bool:
+    return name.strip().replace(" ", "").lower() in _GENERIC_NAME_STOPLIST
+
+
+def _extract_conversant_pairs(call_ctx: dict, transcript: str) -> tuple[list[tuple[str, str]], dict]:
+    """CALL 1 — 서로 대화하는(=다른 인물) 쌍 추출. coref 병합금지 하드제약의 근거. 실패 시 빈 목록(격리)."""
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, _CONVERSANT_SYSTEM_PROMPT, transcript, [])
+            raw = call.result if isinstance(call.result, dict) else {}
+            pairs: list[tuple[str, str]] = []
+            for p in (raw.get("pairs") or []):
+                if not isinstance(p, dict):
+                    continue
+                a = _str_or_empty(p.get("a")).strip()
+                b = _str_or_empty(p.get("b")).strip()
+                if a and b and a != b:
+                    pairs.append((a, b))
+            return pairs, (call.usage or {})
+        except Exception as e:  # noqa: BLE001 — 스테이지 격리(제약 없이 coref만 진행)
+            logger.warning("[step3.naming] conversant 추출 실패(재시도): %s", e)
+    return [], {}
+
+
+def _alias_coref(call_ctx: dict, transcript: str, pairs: list[tuple[str, str]]) -> tuple[dict, dict]:
+    """CALL 2 — 별칭-인식 coref(대화쌍 병합금지 하드제약). {characters, lines} 반환. 실패 시 빈 dict(격리)."""
+    cons = ""
+    if pairs:
+        cons = ("⚠️ 다음 쌍은 서로 대화하므로 반드시 다른 캐릭터다(병합 절대 금지): "
+                + ", ".join(f"{a}↔{b}" for a, b in pairs) + "\n")
+    sys_prompt = _COREF_SYSTEM_PROMPT.replace("__CONSTRAINT__", cons)
+    for _attempt in range(_PASS2_RETRIES):
+        try:
+            call = call_llm_json(call_ctx, sys_prompt, transcript, [])
+            raw = call.result if isinstance(call.result, dict) else {}
+            return raw, (call.usage or {})
+        except Exception as e:  # noqa: BLE001 — 스테이지 격리(run 중단 금지)
+            logger.warning("[step3.naming] coref 실패(재시도): %s", e)
+    return {}, {}
 
 
 def name_clusters_by_dialogue(
@@ -2714,10 +2787,12 @@ def name_clusters_by_dialogue(
 ) -> dict:
     """대사 흐름으로 **시각 클러스터에 이름을 바인딩**(자칭/호격/3인칭). 반환 {characters, usage}.
 
-    각 발화 블록의 화자를 그 유닛 faces(face_label→character_id)로 클러스터에 매핑해 슬롯 라벨을
-    만들고(빈도순 S1..), 트랜스크립트+라벨을 텍스트 모델에 통으로 준다. 출력 이름을 클러스터
-    character_id로 되짚어 ResolveResult.characters 형식([{character_id,name,name_confidence,evidence}])
-    으로 반환 → apply(_project_characters)가 명명·승격·(동명이면)자동 귀속. 실패 시 빈 결과(격리).
+    명명 = conversant-제약 별칭-coref, **slot 단위**(D8, 2콜): 화자 클러스터(cid)에 슬롯 라벨(S1..)을
+    얹어 트랜스크립트를 만들고 ①대화하는 슬롯쌍(=다른인물) 추출 → ②그 병합금지 하드제약 하에 슬롯들을
+    인물로 묶고 명명(별호/전생명 별칭그룹, 과분할 슬롯 병합). 각 인물의 슬롯→cid에 이름을 바인딩해
+    ResolveResult.characters 형식([{character_id,name,aliases,name_confidence,evidence}])으로 반환 →
+    apply(_project_characters)가 명명·승격·(동명이면)자동 귀속. cluster-first면 suggestion으로만.
+    출력이 O(슬롯수)라 긴 회차도 타임아웃 없음(라인단위는 O(라인수)라 위험). 실패 시 빈 결과(격리).
     """
     if webtoon_id is None:
         webtoon_id = _get_webtoon_id(webtoon_episode_id)
@@ -2746,40 +2821,55 @@ def name_clusters_by_dialogue(
     freq = Counter(cid for _t, _x, cid in blocks if cid is not None)
     if not freq:
         return {"characters": [], "usage": {}}
+    # 화자 클러스터(cid)에 안정 슬롯 라벨(빈도순 S1..) — coref의 기본 단위. 슬롯 있는 블록만 준다.
     cid2slot = {cid: f"S{i+1}" for i, (cid, _n) in enumerate(freq.most_common())}
     slot2cid = {v: k for k, v in cid2slot.items()}
-    lines = [f"[{cid2slot.get(cid, '?')}] ({typ}) {text}" for typ, text, cid in blocks]
-    user_text = "트랜스크립트:\n" + "\n".join(lines)
+    lines = [f"[{cid2slot[cid]}] ({typ}) {text}" for typ, text, cid in blocks if cid is not None]
+    transcript = "대사:\n" + "\n".join(lines)
 
-    raw: dict = {}
+    # 2콜 conversant-제약 별칭-coref, slot 단위(D8). 출력이 O(슬롯수)라 긴 회차도 안전.
     usage: dict = {}
-    for _attempt in range(_PASS2_RETRIES):
-        try:
-            call = call_llm_json(call_ctx, _NAMING_SYSTEM_PROMPT, user_text, [])
-            raw = call.result if isinstance(call.result, dict) else {}
-            usage = call.usage or {}
-            break
-        except Exception as e:  # noqa: BLE001 — 스테이지 격리(run 중단 금지)
-            logger.warning("[step3.naming] episode %s — naming 실패(재시도): %s", webtoon_episode_id, e)
-            raw = {}
+    pairs, u1 = _extract_conversant_pairs(call_ctx, transcript)
+    # 알려진 슬롯쌍만 제약으로(모델 환각 슬롯 배제).
+    valid_pairs = [(a, b) for a, b in pairs if a in slot2cid and b in slot2cid]
+    coref, u2 = _alias_coref(call_ctx, transcript, valid_pairs)
+    for extra in (u1, u2):
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            usage[k] = int(usage.get(k, 0) or 0) + int((extra or {}).get(k, 0) or 0)
     if run_id is not None and usage:
         _insert_llm_usage(webtoon_id, webtoon_episode_id, None, ctx.get("id"), usage,
                           stage=_NAMING_STAGE, image_count=None, run_id=run_id)
 
-    out: list[dict] = []
-    for n in (raw.get("names") or []):
-        if not isinstance(n, dict):
+    # coref 인물 → 그 슬롯들의 클러스터(cid)에 이름 바인딩. 별호는 aliases로 보존(3층모델).
+    # 한 인물이 여러 슬롯(과분할)이면 각 cid에 같은 이름 부여 → 전역패스(C)가 name-link로 병합.
+    best_by_cid: dict[int, tuple[float, dict]] = {}  # cid → (conf, entry) — cid당 최고신뢰 1개
+    for c in (coref.get("characters") or []):
+        if not isinstance(c, dict):
             continue
-        cid = slot2cid.get(n.get("slot"))
-        name = _str_or_empty(n.get("name")).strip()
-        conf = _clampf(n.get("confidence", 0))
-        if cid and name and conf > 0:
-            out.append({"character_id": cid, "name": name[:64], "name_confidence": conf,
-                        "evidence": _str_or_empty(n.get("evidence")).strip()[:200], "significance": None})
+        names = [nm for nm in (c.get("names") or []) if _str_or_empty(nm).strip()]
+        conf = _clampf(c.get("confidence", 0))
+        if not names or conf <= 0:
+            continue
+        for slot in (c.get("slots") or []):
+            cid = slot2cid.get(slot)
+            if cid is None:
+                continue  # 환각 슬롯 무시
+            entry = {"character_id": cid, "name": names[0].strip()[:64],
+                     "aliases": [nm.strip()[:64] for nm in names[1:]],
+                     "name_confidence": conf,
+                     "evidence": _str_or_empty(c.get("evidence")).strip()[:200], "significance": None}
+            prev = best_by_cid.get(cid)
+            if prev is None or conf > prev[0]:
+                best_by_cid[cid] = (conf, entry)
+
+    out = [entry for _conf, entry in best_by_cid.values()]
     # 지배 클러스터(대사 최다)를 앞에 — 동명 다수 시 그게 primary가 되도록.
     out.sort(key=lambda o: -freq.get(o["character_id"], 0))
-    logger.info("[step3.naming] episode %s — 슬롯명명 %s개: %s", webtoon_episode_id, len(out),
-                ", ".join(f"{cid2slot.get(o['character_id'])}={o['name']}({o['name_confidence']:.2f})" for o in out))
+    logger.info("[step3.naming] episode %s — slot-coref명명 %s개(슬롯 %s·대화쌍 %s): %s", webtoon_episode_id,
+                len(out), len(cid2slot), len(valid_pairs),
+                ", ".join(f"{cid2slot.get(o['character_id'])}={o['name']}"
+                          f"{'+' + '/'.join(o['aliases']) if o['aliases'] else ''}"
+                          f"({o['name_confidence']:.2f})" for o in out))
     return {"characters": out, "usage": usage}
 
 
@@ -2795,6 +2885,8 @@ def _union_naming_characters(stage_r: list[dict], naming: list[dict]) -> list[di
             tgt["name"] = nc["name"]
             tgt["name_confidence"] = nc["name_confidence"]
             tgt["evidence"] = nc.get("evidence") or tgt.get("evidence")
+            if nc.get("aliases"):
+                tgt["aliases"] = nc["aliases"]  # 별칭 보존(전역패스 C가 소비)
         else:
             out.append(dict(nc))
             idx[cid] = out[-1]
@@ -3087,6 +3179,7 @@ def _project_characters(
                     suggestions.append({
                         "character_id": cid, "name": name,
                         "confidence": conf, "evidence": evidence,
+                        "aliases": c.get("aliases") or [],  # 전역패스(C)가 정본/별칭 결정에 사용
                     })
 
             # Property 7 v2 — is_match_excluded 파생 동기화(prd §22.2).
@@ -3184,7 +3277,8 @@ def _commit_suggestions(
             ev = sug.get("evidence")
             ev_list = [ev] if isinstance(ev, str) and ev.strip() else (ev if isinstance(ev, list) else [])
             _insert("name", sug["character_id"],
-                    {"name": (sug.get("name") or "")[:64], "evidence": ev_list},
+                    {"name": (sug.get("name") or "")[:64], "evidence": ev_list,
+                     "aliases": [a[:64] for a in (sug.get("aliases") or [])][:8]},  # 전역패스(C)용
                     sug.get("confidence"))
 
         for c in characters or []:
@@ -3221,6 +3315,182 @@ def _commit_suggestions(
                     fr.get("confidence"),
                     detection_id=target["detection_id"], cut=fr.get("cut"))
     return inserted
+
+
+def resolve_global_identities(
+    webtoon_id: int, *, run_id: Optional[int] = None,
+    min_confidence: Optional[float] = None, now: Optional[datetime] = None,
+) -> dict:
+    """전역 명명 + 교차회차 링킹 최후 패스 (D8 'Phase 4 링커' — 이전까지 미구현).
+
+    cluster-first ON에선 per-episode apply가 이름을 커밋하지 않고 name suggestion만 쌓는다(D6 오염
+    벡터 차단). 이 패스가 웹툰 전역에서 그 표를 모아 **결정론으로**(LLM 없음 — 이름 근거는 per-episode
+    conversant-제약 coref가 이미 냄):
+      1. 클러스터별 정본 이름 = 신뢰합 최다 표. 별칭 = 그 표의 aliases ∪ 다른 이름표.
+      2. 같은 정본 이름 클러스터를 union-find(name-link)로 묶음 — CCIP 과분할 치유 + 교차회차 통합
+         (appearance가 이미 회차 span을 가지므로 이름만으로 전역 정체가 이어진다).
+      3. 그룹을 대표 클러스터로 승격(kind=character, name, aliases). 동명 기존 확정/명명 인물이 있으면
+         그쪽으로 흡수. 나머지 클러스터는 `_attach_cluster_to_character`로 흡수(appearance/화자 재배정).
+      4. 처리한 suggestion은 accepted, 저신뢰(그룹 최고신뢰 < min_confidence)는 pending 유지(human 검토).
+
+    ⚠️ v1은 name-link만(무명 클러스터끼리의 얼굴-link 병합은 미포함 — appearance span으로 이미 교차회차라
+    안전, 무명 과분할 병합은 향후 정밀화). 반환 요약 dict.
+    """
+    empty = {"groups": 0, "promoted": 0, "attached": 0, "clusters": 0}
+    # cluster-first 전용 — 비-cluster-first 흐름은 per-episode apply가 이미 승격/자동귀속하므로
+    # 여기서 또 병합하면 이중 처리·오염. cluster-first OFF면 no-op(안전).
+    if not _cluster_first_enabled(webtoon_id):
+        return empty
+    now = now or datetime.now(timezone.utc)
+    min_conf = _NAME_AUTO_CONFIDENCE if min_confidence is None else float(min_confidence)
+    from collections import defaultdict
+
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT character_id, payload, confidence FROM analysis_suggestion
+            WHERE webtoon_id = %s AND type = 'name' AND status = 'pending'
+              AND character_id IS NOT NULL
+            """,
+            (webtoon_id,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return empty
+
+    votes: dict[int, list] = defaultdict(list)  # cid -> [(name, conf, aliases)]
+    for cid, payload, conf in rows:
+        payload = payload or {}
+        name = _str_or_empty(payload.get("name")).strip()
+        if not name:
+            continue
+        aliases = [a for a in (payload.get("aliases") or []) if _str_or_empty(a).strip()]
+        votes[cid].append((name, float(conf or 0), aliases))
+    if not votes:
+        return empty
+
+    cids = list(votes.keys())
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT id, kind, name, is_confirmed FROM analysis_character "
+            "WHERE id = ANY(%s) AND webtoon_id = %s AND deleted_at IS NULL",
+            (cids, webtoon_id),
+        )
+        meta = {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
+        cur.execute(
+            "SELECT character_id, count(*) FROM analysis_character_appearance "
+            "WHERE character_id = ANY(%s) AND deleted_at IS NULL GROUP BY character_id",
+            (cids,),
+        )
+        appcount = {r[0]: r[1] for r in cur.fetchall()}
+
+    # 클러스터별 정본 이름/별칭 — 확정·비클러스터·이미 명명된 건 동결(스킵).
+    cluster_name: dict[int, tuple] = {}  # cid -> (canonical, aliases_set, best_conf)
+    for cid, vlist in votes.items():
+        km = meta.get(cid)
+        if not km:
+            continue
+        kind, cur_name, is_confirmed = km
+        if is_confirmed or kind != "cluster" or _str_or_empty(cur_name).strip():
+            continue
+        by_name: dict[str, float] = defaultdict(float)
+        aliases: set = set()
+        for name, conf, al in vlist:
+            by_name[name] += conf
+            aliases.update(al)
+        # 일반 호칭(사부/형님 등)만 정본이면 스킵 — 서로 다른 인물 오병합 방지(M2). 실명 후보만 정본.
+        named = {n: s for n, s in by_name.items() if not _is_generic_name(n)}
+        if not named:
+            continue  # 실명 없음(호칭뿐) — 익명 유지, suggestion 잔류
+        canonical = max(named, key=lambda n: (named[n], n))
+        aliases.update(n for n in by_name if n != canonical)  # 소수 이름·호칭도 별칭
+        aliases.discard(canonical)
+        cluster_name[cid] = (canonical, aliases, max(c for _n, c, _a in vlist))
+    if not cluster_name:
+        return empty
+
+    # union-find by 정규화 정본 이름(대소문자·공백).
+    groups: dict[str, list] = defaultdict(list)
+    for cid, (canon, _al, _c) in cluster_name.items():
+        groups[canon.strip().lower()].append(cid)
+
+    promoted = attached = handled = 0
+    for _nkey, allcids in groups.items():
+        # M1: 그룹 최고신뢰가 아니라 **클러스터별 자기 신뢰**로 참여를 건다 — 저신뢰(오명명 의심)
+        # 클러스터가 강한 동명 클러스터에 편승해 비가역 흡수되는 걸 막는다. 미달분은 suggestion 잔류.
+        gcids = [c for c in allcids if cluster_name[c][2] >= min_conf]
+        if not gcids:
+            continue
+        # 그룹 정본 = 참여 클러스터 정본 중 최다 채택 표면형, 별칭 = 참여분 별칭 ∪ 다른 정본.
+        surf_freq: dict[str, int] = defaultdict(int)
+        for c in gcids:
+            surf_freq[cluster_name[c][0]] += 1
+        canon = max(surf_freq, key=lambda s: (surf_freq[s], s))
+        galiases: set = set()
+        for c in gcids:
+            galiases.update(cluster_name[c][1])
+            if cluster_name[c][0] != canon:
+                galiases.add(cluster_name[c][0])
+        galiases.discard(canon)
+
+        existing = _find_character_by_name(webtoon_id, canon)
+        g_promoted = g_attached = 0
+        with db_cursor() as cur:
+            if existing is not None and existing not in gcids:
+                target = existing  # 동명 기존 인물에 흡수(교차런 안정)
+                # 별칭 보강(정본 이름·확정 인물의 이름은 유지).
+                cur.execute("SELECT COALESCE(aliases, '[]')::jsonb, is_confirmed FROM "
+                            "analysis_character WHERE id = %s AND deleted_at IS NULL", (target,))
+                row = cur.fetchone()
+                if not row:
+                    continue  # 대상이 사라짐(경쟁) — 그룹 스킵(suggestion 잔류)
+                if not row[1]:
+                    merged = sorted((set(row[0] or []) | galiases) - {canon})
+                    cur.execute("UPDATE analysis_character SET aliases = %s::jsonb, updated_at = %s "
+                                "WHERE id = %s", (json.dumps(merged, ensure_ascii=False), now, target))
+            else:
+                target = max(gcids, key=lambda c: (appcount.get(c, 0), c))  # appearance 최다 대표
+                cur.execute(
+                    "UPDATE analysis_character SET name = %s, aliases = %s::jsonb, kind = 'character', "
+                    "is_name_auto_assigned = true, updated_at = %s "
+                    "WHERE id = %s AND webtoon_id = %s AND deleted_at IS NULL "
+                    "AND is_confirmed = false AND kind = 'cluster'",
+                    (canon[:64], json.dumps(sorted(galiases), ensure_ascii=False), now, target, webtoon_id),
+                )
+                if not cur.rowcount:
+                    continue  # 대표 승격 실패(경쟁: 확정/이미명명/삭제) — 흡수 스킵(안전)
+                g_promoted = 1
+            accepted_cids = [target] if g_promoted else []
+            for c in gcids:
+                if c == target:
+                    continue
+                # M3: 흡수 직전 소스 재검사 — human이 그 사이 확정/명명했으면 건드리지 않는다
+                # (HITL은 별 프로세스라 _webtoon_serialized 밖). 확정·비클러스터·삭제면 스킵.
+                cur.execute(
+                    "SELECT 1 FROM analysis_character WHERE id = %s AND webtoon_id = %s "
+                    "AND deleted_at IS NULL AND is_confirmed = false AND kind = 'cluster'",
+                    (c, webtoon_id),
+                )
+                if not cur.fetchone():
+                    continue  # 소스가 그 사이 변함 — 흡수 스킵(suggestion 잔류)
+                _attach_cluster_to_character(cur, c, target, now)
+                g_attached += 1
+                accepted_cids.append(c)
+            # m5: 이 그룹의 병합 + suggestion accepted를 같은 트랜잭션에서 원자적으로 처리(고아 방지).
+            if accepted_cids:
+                cur.execute(
+                    "UPDATE analysis_suggestion SET status = 'accepted', updated_at = %s "
+                    "WHERE webtoon_id = %s AND type = 'name' AND status = 'pending' "
+                    "AND character_id = ANY(%s)",
+                    (now, webtoon_id, accepted_cids),
+                )
+        promoted += g_promoted
+        attached += g_attached
+        handled += 1
+
+    logger.info("[step3.global] webtoon %s 전역명명: 그룹 %s·승격 %s·흡수 %s (후보 클러스터 %s)",
+                webtoon_id, handled, promoted, attached, len(cluster_name))
+    return {"groups": handled, "promoted": promoted, "attached": attached, "clusters": len(cluster_name)}
 
 
 def _commit_profiles(

@@ -174,6 +174,17 @@ class EpisodeChainWorkflow:
                 start_to_close_timeout=_META_TIMEOUT, retry_policy=_RETRY,
             )
             raise
+
+        # step3d: 전역 명명 최후 패스(cluster-first ON일 때만 동작, LLM 없음). apply 성공 후 웹툰
+        # 전역에서 name suggestion을 모아 명명·과분할치유·교차회차 통합. 실패해도 체인 비차단
+        # (activity 내부에서 흡수 + 다음 회차 재시도) — 정체 통합은 결정론이라 소급 수렴한다.
+        await workflow.execute_activity(
+            activities.step3d_global_identities,
+            args=[ep],
+            task_queue=STEP3_QUEUE,
+            start_to_close_timeout=timedelta(minutes=10),
+            heartbeat_timeout=timedelta(minutes=2), retry_policy=_RETRY,
+        )
         # v4.0: step3 완료 마킹은 별도 없음 — step3c가 resolve run을 succeeded로 전이하는 것이
         # 진행도의 정본이다(§17.1). _mark는 step1/2(run 원장 완료 기록)에만 쓴다.
         #

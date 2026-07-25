@@ -119,6 +119,7 @@ async def main() -> None:
             activities.step3a_extract,
             activities.step3b_resolve,
             activities.step3c_apply,
+            activities.step3d_global_identities,
             activities.regen_reresolve_episode,
             activities.regen_profile,
         ],

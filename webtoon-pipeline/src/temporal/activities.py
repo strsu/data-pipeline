@@ -494,6 +494,34 @@ def step3c_apply(ep: EpisodeInput, resolution: dict) -> dict:
 
 
 @activity.defn
+def step3d_global_identities(ep: EpisodeInput) -> dict:
+    """전역 명명 최후 패스(step3d) — **LLM 없음**. cluster-first ON일 때만 동작(아니면 no-op).
+
+    per-episode apply(step3c)가 cluster-first에서 이름을 커밋 않고 name suggestion만 쌓으므로,
+    회차 커밋 후 웹툰 전역에서 그 표를 모아 결정론으로 명명·과분할치유·교차회차 통합한다
+    (`step3.resolve_global_identities`). 회차마다 호출되지만 멱등(pending suggestion만 처리).
+    실패해도 체인을 막지 않는다 — 정체 통합은 다음 회차/재실행에서 다시 시도되면 되므로(격리).
+    """
+    from src.core import step3
+
+    activity.heartbeat("global:start")
+    webtoon_id = step3._get_webtoon_id(ep.webtoon_episode_id)
+    try:
+        with _webtoon_serialized(webtoon_id, "step3d"):
+            summary = _run_with_heartbeat(
+                step3.resolve_global_identities,
+                args=(webtoon_id,),
+                kwargs={},
+                detail="global:working",
+            )
+        logger.info("[step3d] webtoon=%s 전역명명 %s", webtoon_id, summary)
+        return summary or {}
+    except Exception as e:  # noqa: BLE001 — 전역명명 실패는 체인 비차단(다음 회차 재시도)
+        logger.warning("[step3d] webtoon=%s 전역명명 실패(비차단): %s", webtoon_id, e)
+        return {"error": str(e)}
+
+
+@activity.defn
 def mark_resolve_run_failed(run_id: int | None, error: str) -> None:
     """step3c 최종 실패(액티비티 재시도 소진) 시 워크플로가 호출 — resolve run을 failed로 닫는다.
 
