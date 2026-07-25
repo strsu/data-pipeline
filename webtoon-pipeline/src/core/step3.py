@@ -3394,18 +3394,22 @@ def resolve_global_identities(
         if is_confirmed or kind != "cluster" or _str_or_empty(cur_name).strip():
             continue
         by_name: dict[str, float] = defaultdict(float)
-        aliases: set = set()
+        aliases_by_name: dict[str, set] = defaultdict(set)  # 이름별 **함께 투표된** 별호
         for name, conf, al in vlist:
             by_name[name] += conf
-            aliases.update(al)
+            aliases_by_name[name].update(a for a in al if _str_or_empty(a).strip())
         # 일반 호칭(사부/형님 등)만 정본이면 스킵 — 서로 다른 인물 오병합 방지(M2). 실명 후보만 정본.
         named = {n: s for n, s in by_name.items() if not _is_generic_name(n)}
         if not named:
             continue  # 실명 없음(호칭뿐) — 익명 유지, suggestion 잔류
         canonical = max(named, key=lambda n: (named[n], n))
-        aliases.update(n for n in by_name if n != canonical)  # 소수 이름·호칭도 별칭
-        aliases.discard(canonical)
-        cluster_name[cid] = (canonical, aliases, max(c for _n, c, _a in vlist))
+        # 별칭 = **정본과 함께 투표된 별호만**. 다른 이름표(회차간 정체 flip의 소수 primary)와 그
+        # 이름표에 딸린 별칭은 canonical의 것이 아니다 — 별칭 오염·_find_character_by_name 라우팅버그 방지.
+        aliases = {a for a in aliases_by_name[canonical]
+                   if a != canonical and not _is_generic_name(a)}
+        # M1 게이트용 신뢰 = **정본 이름 자체의 최고 신뢰**(flip 소수표의 고신뢰로 게이트 통과 방지).
+        canon_conf = max((cf for nm, cf, _a in vlist if nm == canonical), default=0.0)
+        cluster_name[cid] = (canonical, aliases, canon_conf)
     if not cluster_name:
         return empty
 
@@ -3421,7 +3425,8 @@ def resolve_global_identities(
         gcids = [c for c in allcids if cluster_name[c][2] >= min_conf]
         if not gcids:
             continue
-        # 그룹 정본 = 참여 클러스터 정본 중 최다 채택 표면형, 별칭 = 참여분 별칭 ∪ 다른 정본.
+        # 그룹 정본 = 참여 클러스터 정본 중 최다 채택 표면형. 별칭 = 참여분의 (정제된) 별호 합집합만
+        # — 다른 클러스터의 '정본'은 별칭이 아니다(같은 정규화 이름의 표면변형일 뿐, 오염 방지).
         surf_freq: dict[str, int] = defaultdict(int)
         for c in gcids:
             surf_freq[cluster_name[c][0]] += 1
@@ -3429,8 +3434,6 @@ def resolve_global_identities(
         galiases: set = set()
         for c in gcids:
             galiases.update(cluster_name[c][1])
-            if cluster_name[c][0] != canon:
-                galiases.add(cluster_name[c][0])
         galiases.discard(canon)
 
         existing = _find_character_by_name(webtoon_id, canon)
