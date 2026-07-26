@@ -96,8 +96,11 @@ D1(Path A)은 구현·배포(이미지 `0545bd5`)·검증 완료. **정본 = `pr
 
 **⭐ D8. cluster-first 정체추적 재설계 (2026-07-24 R&D, 사용자 설계리뷰) — 정체=글로벌ID문제, 얼굴은 신호 하나**
 
-> ### ✅✅ 2026-07-25 A+B+C 구현·배포·검증 완료 (아래 R&D를 프로덕션으로)
-> 커밋: data-pipeline `b0bf6cf`(A+B+C) + `2da618b`(별칭수정) **push·배포됨**, service `c55491e`(마이그 0041) 적용됨. **cluster-first 전역 ON**(config `cluster_first_enabled` default true, 게이트 no-row→True).
+> ### ⚠️ 2026-07-25~27 A+B+C 배포 → 검증서 얼굴오염 발견 → 자동병합 임시 OFF → 방향 미결정
+> **★ 종합·남은 선택지 정본 = `identity-cluster-first-status-2026-07.md`(자족 문서, 다음 세션 여기 먼저).**
+> 요약: A+B+C 구현·3회리뷰·배포·검증 완료했으나 **주인공이 남의 얼굴 대량 흡수(co-presence 오염, 청명=194얼굴/천마0/구칠2)** 발견. co-occurrence 게이트 시도→몽타주 검증서 **신뢰불가**(멀티패널 컷·닮은얼굴). **`_GLOBAL_NAMING_ENABLED=False`(커밋 `267bd9d`) 배포로 step3d 자동병합 OFF=오염정지**, 이름은 suggestion만. **남은 선택지=(C)사람검토 (D)대사만정체 (E)패널단위게이트+임베딩 (F)고확신만** — 사용자 검토 중. 산출물=`anon-roster/identity-redesign/`(cheongmyeong_montage.jpg·cooccur_demo.py·montage.py).
+>
+> 커밋: data-pipeline `b0bf6cf`(A+B+C)·`2da618b`(별칭수정)·`4a3a086`+`7a0ddfe`(E dead code)·`267bd9d`(안전정지) **push·배포됨**, service `c55491e`(마이그 0041) 적용됨. **cluster-first 전역 ON**(config `cluster_first_enabled` default true) but **step3d 자동병합은 OFF**.
 > - **B**: `name_clusters_by_dialogue` = conversant-제약 **slot-coref 2콜**(`_extract_conversant_pairs`+`_alias_coref`). **slot 단위**(라인단위 O(라인수)는 긴회차 180s타임아웃 — glm-5.2 콜당 ~270s, litellm p50 268s=정상). 별호=aliases.
 > - **C**: `resolve_global_identities(webtoon_id)` = pending name suggestion→클러스터별 정본→**name-link union-find**→대표 승격+나머지 `_attach_cluster_to_character` 흡수. `step3d_global_identities` activity(apply 후, 비차단·멱등)로 배선(workflows.py·worker.py). cluster-first OFF면 no-op.
 > - **A**: 게이트 전역 ON(step3.py) + service 마이그 0041. **배포순서**: data-pipeline 먼저→service(구코드는 컬럼 안 읽어 순서 무관도 안전).
